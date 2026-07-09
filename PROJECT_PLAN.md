@@ -1,34 +1,33 @@
-# Upstox Scalper Backend API Plan
+# Upstox Personal Backend V1 Plan
 
 ## 1. Goal
-Build a backend API service that uses the Upstox Python SDK and exposes endpoints for an Android app to authenticate, fetch market data, and place trades. There will be no database and no persistent storage layer.
+Build a personal backend API service that uses Upstox REST APIs and exposes endpoints for Android/iPhone apps to authenticate, fetch market data, and view portfolio data. There will be no database in v1; the Upstox token is stored in an encrypted file on the VPS.
 
 ## 2. Recommended stack
 - Language: Python 3.12
 - Framework: FastAPI
-- Upstox SDK: official Python SDK
-- HTTP client: httpx or requests
-- Authentication: OAuth flow handled by the backend
+- Upstox API: REST calls via httpx for v1
+- Authentication: OAuth flow handled by the backend; mobile app protected by `X-API-Key`
 - Containerization: Docker + Docker Compose
 - Hosting: VPS running the backend container
 - Version control: GitHub
 
 ## 3. Core constraints
 - No database access
-- No persistent storage requirement
+- No database requirement
 - The backend should be stateless where possible
-- Tokens and session state may be held in memory or in secure server-side storage if needed later
-- The Android app will call these API endpoints
+- Upstox token is stored in an encrypted server-side file
+- Android/iPhone apps will call these API endpoints over HTTPS
 
 ## 4. Initial scope
 Phase 1 should focus on the API foundation:
 - health endpoint
-- Upstox OAuth callback and token exchange
-- token refresh handling
+- Upstox OAuth login URL, callback, token exchange, status, and logout
+- encrypted token persistence
+- mobile API key protection
 - market quotes endpoint
-- order placement endpoint
-- portfolio and positions endpoint
-- paper trading mode first
+- portfolio holdings and positions endpoint
+- no live order placement in v1
 
 ## 5. Suggested project structure
 - app/
@@ -47,27 +46,26 @@ Phase 1 should focus on the API foundation:
 - README.md
 
 ## 6. Core modules
-- Auth service
+- Backend auth
+  - static `X-API-Key` protection for `/api/*`
+- Upstox auth service
   - Upstox OAuth login initiation
   - callback handling
-  - token refresh logic
+  - encrypted token save/load/delete
 - Market data service
-  - fetch quotes and instrument data
+  - fetch LTP and full quote snapshots
   - expose simple REST endpoints for the mobile app
-- Order service
-  - place, modify, and cancel orders
-  - enforce simple risk limits in code
-- Session handling
-  - keep user session context per authenticated client
-- API contracts
-  - define clear request and response schemas for Android integration
+- Portfolio service
+  - fetch holdings and positions
+- Error handling
+  - normalize Upstox errors into simple JSON responses
 
 ## 7. Development workflow
 1. Create GitHub repository
 2. Initialize FastAPI project structure
 3. Add Docker setup for the backend
-4. Implement health and auth endpoints
-5. Add market data and order endpoints
+4. Implement health, mobile API key auth, and Upstox auth endpoints
+5. Add market data and portfolio endpoints
 6. Add environment-based config and deployment setup
 7. Deploy to VPS and validate
 
@@ -81,16 +79,18 @@ Phase 1 should focus on the API foundation:
 ## 9. Docker and deployment plan
 - Build a backend container image
 - Run it with Docker Compose on the VPS
+- Mount a Docker volume at `/data` for encrypted token persistence
 - Expose only the required HTTP port
 - Use environment variables for Upstox credentials and app config
-- Optionally place behind Nginx or a reverse proxy later
+- Place behind HTTPS using Nginx/Caddy/reverse proxy before mobile use
 
 ## 10. Security notes
 - Do not commit secrets or tokens
 - Keep credentials in environment variables
 - Use HTTPS in deployment
-- Prefer short-lived tokens and refresh handling
-- If needed later, add secure server-side storage for tokens, but keep the initial version simple
+- Protect `/api/*` routes with `X-API-Key`
+- Store Upstox tokens only in encrypted form
+- Recheck Upstox rate limits and regulatory constraints before adding order placement
 
 ## 11. Coding standards
 - Every function must have documentation strings.
@@ -100,10 +100,10 @@ Phase 1 should focus on the API foundation:
 
 ## 12. Recommended first milestones
 - Milestone 1: FastAPI app skeleton + Docker + health endpoint
-- Milestone 2: Upstox OAuth flow and token handling
-- Milestone 3: market data endpoint
-- Milestone 4: order placement endpoint
+- Milestone 2: mobile API key auth + Upstox OAuth + encrypted token handling
+- Milestone 3: market data and portfolio read-only endpoints
+- Milestone 4: paper/sandbox order placement endpoint
 - Milestone 5: VPS deployment and smoke test
 
 ## 12. Suggested next step
-I will scaffold the backend API structure, add the Docker setup, and start with the health endpoint and Upstox auth integration.
+Implement V1 read-only backend foundation, then validate locally and in Docker before adding any paper/sandbox order workflow.
