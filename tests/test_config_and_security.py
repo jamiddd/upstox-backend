@@ -48,3 +48,21 @@ def test_protected_route_accepts_valid_api_key() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+def test_auth_status_reports_invalid_token_store_config() -> None:
+    """Return a useful error when token encryption config is invalid."""
+    app.dependency_overrides[get_settings] = _settings
+    try:
+        response = TestClient(app).get(
+            "/api/auth/status",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "status": "error",
+        "message": "TOKEN_ENCRYPTION_KEY is not configured",
+    }

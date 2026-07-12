@@ -101,7 +101,6 @@ def test_auth_callback_saves_token() -> None:
     try:
         response = client.get(
             "/api/auth/callback?code=abc",
-            headers={"X-API-Key": "mobile-secret"},
         )
     finally:
         app.dependency_overrides.clear()
@@ -109,6 +108,19 @@ def test_auth_callback_saves_token() -> None:
     assert response.status_code == 200
     assert response.json() == {"status": "authenticated"}
     assert token_store.saved == {"access_token": "token-for-abc"}
+
+
+def test_auth_callback_does_not_require_mobile_api_key() -> None:
+    """Allow Upstox browser redirects to call the OAuth callback."""
+    token_store = FakeTokenStore(token=None)
+    client = _client(token_store)
+    try:
+        response = client.get("/api/auth/callback?code=redirect-code")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert token_store.saved == {"access_token": "token-for-redirect-code"}
 
 
 def test_market_route_uses_stored_token() -> None:

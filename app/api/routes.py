@@ -11,20 +11,21 @@ from app.core.exceptions import (
     UpstoxApiError,
     UpstoxAuthRequiredError,
 )
-from app.core.security import require_mobile_api_key
 from app.services.token_store import EncryptedTokenStore
 from app.services.upstox_service import UpstoxService
+from app.core.security import require_mobile_api_key
 
-router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
+public_router = APIRouter()
+protected_router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
 
 
-@router.get("/status")
+@protected_router.get("/status")
 def get_status() -> dict[str, str]:
     """Return a basic API status payload for the mobile client."""
     return {"status": "ready"}
 
 
-@router.get("/auth/login-url")
+@protected_router.get("/auth/login-url")
 def get_login_url(
     state: Optional[str] = None,
     service: UpstoxService = Depends(get_upstox_service),
@@ -36,7 +37,7 @@ def get_login_url(
         raise _http_error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
 
 
-@router.get("/auth/callback")
+@public_router.get("/auth/callback")
 async def auth_callback(
     code: str,
     service: UpstoxService = Depends(get_upstox_service),
@@ -53,7 +54,7 @@ async def auth_callback(
     return {"status": "authenticated"}
 
 
-@router.get("/auth/status")
+@protected_router.get("/auth/status")
 def auth_status(
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, bool]:
@@ -65,7 +66,7 @@ def auth_status(
     return {"authenticated": authenticated}
 
 
-@router.post("/auth/logout")
+@protected_router.post("/auth/logout")
 def logout(
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, str]:
@@ -77,7 +78,7 @@ def logout(
     return {"status": "logged_out"}
 
 
-@router.get("/market/ltp")
+@protected_router.get("/market/ltp")
 async def get_ltp(
     instrument_key: str = Query(min_length=1),
     service: UpstoxService = Depends(get_upstox_service),
@@ -91,7 +92,7 @@ async def get_ltp(
         raise _upstox_http_error(exc) from exc
 
 
-@router.get("/market/quotes")
+@protected_router.get("/market/quotes")
 async def get_quotes(
     instrument_key: str = Query(min_length=1),
     service: UpstoxService = Depends(get_upstox_service),
@@ -105,7 +106,7 @@ async def get_quotes(
         raise _upstox_http_error(exc) from exc
 
 
-@router.get("/portfolio/holdings")
+@protected_router.get("/portfolio/holdings")
 async def get_holdings(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
@@ -118,7 +119,7 @@ async def get_holdings(
         raise _upstox_http_error(exc) from exc
 
 
-@router.get("/portfolio/positions")
+@protected_router.get("/portfolio/positions")
 async def get_positions(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
@@ -159,3 +160,8 @@ def _upstox_http_error(exc: UpstoxApiError) -> HTTPException:
     if exc.details is not None:
         detail["details"] = exc.details
     return HTTPException(status_code=exc.status_code, detail=detail)
+
+
+router = APIRouter()
+router.include_router(public_router)
+router.include_router(protected_router)

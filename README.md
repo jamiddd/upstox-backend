@@ -47,6 +47,12 @@ docker compose up --build -d
 ./scripts/smoke_test.sh
 ```
 
+Validate Upstox OAuth/read-only endpoints after configuring credentials:
+
+```bash
+BASE_URL=http://localhost:8000 ./scripts/validate_readonly.sh
+```
+
 Protected endpoints require:
 
 ```text

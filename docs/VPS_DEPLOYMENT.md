@@ -47,7 +47,17 @@ curl -H "X-API-Key: $MOBILE_API_KEY" \
   https://api.yourdomain.com/api/auth/status
 ```
 
+The OAuth callback itself is intentionally public because Upstox redirects the browser to `/api/auth/callback` without custom headers.
+
 ## 5. Test Read-Only Endpoints
+You can run the full read-only validation script:
+
+```bash
+BASE_URL=https://api.yourdomain.com ./scripts/validate_readonly.sh
+```
+
+Or call endpoints manually:
+
 ```bash
 curl -H "X-API-Key: $MOBILE_API_KEY" \
   "https://api.yourdomain.com/api/market/ltp?instrument_key=NSE_EQ%7CINE848E01016"
