@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import anyio
@@ -120,6 +121,42 @@ def test_get_historical_trades_sends_pagination_and_date_range() -> None:
 
     payload = anyio.run(run)
     assert payload == {"status": "success", "data": []}
+
+
+def test_place_gtt_order_posts_to_v3_gtt_endpoint() -> None:
+    """Place a GTT order through the V3 endpoint."""
+    order = {
+        "type": "MULTIPLE",
+        "quantity": 75,
+        "product": "I",
+        "rules": [
+            {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": 125.5},
+            {"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 140.0},
+            {"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 118.0},
+        ],
+        "instrument_token": "NSE_FO|111",
+        "transaction_type": "BUY",
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v3/order/gtt/place"
+        assert request.headers["Accept"] == "application/json"
+        assert request.headers["Content-Type"] == "application/json"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        assert json.loads((await request.aread()).decode("utf-8")) == order
+        return httpx.Response(
+            200,
+            json={"status": "success", "data": {"gtt_order_ids": ["GTT-123"]}},
+        )
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.place_gtt_order("upstox-token", order)
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": {"gtt_order_ids": ["GTT-123"]}}
 
 
 def test_get_option_contracts_sends_underlying_and_expiry() -> None:

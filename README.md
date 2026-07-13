@@ -91,3 +91,4 @@ See `docs/VPS_DEPLOYMENT.md` for the VPS checklist, smoke test steps, OAuth vali
 - Main screen backend contract: `docs/MAIN_SCREEN_API.md`
 - Search screen backend contract: `docs/SEARCH_SCREEN_API.md`
 - Order history screen backend contract: `docs/ORDER_HISTORY_SCREEN_API.md`
+- Order placement backend contract: `docs/ORDER_PLACEMENT_API.md`

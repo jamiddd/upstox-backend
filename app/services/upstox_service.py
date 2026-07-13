@@ -107,6 +107,27 @@ class UpstoxService:
             },
         )
 
+    async def place_gtt_order(
+        self,
+        access_token: str,
+        order: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Place a V3 GTT order."""
+        response = await self._request(
+            "POST",
+            f"{self.settings.upstox_api_v3_base_url}/order/gtt/place",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+            json=order,
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox GTT order response")
+        return payload
+
     async def get_option_contracts(
         self,
         access_token: str,

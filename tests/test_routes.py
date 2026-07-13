@@ -202,6 +202,19 @@ class FakeUpstoxService:
             },
         }
 
+    async def place_gtt_order(
+        self,
+        access_token: str,
+        order: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": {
+                "gtt_order_ids": ["GTT-123"],
+            },
+            "echo": order,
+        }
+
     async def get_option_contracts(
         self,
         access_token: str,
@@ -699,3 +712,97 @@ def test_order_history_all_returns_paginated_historical_trades() -> None:
         "total_records": 2,
         "total_pages": 1,
     }
+
+
+def test_place_smart_bracket_order_submits_multi_leg_gtt() -> None:
+    """Place a bracket-like order with client-provided GTT prices."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/smart-bracket",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 118.0,
+                "market_protection": -1,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["source"] == "upstox_gtt"
+    assert payload["total_quantity"] == 75
+    assert payload["slice_quantity"] == 1800
+    assert payload["slice_count"] == 1
+    assert payload["slices"][0]["submitted_order"] == {
+        "type": "MULTIPLE",
+        "quantity": 75,
+        "product": "I",
+        "rules": [
+            {
+                "strategy": "ENTRY",
+                "trigger_type": "IMMEDIATE",
+                "trigger_price": 125.5,
+                "market_protection": -1,
+            },
+            {
+                "strategy": "TARGET",
+                "trigger_type": "IMMEDIATE",
+                "trigger_price": 140.0,
+                "market_protection": -1,
+            },
+            {
+                "strategy": "STOPLOSS",
+                "trigger_type": "IMMEDIATE",
+                "trigger_price": 118.0,
+                "market_protection": -1,
+            },
+        ],
+        "instrument_token": "NSE_FO|111",
+        "transaction_type": "BUY",
+    }
+    assert payload["slices"][0]["upstox_response"]["data"] == {"gtt_order_ids": ["GTT-123"]}
+
+
+def test_place_smart_bracket_order_slices_large_quantity() -> None:
+    """Split large quantities so the client does not handle freeze slicing."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/smart-bracket",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 3750,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 118.0,
+                "slice_quantity": 1800,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total_quantity"] == 3750
+    assert payload["slice_quantity"] == 1800
+    assert payload["slice_count"] == 3
+    assert [item["quantity"] for item in payload["slices"]] == [1800, 1800, 150]
+    assert [item["submitted_order"]["quantity"] for item in payload["slices"]] == [
+        1800,
+        1800,
+        150,
+    ]

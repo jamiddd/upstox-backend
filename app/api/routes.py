@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_token_store, get_upstox_service
+from app.core.config import Settings, get_settings
 from app.core.exceptions import (
     AppConfigError,
     TokenStoreError,
@@ -17,9 +19,26 @@ from app.core.security import require_mobile_api_key
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 from app.services.order_history_service import OrderHistoryService
 from app.services.search_screen_service import SearchScreenService
+from app.services.smart_order_service import SmartOrderService
 
 public_router = APIRouter()
 protected_router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
+
+
+class SmartBracketOrderRequest(BaseModel):
+    """Client-provided bracket-like GTT order parameters."""
+
+    instrument_key: str = Field(min_length=1)
+    transaction_type: Literal["BUY", "SELL"]
+    quantity: int = Field(gt=0)
+    product: Literal["I", "D", "MTF"] = "I"
+    entry_trigger_type: Literal["ABOVE", "BELOW", "IMMEDIATE"] = "IMMEDIATE"
+    entry_trigger_price: float = Field(gt=0)
+    target_trigger_price: float = Field(gt=0)
+    stoploss_trigger_price: float = Field(gt=0)
+    trailing_gap: Optional[float] = Field(default=None, gt=0)
+    market_protection: Optional[int] = Field(default=None, ge=-1, le=25)
+    slice_quantity: Optional[int] = Field(default=None, gt=0)
 
 
 @protected_router.get("/status")
@@ -270,6 +289,34 @@ async def order_history(
             start_date=start_date,
             end_date=end_date,
             segment=segment,
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.post("/orders/smart-bracket")
+async def place_smart_bracket_order(
+    order: SmartBracketOrderRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Place a bracket-like order using Upstox multi-leg GTT."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await SmartOrderService(service).place_bracket_order(
+            access_token,
+            instrument_key=order.instrument_key,
+            transaction_type=order.transaction_type,
+            quantity=order.quantity,
+            product=order.product,
+            entry_trigger_type=order.entry_trigger_type,
+            entry_trigger_price=order.entry_trigger_price,
+            target_trigger_price=order.target_trigger_price,
+            stoploss_trigger_price=order.stoploss_trigger_price,
+            trailing_gap=order.trailing_gap,
+            market_protection=order.market_protection,
+            slice_quantity=order.slice_quantity or settings.default_order_slice_quantity,
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc

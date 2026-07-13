@@ -27,6 +27,7 @@ class Settings:
     upstox_api_v3_base_url: str = "https://api.upstox.com/v3"
     upstox_login_url: str = "https://api.upstox.com/v2/login/authorization/dialog"
     upstox_token_url: str = "https://api.upstox.com/v2/login/authorization/token"
+    default_order_slice_quantity: int = 1800
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -52,6 +53,7 @@ class Settings:
                 "UPSTOX_TOKEN_URL",
                 "https://api.upstox.com/v2/login/authorization/token",
             ),
+            default_order_slice_quantity=int(os.getenv("DEFAULT_ORDER_SLICE_QUANTITY", "1800")),
         )
 
     def require_mobile_api_key(self) -> None:
