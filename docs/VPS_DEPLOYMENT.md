@@ -1,12 +1,24 @@
 # VPS Deployment Checklist
 
+Production API base URL:
+
+```text
+https://api.scalp8.xyz
+```
+
+Production Upstox callback URL:
+
+```text
+https://api.scalp8.xyz/api/auth/callback
+```
+
 ## 1. Prepare Secrets
 - Create an Upstox developer app.
-- Register the final callback URL, for example `https://api.yourdomain.com/api/auth/callback`.
+- Register the final callback URL. Production uses `https://api.scalp8.xyz/api/auth/callback`.
 - Fill `.env` on the VPS:
   - `UPSTOX_API_KEY`
   - `UPSTOX_API_SECRET`
-  - `UPSTOX_REDIRECT_URL`
+  - `UPSTOX_REDIRECT_URL=https://api.scalp8.xyz/api/auth/callback`
   - `MOBILE_API_KEY`
   - `TOKEN_ENCRYPTION_KEY`
   - `TOKEN_STORE_PATH=/data/upstox_token.enc`
@@ -37,14 +49,26 @@ Expected checks:
 ## 4. Test Upstox Login
 ```bash
 curl -H "X-API-Key: $MOBILE_API_KEY" \
-  https://api.yourdomain.com/api/auth/login-url
+  https://api.scalp8.xyz/api/auth/login-url
 ```
 
-Open the returned `login_url`, complete Upstox login, then check:
+Open the returned `login_url`, complete Upstox login, and confirm the browser callback returns:
+
+```json
+{"status":"authenticated"}
+```
+
+Then check:
 
 ```bash
 curl -H "X-API-Key: $MOBILE_API_KEY" \
-  https://api.yourdomain.com/api/auth/status
+  https://api.scalp8.xyz/api/auth/status
+```
+
+Expected response:
+
+```json
+{"authenticated":true}
 ```
 
 The OAuth callback itself is intentionally public because Upstox redirects the browser to `/api/auth/callback` without custom headers.
@@ -53,26 +77,38 @@ The OAuth callback itself is intentionally public because Upstox redirects the b
 You can run the full read-only validation script:
 
 ```bash
-BASE_URL=https://api.yourdomain.com ./scripts/validate_readonly.sh
+BASE_URL=https://api.scalp8.xyz MOBILE_API_KEY=$MOBILE_API_KEY ./scripts/validate_readonly.sh
 ```
 
 Or call endpoints manually:
 
 ```bash
 curl -H "X-API-Key: $MOBILE_API_KEY" \
-  "https://api.yourdomain.com/api/market/ltp?instrument_key=NSE_EQ%7CINE848E01016"
+  "https://api.scalp8.xyz/api/market/ltp?instrument_key=NSE_EQ%7CINE848E01016"
 
 curl -H "X-API-Key: $MOBILE_API_KEY" \
-  https://api.yourdomain.com/api/portfolio/holdings
+  https://api.scalp8.xyz/api/portfolio/holdings
 ```
 
 ## 6. Reverse Proxy
 Use HTTPS before mobile app use. Caddy is the simplest option:
 
 ```caddyfile
-api.yourdomain.com {
+api.scalp8.xyz {
     reverse_proxy 127.0.0.1:8000
 }
 ```
 
-After HTTPS is active, update `UPSTOX_REDIRECT_URL` and the Upstox developer app callback URL to the same HTTPS value.
+After HTTPS is active, `UPSTOX_REDIRECT_URL` and the Upstox developer app callback URL must both be `https://api.scalp8.xyz/api/auth/callback`.
+
+Validate HTTPS through Caddy:
+
+```bash
+curl https://api.scalp8.xyz/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```

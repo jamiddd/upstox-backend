@@ -53,6 +53,12 @@ Validate Upstox OAuth/read-only endpoints after configuring credentials:
 BASE_URL=http://localhost:8000 ./scripts/validate_readonly.sh
 ```
 
+For the live deployment, use:
+
+```bash
+BASE_URL=https://api.scalp8.xyz MOBILE_API_KEY=<MOBILE_API_KEY> ./scripts/validate_readonly.sh
+```
+
 Protected endpoints require:
 
 ```text
@@ -72,4 +78,10 @@ X-API-Key: <MOBILE_API_KEY>
 - `GET /api/portfolio/positions`
 
 ## Deployment
-See `docs/VPS_DEPLOYMENT.md` for the VPS checklist, smoke test steps, and reverse proxy notes.
+Production API base URL:
+
+```text
+https://api.scalp8.xyz
+```
+
+See `docs/VPS_DEPLOYMENT.md` for the VPS checklist, smoke test steps, OAuth validation, and reverse proxy notes.
