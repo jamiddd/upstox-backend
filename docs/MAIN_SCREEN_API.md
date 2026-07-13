@@ -77,6 +77,9 @@ The app sends the selected strike and CE/PE toggle. The backend resolves the mat
     "trading_symbol": "NIFTY26JUL25000CE",
     "strike_price": 25000.0,
     "option_type": "CE",
+    "lot_size": 65.0,
+    "freeze_quantity": 1755.0,
+    "tick_size": 0.05,
     "ltp": 125.0,
     "bid_price": 124.5,
     "ask_price": 125.5

@@ -87,6 +87,9 @@ class MainScreenService:
                 "trading_symbol": _string_value(contract, "trading_symbol", "tradingsymbol"),
                 "strike_price": _number_value(contract, "strike_price"),
                 "option_type": _option_type(contract),
+                "lot_size": _number_value(contract, "lot_size"),
+                "freeze_quantity": _number_value(contract, "freeze_quantity"),
+                "tick_size": _tick_size(contract),
                 "ltp": _last_price(contract_quote),
                 "bid_price": _best_depth_price(contract_quote, "buy"),
                 "ask_price": _best_depth_price(contract_quote, "sell"),
@@ -366,6 +369,13 @@ def _number_value(payload: dict[str, Any], *names: str) -> float:
         if isinstance(value, (int, float)):
             return float(value)
     return 0.0
+
+
+def _tick_size(payload: dict[str, Any]) -> float:
+    value = _number_value(payload, "tick_size")
+    if value >= 1:
+        return value / 100.0
+    return value
 
 
 def _same_price(left: float, right: float) -> bool:

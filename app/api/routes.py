@@ -16,6 +16,12 @@ from app.core.exceptions import (
 from app.services.token_store import EncryptedTokenStore
 from app.services.upstox_service import UpstoxService
 from app.core.security import require_mobile_api_key
+from app.services.instrument_rules_service import (
+    InstrumentRulesService,
+    slice_quantity_for_freeze,
+    validate_price,
+    validate_quantity,
+)
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 from app.services.order_history_service import OrderHistoryService
 from app.services.search_screen_service import SearchScreenService
@@ -304,6 +310,12 @@ async def place_smart_bracket_order(
     """Place a bracket-like order using Upstox multi-leg GTT."""
     access_token = _load_access_token(token_store)
     try:
+        rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
+        validate_quantity(order.quantity, rules)
+        validate_price(order.entry_trigger_price, rules, field_name="entry_trigger_price")
+        validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
+        validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
+        slice_quantity = order.slice_quantity or slice_quantity_for_freeze(order.quantity, rules)
         return await SmartOrderService(service).place_bracket_order(
             access_token,
             instrument_key=order.instrument_key,
@@ -316,8 +328,10 @@ async def place_smart_bracket_order(
             stoploss_trigger_price=order.stoploss_trigger_price,
             trailing_gap=order.trailing_gap,
             market_protection=order.market_protection,
-            slice_quantity=order.slice_quantity or settings.default_order_slice_quantity,
+            slice_quantity=slice_quantity,
         )
+    except AppConfigError as exc:
+        raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

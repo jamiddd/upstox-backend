@@ -22,7 +22,9 @@ DEFAULT_OPTION_INDICES = [
         "name": "Nifty 50",
         "underlying_type": "INDEX",
         "exchange": "NSE",
-        "lot_size": 0.0,
+        "lot_size": 65.0,
+        "freeze_quantity": 1755.0,
+        "tick_size": 0.05,
     },
     {
         "instrument_key": "NSE_INDEX|Nifty Bank",
@@ -30,7 +32,9 @@ DEFAULT_OPTION_INDICES = [
         "name": "Nifty Bank",
         "underlying_type": "INDEX",
         "exchange": "NSE",
-        "lot_size": 0.0,
+        "lot_size": 30.0,
+        "freeze_quantity": 600.0,
+        "tick_size": 0.05,
     },
     {
         "instrument_key": "NSE_INDEX|Nifty Fin Service",
@@ -38,7 +42,9 @@ DEFAULT_OPTION_INDICES = [
         "name": "Nifty Fin Service",
         "underlying_type": "INDEX",
         "exchange": "NSE",
-        "lot_size": 0.0,
+        "lot_size": 65.0,
+        "freeze_quantity": 1755.0,
+        "tick_size": 0.05,
     },
     {
         "instrument_key": "NSE_INDEX|Nifty Midcap Select",
@@ -46,7 +52,9 @@ DEFAULT_OPTION_INDICES = [
         "name": "Nifty Midcap Select",
         "underlying_type": "INDEX",
         "exchange": "NSE",
-        "lot_size": 0.0,
+        "lot_size": 120.0,
+        "freeze_quantity": 2800.0,
+        "tick_size": 0.05,
     },
 ]
 
@@ -138,6 +146,8 @@ def _shape_underlyings(payload: dict[str, Any], *, limit: int) -> list[dict[str,
                 "underlying_type": underlying_type,
                 "exchange": _exchange_from_key(underlying_key) or _string_value(item, "exchange"),
                 "lot_size": _number_value(item, "lot_size"),
+                "freeze_quantity": _number_value(item, "freeze_quantity"),
+                "tick_size": _tick_size(item),
             }
         )
         if len(results) >= limit:
@@ -190,6 +200,13 @@ def _number_value(payload: dict[str, Any], name: str) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return 0.0
+
+
+def _tick_size(payload: dict[str, Any]) -> float:
+    value = _number_value(payload, "tick_size")
+    if value >= 1:
+        return value / 100.0
+    return value
 
 
 def _int_value(payload: dict[str, Any], name: str, *, default: int) -> int:

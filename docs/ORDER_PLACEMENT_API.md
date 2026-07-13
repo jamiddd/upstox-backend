@@ -28,7 +28,6 @@ Request:
   "entry_trigger_price": 125.5,
   "target_trigger_price": 140.0,
   "stoploss_trigger_price": 118.0,
-  "slice_quantity": 1800,
   "market_protection": -1
 }
 ```
@@ -46,14 +45,19 @@ target_trigger_price required, positive number
 stoploss_trigger_price required, positive number
 trailing_gap optional, positive number
 market_protection optional, -1 to 25
-slice_quantity optional, positive integer, defaults to DEFAULT_ORDER_SLICE_QUANTITY
+slice_quantity optional, positive integer
 ```
 
-The backend slices `quantity` into multiple Upstox GTT orders when it exceeds `slice_quantity`. This keeps freeze-quantity handling out of the client. Configure the server default with:
+The backend validates the selected instrument against Upstox's BOD instrument master before placing the order:
 
-```env
-DEFAULT_ORDER_SLICE_QUANTITY=1800
+```text
+quantity must be a multiple of lot_size
+entry_trigger_price must align to tick_size
+target_trigger_price must align to tick_size
+stoploss_trigger_price must align to tick_size
 ```
+
+The backend also slices `quantity` into multiple Upstox GTT orders when it exceeds the instrument `freeze_quantity`. This keeps freeze-quantity handling out of the client. If `slice_quantity` is provided, it overrides the instrument freeze quantity.
 
 For `quantity=3750` and `slice_quantity=1800`, the backend submits three GTT orders:
 
@@ -127,4 +131,5 @@ This is not a classic exchange/broker bracket order.
 It uses Upstox GTT MULTIPLE with ENTRY, TARGET, and STOPLOSS rules.
 For BUY entry, Upstox treats TARGET/STOPLOSS as SELL exits; for SELL entry, exits are BUY.
 TARGET and STOPLOSS trigger_type are always IMMEDIATE as required by Upstox.
+Normal Upstox v3 place-order supports slice=true, but GTT place order does not document slice=true, so the backend handles slicing for smart bracket orders.
 ```

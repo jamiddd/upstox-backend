@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 from app.api.dependencies import get_token_store, get_upstox_service
 from app.core.config import Settings, get_settings
 from app.main import app
+from app.services import instrument_rules_service
+from app.services.instrument_rules_service import _MasterCache
 from app.services.main_screen_service import _CACHE
 from app.services.search_screen_service import _SEARCH_CACHE
 
@@ -231,6 +233,9 @@ class FakeUpstoxService:
                 "instrument_type": "CE",
                 "underlying_symbol": "NIFTY",
                 "strike_price": 25000,
+                "lot_size": 65,
+                "freeze_quantity": 1755.0,
+                "tick_size": 5.0,
             },
             {
                 "name": "NIFTY",
@@ -240,6 +245,9 @@ class FakeUpstoxService:
                 "instrument_type": "PE",
                 "underlying_symbol": "NIFTY",
                 "strike_price": 25000,
+                "lot_size": 65,
+                "freeze_quantity": 1755.0,
+                "tick_size": 5.0,
             },
         ]
         if expiry_date:
@@ -292,6 +300,8 @@ class FakeUpstoxService:
                     "underlying_type": "INDEX",
                     "underlying_symbol": "NIFTY",
                     "lot_size": 75,
+                    "freeze_quantity": 1800.0,
+                    "tick_size": 5.0,
                 },
                 {
                     "name": "Nifty 50",
@@ -301,6 +311,8 @@ class FakeUpstoxService:
                     "underlying_type": "INDEX",
                     "underlying_symbol": "NIFTY",
                     "lot_size": 75,
+                    "freeze_quantity": 1800.0,
+                    "tick_size": 5.0,
                 },
                 {
                     "name": "RELIANCE INDUSTRIES LTD",
@@ -310,6 +322,8 @@ class FakeUpstoxService:
                     "underlying_type": "EQUITY",
                     "underlying_symbol": "RELIANCE",
                     "lot_size": 500,
+                    "freeze_quantity": 10000.0,
+                    "tick_size": 5.0,
                 },
                 {
                     "name": "Gold",
@@ -319,6 +333,8 @@ class FakeUpstoxService:
                     "underlying_type": "COM",
                     "underlying_symbol": "GOLD",
                     "lot_size": 100,
+                    "freeze_quantity": 10000.0,
+                    "tick_size": 5.0,
                 },
                 {
                     "name": "Nifty Future",
@@ -328,6 +344,8 @@ class FakeUpstoxService:
                     "underlying_type": "INDEX",
                     "underlying_symbol": "NIFTY",
                     "lot_size": 75,
+                    "freeze_quantity": 1800.0,
+                    "tick_size": 5.0,
                 },
             ],
             "meta_data": {
@@ -356,6 +374,18 @@ def _settings() -> Settings:
 def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     _CACHE.clear()
     _SEARCH_CACHE.clear()
+    instrument_rules_service._CACHE = _MasterCache(
+        expires_at=9999999999,
+        by_key={
+            "NSE_FO|111": {
+                "instrument_key": "NSE_FO|111",
+                "lot_size": 75,
+                "freeze_quantity": 1800,
+                "tick_size": 5.0,
+                "trading_symbol": "NIFTY26JUL25000CE",
+            }
+        },
+    )
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = FakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: token_store or FakeTokenStore()
@@ -505,6 +535,9 @@ def test_main_selected_quote_returns_bid_and_ask_for_selected_strike() -> None:
             "trading_symbol": "NIFTY26JUL25000CE",
             "strike_price": 25000.0,
             "option_type": "CE",
+            "lot_size": 65.0,
+            "freeze_quantity": 1755.0,
+            "tick_size": 0.05,
             "ltp": 125.0,
             "bid_price": 124.5,
             "ask_price": 125.5,
@@ -593,6 +626,8 @@ def test_search_underlyings_returns_only_option_capable_indices_and_stocks() -> 
                 "underlying_type": "INDEX",
                 "exchange": "NSE",
                 "lot_size": 75.0,
+                "freeze_quantity": 1800.0,
+                "tick_size": 0.05,
             },
             {
                 "instrument_key": "NSE_EQ|INE002A01018",
@@ -601,6 +636,8 @@ def test_search_underlyings_returns_only_option_capable_indices_and_stocks() -> 
                 "underlying_type": "EQUITY",
                 "exchange": "NSE",
                 "lot_size": 500.0,
+                "freeze_quantity": 10000.0,
+                "tick_size": 0.05,
             },
         ],
         "page": {
@@ -633,7 +670,9 @@ def test_search_underlyings_empty_query_returns_default_option_indices() -> None
                 "name": "Nifty 50",
                 "underlying_type": "INDEX",
                 "exchange": "NSE",
-                "lot_size": 0.0,
+                "lot_size": 65.0,
+                "freeze_quantity": 1755.0,
+                "tick_size": 0.05,
             },
             {
                 "instrument_key": "NSE_INDEX|Nifty Bank",
@@ -641,7 +680,9 @@ def test_search_underlyings_empty_query_returns_default_option_indices() -> None
                 "name": "Nifty Bank",
                 "underlying_type": "INDEX",
                 "exchange": "NSE",
-                "lot_size": 0.0,
+                "lot_size": 30.0,
+                "freeze_quantity": 600.0,
+                "tick_size": 0.05,
             },
         ],
         "page": {
@@ -741,7 +782,7 @@ def test_place_smart_bracket_order_submits_multi_leg_gtt() -> None:
     assert payload["status"] == "success"
     assert payload["source"] == "upstox_gtt"
     assert payload["total_quantity"] == 75
-    assert payload["slice_quantity"] == 1800
+    assert payload["slice_quantity"] == 75
     assert payload["slice_count"] == 1
     assert payload["slices"][0]["submitted_order"] == {
         "type": "MULTIPLE",
@@ -806,3 +847,59 @@ def test_place_smart_bracket_order_slices_large_quantity() -> None:
         1800,
         150,
     ]
+
+
+def test_place_smart_bracket_order_rejects_invalid_lot_size() -> None:
+    """Reject quantities that are not a multiple of the instrument lot size."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/smart-bracket",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 76,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 118.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "status": "error",
+        "message": "Quantity 76 must be a multiple of lot size 75",
+    }
+
+
+def test_place_smart_bracket_order_rejects_invalid_tick_size() -> None:
+    """Reject prices that are not aligned to the instrument tick size."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/smart-bracket",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.53,
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 118.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "status": "error",
+        "message": "entry_trigger_price 125.53 must be a multiple of tick size 0.05",
+    }

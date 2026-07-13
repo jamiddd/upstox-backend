@@ -45,7 +45,9 @@ Response:
       "name": "Nifty 50",
       "underlying_type": "INDEX",
       "exchange": "NSE",
-      "lot_size": 75.0
+      "lot_size": 65.0,
+      "freeze_quantity": 1755.0,
+      "tick_size": 0.05
     },
     {
       "instrument_key": "NSE_EQ|INE002A01018",
@@ -53,7 +55,9 @@ Response:
       "name": "RELIANCE INDUSTRIES LTD",
       "underlying_type": "EQUITY",
       "exchange": "NSE",
-      "lot_size": 500.0
+      "lot_size": 500.0,
+      "freeze_quantity": 10000.0,
+      "tick_size": 0.05
     }
   ],
   "page": {
@@ -66,6 +70,14 @@ Response:
 ```
 
 When the user selects a result, pass `instrument_key` back to the main screen as its `underlying_key`.
+
+Use `lot_size`, `freeze_quantity`, and `tick_size` to guide the order UI:
+
+```text
+lot_size: quantity stepper increment/decrement
+tick_size: price stepper and client-side price validation
+freeze_quantity: show when the backend will split an order into slices
+```
 
 ## Upstox Mapping
 
