@@ -24,6 +24,7 @@ class Settings:
     token_encryption_key: str
     token_store_path: Path
     upstox_api_base_url: str = "https://api.upstox.com/v2"
+    upstox_api_v3_base_url: str = "https://api.upstox.com/v3"
     upstox_login_url: str = "https://api.upstox.com/v2/login/authorization/dialog"
     upstox_token_url: str = "https://api.upstox.com/v2/login/authorization/token"
 
@@ -39,6 +40,10 @@ class Settings:
             token_encryption_key=os.getenv("TOKEN_ENCRYPTION_KEY", ""),
             token_store_path=Path(os.getenv("TOKEN_STORE_PATH", "/data/upstox_token.enc")),
             upstox_api_base_url=os.getenv("UPSTOX_API_BASE_URL", "https://api.upstox.com/v2"),
+            upstox_api_v3_base_url=os.getenv(
+                "UPSTOX_API_V3_BASE_URL",
+                "https://api.upstox.com/v3",
+            ),
             upstox_login_url=os.getenv(
                 "UPSTOX_LOGIN_URL",
                 "https://api.upstox.com/v2/login/authorization/dialog",

@@ -76,6 +76,74 @@ def test_get_ltp_sends_bearer_token() -> None:
     assert payload == {"status": "success", "data": {}}
 
 
+def test_get_option_contracts_sends_underlying_and_expiry() -> None:
+    """Fetch option contracts with the selected underlying and expiry."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v2/option/contract"
+        assert request.url.params["instrument_key"] == "NSE_INDEX|Nifty 50"
+        assert request.url.params["expiry_date"] == "2026-07-16"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": []})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_option_contracts(
+                "upstox-token",
+                "NSE_INDEX|Nifty 50",
+                expiry_date="2026-07-16",
+            )
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": []}
+
+
+def test_get_funds_and_margin_uses_v3_api() -> None:
+    """Fetch funds from the V3 account endpoint."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v3/user/get-funds-and-margin"
+        assert request.headers["Api-Version"] == "3.0"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": {}})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_funds_and_margin("upstox-token")
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": {}}
+
+
+def test_get_market_feed_authorize_uses_v2_authorize_endpoint() -> None:
+    """Fetch a one-time WebSocket authorization URL for market streaming."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v2/feed/market-data-feed/authorize"
+        assert request.headers["Accept"] == "application/json"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"authorized_redirect_uri": "wss://feed.test/socket"},
+            },
+        )
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_market_feed_authorize("upstox-token")
+
+    payload = anyio.run(run)
+    assert payload == {
+        "status": "success",
+        "data": {"authorized_redirect_uri": "wss://feed.test/socket"},
+    }
+
+
 def test_upstox_errors_are_normalized() -> None:
     """Convert failed Upstox responses into the service error type."""
     async def handler(request: httpx.Request) -> httpx.Response:

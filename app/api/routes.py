@@ -14,6 +14,7 @@ from app.core.exceptions import (
 from app.services.token_store import EncryptedTokenStore
 from app.services.upstox_service import UpstoxService
 from app.core.security import require_mobile_api_key
+from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 
 public_router = APIRouter()
 protected_router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
@@ -128,6 +129,92 @@ async def get_positions(
     access_token = _load_access_token(token_store)
     try:
         return await service.get_positions(access_token)
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/main/bootstrap")
+async def main_bootstrap(
+    underlying_key: str = DEFAULT_UNDERLYING_KEY,
+    expiry_date: Optional[str] = None,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return screen-ready initial data for the option trading main screen."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await MainScreenService(service).bootstrap(
+            access_token,
+            underlying_key=underlying_key,
+            expiry_date=expiry_date,
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/main/selected-quote")
+async def main_selected_quote(
+    expiry_date: str = Query(min_length=1),
+    strike_price: float = Query(gt=0),
+    option_type: str = Query(pattern="^(CE|PE|ce|pe)$"),
+    underlying_key: str = DEFAULT_UNDERLYING_KEY,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return underlying spot plus selected option bid/ask prices."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await MainScreenService(service).selected_quote(
+            access_token,
+            underlying_key=underlying_key,
+            expiry_date=expiry_date,
+            strike_price=strike_price,
+            option_type=option_type,
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/main/position-quotes")
+async def main_position_quotes(
+    instrument_keys: str = Query(default=""),
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return LTP snapshots for open positions tracked by the app."""
+    access_token = _load_access_token(token_store)
+    keys = [key.strip() for key in instrument_keys.split(",") if key.strip()]
+    try:
+        return await MainScreenService(service).position_quotes(
+            access_token,
+            instrument_keys=keys,
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/main/summary")
+async def main_summary(
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, float]:
+    """Return opening balance, current P&L, and closing balance."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await MainScreenService(service).summary(access_token)
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/market/feed/authorize")
+async def authorize_market_feed(
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return a one-time Upstox V3 market feed WebSocket URL."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await service.get_market_feed_authorize(access_token)
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

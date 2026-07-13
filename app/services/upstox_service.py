@@ -80,6 +80,50 @@ class UpstoxService:
         """Fetch current trading positions for the logged-in Upstox account."""
         return await self._get_json("/portfolio/short-term-positions", access_token)
 
+    async def get_option_contracts(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        expiry_date: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Fetch option contracts for an underlying, optionally scoped to an expiry."""
+        params = {"instrument_key": instrument_key}
+        if expiry_date:
+            params["expiry_date"] = expiry_date
+        return await self._get_json("/option/contract", access_token, params=params)
+
+    async def get_funds_and_margin(self, access_token: str) -> dict[str, Any]:
+        """Fetch V3 funds and margin data for account summary."""
+        response = await self._request(
+            "GET",
+            f"{self.settings.upstox_api_v3_base_url}/user/get-funds-and-margin",
+            headers={
+                "Accept": "application/json",
+                "Api-Version": "3.0",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox funds response")
+        return payload
+
+    async def get_market_feed_authorize(self, access_token: str) -> dict[str, Any]:
+        """Fetch a one-time V3 market data WebSocket authorization URL."""
+        response = await self._request(
+            "GET",
+            f"{self.settings.upstox_api_base_url}/feed/market-data-feed/authorize",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox market feed authorization response")
+        return payload
+
     async def _get_json(
         self,
         path: str,

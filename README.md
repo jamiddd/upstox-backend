@@ -72,6 +72,7 @@ X-API-Key: <MOBILE_API_KEY>
 - `GET /api/auth/callback?code=...`
 - `GET /api/auth/status`
 - `POST /api/auth/logout`
+- `GET /api/market/feed/authorize`
 - `GET /api/market/ltp?instrument_key=...`
 - `GET /api/market/quotes?instrument_key=...`
 - `GET /api/portfolio/holdings`
@@ -85,3 +86,6 @@ https://api.scalp8.xyz
 ```
 
 See `docs/VPS_DEPLOYMENT.md` for the VPS checklist, smoke test steps, OAuth validation, and reverse proxy notes.
+
+## Screen APIs
+- Main screen backend contract: `docs/MAIN_SCREEN_API.md`
