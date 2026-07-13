@@ -76,6 +76,52 @@ def test_get_ltp_sends_bearer_token() -> None:
     assert payload == {"status": "success", "data": {}}
 
 
+def test_get_order_book_uses_current_day_order_endpoint() -> None:
+    """Fetch today's order book."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v2/order/retrieve-all"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": []})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_order_book("upstox-token")
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": []}
+
+
+def test_get_historical_trades_sends_pagination_and_date_range() -> None:
+    """Fetch historical trade records with segment, dates, and page params."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v2/charges/historical-trades"
+        assert request.url.params["segment"] == "FO"
+        assert request.url.params["start_date"] == "2026-04-01"
+        assert request.url.params["end_date"] == "2026-07-13"
+        assert request.url.params["page_number"] == "2"
+        assert request.url.params["page_size"] == "50"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": []})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_historical_trades(
+                "upstox-token",
+                segment="FO",
+                start_date="2026-04-01",
+                end_date="2026-07-13",
+                page_number=2,
+                page_size=50,
+            )
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": []}
+
+
 def test_get_option_contracts_sends_underlying_and_expiry() -> None:
     """Fetch option contracts with the selected underlying and expiry."""
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -142,6 +188,31 @@ def test_get_market_feed_authorize_uses_v2_authorize_endpoint() -> None:
         "status": "success",
         "data": {"authorized_redirect_uri": "wss://feed.test/socket"},
     }
+
+
+def test_search_instruments_sends_fo_option_filters() -> None:
+    """Search instruments with filters that find option-capable underlyings."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v2/instruments/search"
+        assert request.url.params["query"] == "NIFTY"
+        assert request.url.params["exchanges"] == "NSE,BSE"
+        assert request.url.params["segments"] == "FO"
+        assert request.url.params["instrument_types"] == "CE,PE"
+        assert request.url.params["expiry"] == "current_month"
+        assert request.url.params["atm_offset"] == "0"
+        assert request.url.params["page_number"] == "1"
+        assert request.url.params["records"] == "30"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": []})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.search_instruments("upstox-token", query="NIFTY")
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": []}
 
 
 def test_upstox_errors_are_normalized() -> None:

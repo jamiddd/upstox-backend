@@ -9,6 +9,7 @@ from app.api.dependencies import get_token_store, get_upstox_service
 from app.core.config import Settings, get_settings
 from app.main import app
 from app.services.main_screen_service import _CACHE
+from app.services.search_screen_service import _SEARCH_CACHE
 
 
 class FakeTokenStore:
@@ -104,6 +105,103 @@ class FakeUpstoxService:
             ],
         }
 
+    async def get_order_book(self, access_token: str) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "order_id": "order-older",
+                    "instrument_token": "NSE_FO|111",
+                    "trading_symbol": "NIFTY26JUL25000CE",
+                    "transaction_type": "BUY",
+                    "order_type": "LIMIT",
+                    "product": "I",
+                    "status": "complete",
+                    "quantity": 75,
+                    "filled_quantity": 75,
+                    "pending_quantity": 0,
+                    "price": 120.0,
+                    "average_price": 119.5,
+                    "trigger_price": 0,
+                    "order_timestamp": "2026-07-13 09:20:00",
+                    "exchange_timestamp": "2026-07-13 09:20:01",
+                    "status_message": "",
+                },
+                {
+                    "order_id": "order-newer",
+                    "instrument_token": "NSE_FO|222",
+                    "trading_symbol": "NIFTY26JUL25000PE",
+                    "transaction_type": "SELL",
+                    "order_type": "MARKET",
+                    "product": "I",
+                    "status": "rejected",
+                    "quantity": 75,
+                    "filled_quantity": 0,
+                    "pending_quantity": 0,
+                    "price": 0,
+                    "average_price": 0,
+                    "trigger_price": 0,
+                    "order_timestamp": "2026-07-13 09:25:00",
+                    "exchange_timestamp": "",
+                    "status_message": "Margin exceeded",
+                },
+            ],
+        }
+
+    async def get_historical_trades(
+        self,
+        access_token: str,
+        *,
+        segment: str,
+        start_date: str,
+        end_date: str,
+        page_number: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "trade_id": "trade-older",
+                    "instrument_token": "NSE_FO|111",
+                    "symbol": "NIFTY26JUL25000CE",
+                    "transaction_type": "BUY",
+                    "quantity": 75,
+                    "price": 120.0,
+                    "amount": 9000.0,
+                    "exchange": "NSE",
+                    "segment": segment,
+                    "option_type": "CE",
+                    "strike_price": "25000",
+                    "expiry": "2026-07-16",
+                    "trade_date": "2026-07-10",
+                },
+                {
+                    "trade_id": "trade-newer",
+                    "instrument_token": "NSE_FO|222",
+                    "symbol": "NIFTY26JUL25000PE",
+                    "transaction_type": "SELL",
+                    "quantity": 75,
+                    "price": 90.0,
+                    "amount": 6750.0,
+                    "exchange": "NSE",
+                    "segment": segment,
+                    "option_type": "PE",
+                    "strike_price": "25000",
+                    "expiry": "2026-07-16",
+                    "trade_date": "2026-07-12",
+                },
+            ],
+            "meta_data": {
+                "page": {
+                    "page_number": page_number,
+                    "page_size": page_size,
+                    "total_records": 2,
+                    "total_pages": 1,
+                }
+            },
+        }
+
     async def get_option_contracts(
         self,
         access_token: str,
@@ -157,6 +255,78 @@ class FakeUpstoxService:
             },
         }
 
+    async def search_instruments(
+        self,
+        access_token: str,
+        *,
+        query: str,
+        exchanges: str = "NSE,BSE",
+        segments: str = "FO",
+        instrument_types: str = "CE,PE",
+        expiry: str = "current_month",
+        atm_offset: int = 0,
+        page_number: int = 1,
+        records: int = 30,
+    ) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "name": "Nifty 50",
+                    "exchange": "NSE",
+                    "instrument_type": "CE",
+                    "underlying_key": "NSE_INDEX|Nifty 50",
+                    "underlying_type": "INDEX",
+                    "underlying_symbol": "NIFTY",
+                    "lot_size": 75,
+                },
+                {
+                    "name": "Nifty 50",
+                    "exchange": "NSE",
+                    "instrument_type": "PE",
+                    "underlying_key": "NSE_INDEX|Nifty 50",
+                    "underlying_type": "INDEX",
+                    "underlying_symbol": "NIFTY",
+                    "lot_size": 75,
+                },
+                {
+                    "name": "RELIANCE INDUSTRIES LTD",
+                    "exchange": "NSE",
+                    "instrument_type": "CE",
+                    "underlying_key": "NSE_EQ|INE002A01018",
+                    "underlying_type": "EQUITY",
+                    "underlying_symbol": "RELIANCE",
+                    "lot_size": 500,
+                },
+                {
+                    "name": "Gold",
+                    "exchange": "MCX",
+                    "instrument_type": "CE",
+                    "underlying_key": "MCX_FO|123",
+                    "underlying_type": "COM",
+                    "underlying_symbol": "GOLD",
+                    "lot_size": 100,
+                },
+                {
+                    "name": "Nifty Future",
+                    "exchange": "NSE",
+                    "instrument_type": "FUT",
+                    "underlying_key": "NSE_INDEX|Nifty 50",
+                    "underlying_type": "INDEX",
+                    "underlying_symbol": "NIFTY",
+                    "lot_size": 75,
+                },
+            ],
+            "meta_data": {
+                "page": {
+                    "page_number": page_number,
+                    "records": records,
+                    "total_records": 5,
+                    "total_pages": 1,
+                }
+            },
+        }
+
 
 def _settings() -> Settings:
     return Settings(
@@ -172,6 +342,7 @@ def _settings() -> Settings:
 
 def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     _CACHE.clear()
+    _SEARCH_CACHE.clear()
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = FakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: token_store or FakeTokenStore()
@@ -384,4 +555,147 @@ def test_market_feed_authorize_returns_one_time_websocket_url() -> None:
         "data": {
             "authorized_redirect_uri": "wss://feed.test/socket?code=one-time",
         },
+    }
+
+
+def test_search_underlyings_returns_only_option_capable_indices_and_stocks() -> None:
+    """Search screen returns deduped index/equity underlyings with F&O options."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/search/underlyings?query=nifty&limit=10",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "query": "nifty",
+        "results": [
+            {
+                "instrument_key": "NSE_INDEX|Nifty 50",
+                "symbol": "NIFTY",
+                "name": "Nifty 50",
+                "underlying_type": "INDEX",
+                "exchange": "NSE",
+                "lot_size": 75.0,
+            },
+            {
+                "instrument_key": "NSE_EQ|INE002A01018",
+                "symbol": "RELIANCE",
+                "name": "RELIANCE INDUSTRIES LTD",
+                "underlying_type": "EQUITY",
+                "exchange": "NSE",
+                "lot_size": 500.0,
+            },
+        ],
+        "page": {
+            "page_number": 1,
+            "records": 10,
+            "total_records": 5,
+            "total_pages": 1,
+        },
+    }
+
+
+def test_search_underlyings_empty_query_returns_default_option_indices() -> None:
+    """Empty search returns known index underlyings that provide options."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/search/underlyings?limit=2",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "query": "",
+        "results": [
+            {
+                "instrument_key": "NSE_INDEX|Nifty 50",
+                "symbol": "NIFTY",
+                "name": "Nifty 50",
+                "underlying_type": "INDEX",
+                "exchange": "NSE",
+                "lot_size": 0.0,
+            },
+            {
+                "instrument_key": "NSE_INDEX|Nifty Bank",
+                "symbol": "BANKNIFTY",
+                "name": "Nifty Bank",
+                "underlying_type": "INDEX",
+                "exchange": "NSE",
+                "lot_size": 0.0,
+            },
+        ],
+        "page": {
+            "page_number": 1,
+            "records": 2,
+            "total_records": 4,
+            "total_pages": 2,
+        },
+    }
+
+
+def test_order_history_today_returns_categorized_current_day_orders() -> None:
+    """Order history defaults to current-day order book grouped by status."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/orders/history?scope=today&page_size=10",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["scope"] == "today"
+    assert payload["source"] == "order_book"
+    assert [order["id"] for order in payload["orders"]] == ["order-newer", "order-older"]
+    assert [order["id"] for order in payload["categories"]["rejected"]] == ["order-newer"]
+    assert [order["id"] for order in payload["categories"]["complete"]] == ["order-older"]
+    assert payload["page"] == {
+        "page_number": 1,
+        "page_size": 10,
+        "total_records": 2,
+        "total_pages": 1,
+    }
+
+
+def test_order_history_all_returns_paginated_historical_trades() -> None:
+    """All mode returns paginated historical executed trades newest first."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/orders/history"
+            "?scope=all&page_number=1&page_size=50&start_date=2026-04-01&end_date=2026-07-13",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["scope"] == "all"
+    assert payload["source"] == "historical_trades"
+    assert "past executed trades" in payload["availability_note"]
+    assert [order["id"] for order in payload["orders"]] == ["trade-newer", "trade-older"]
+    assert [order["id"] for order in payload["categories"]["complete"]] == [
+        "trade-newer",
+        "trade-older",
+    ]
+    assert payload["filters"] == {
+        "segment": "FO",
+        "start_date": "2026-04-01",
+        "end_date": "2026-07-13",
+    }
+    assert payload["page"] == {
+        "page_number": 1,
+        "page_size": 50,
+        "total_records": 2,
+        "total_pages": 1,
     }

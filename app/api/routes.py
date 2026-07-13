@@ -15,6 +15,8 @@ from app.services.token_store import EncryptedTokenStore
 from app.services.upstox_service import UpstoxService
 from app.core.security import require_mobile_api_key
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
+from app.services.order_history_service import OrderHistoryService
+from app.services.search_screen_service import SearchScreenService
 
 public_router = APIRouter()
 protected_router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
@@ -215,6 +217,60 @@ async def authorize_market_feed(
     access_token = _load_access_token(token_store)
     try:
         return await service.get_market_feed_authorize(access_token)
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/search/underlyings")
+async def search_underlyings(
+    query: str = Query(default="", max_length=50),
+    limit: int = Query(default=20, ge=1, le=30),
+    page_number: int = Query(default=1, ge=1),
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Search only option-capable index/equity underlyings."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await SearchScreenService(service).search_underlyings(
+            access_token,
+            query=query,
+            limit=limit,
+            page_number=page_number,
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/orders/history")
+async def order_history(
+    scope: str = Query(default="today", pattern="^(today|all)$"),
+    page_number: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=500),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    segment: str = Query(default="FO", pattern="^(EQ|FO|CD|COM|MF)$"),
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return paginated order-history screen data."""
+    access_token = _load_access_token(token_store)
+    order_service = OrderHistoryService(service)
+    try:
+        if scope == "today":
+            return await order_service.today_orders(
+                access_token,
+                page_number=page_number,
+                page_size=page_size,
+            )
+        return await order_service.historical_orders(
+            access_token,
+            page_number=page_number,
+            page_size=page_size,
+            start_date=start_date,
+            end_date=end_date,
+            segment=segment,
+        )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

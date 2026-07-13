@@ -80,6 +80,33 @@ class UpstoxService:
         """Fetch current trading positions for the logged-in Upstox account."""
         return await self._get_json("/portfolio/short-term-positions", access_token)
 
+    async def get_order_book(self, access_token: str) -> dict[str, Any]:
+        """Fetch the current day's order book."""
+        return await self._get_json("/order/retrieve-all", access_token)
+
+    async def get_historical_trades(
+        self,
+        access_token: str,
+        *,
+        segment: str,
+        start_date: str,
+        end_date: str,
+        page_number: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        """Fetch paginated historical trade records."""
+        return await self._get_json(
+            "/charges/historical-trades",
+            access_token,
+            params={
+                "segment": segment,
+                "start_date": start_date,
+                "end_date": end_date,
+                "page_number": str(page_number),
+                "page_size": str(page_size),
+            },
+        )
+
     async def get_option_contracts(
         self,
         access_token: str,
@@ -92,6 +119,35 @@ class UpstoxService:
         if expiry_date:
             params["expiry_date"] = expiry_date
         return await self._get_json("/option/contract", access_token, params=params)
+
+    async def search_instruments(
+        self,
+        access_token: str,
+        *,
+        query: str,
+        exchanges: str = "NSE,BSE",
+        segments: str = "FO",
+        instrument_types: str = "CE,PE",
+        expiry: str = "current_month",
+        atm_offset: int = 0,
+        page_number: int = 1,
+        records: int = 30,
+    ) -> dict[str, Any]:
+        """Search Upstox instruments with filters suitable for F&O underlyings."""
+        return await self._get_json(
+            "/instruments/search",
+            access_token,
+            params={
+                "query": query,
+                "exchanges": exchanges,
+                "segments": segments,
+                "instrument_types": instrument_types,
+                "expiry": expiry,
+                "atm_offset": str(atm_offset),
+                "page_number": str(page_number),
+                "records": str(records),
+            },
+        )
 
     async def get_funds_and_margin(self, access_token: str) -> dict[str, Any]:
         """Fetch V3 funds and margin data for account summary."""
