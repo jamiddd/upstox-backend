@@ -519,8 +519,8 @@ def test_main_bootstrap_returns_screen_ready_payload() -> None:
     assert payload["selected_expiry"] == "2026-07-16"
     assert payload["summary"] == {
         "opening_balance": 100000.0,
-        "profit_loss": 375.0,
-        "closing_balance": 100375.0,
+        "profit_loss": 400.0,
+        "closing_balance": 100400.0,
         "available_margin": 92000.0,
         "margin_used": 8000.0,
         "payin_amount": 5000.0,
@@ -604,11 +604,40 @@ def test_main_summary_returns_balance_pnl_and_closing_balance() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "opening_balance": 100000.0,
-        "profit_loss": 375.0,
-        "closing_balance": 100375.0,
+        "profit_loss": 400.0,
+        "closing_balance": 100400.0,
         "available_margin": 92000.0,
         "margin_used": 8000.0,
         "payin_amount": 5000.0,
+    }
+
+
+def test_get_funds_and_margin_returns_raw_upstox_payload() -> None:
+    """Return the complete V3 funds-and-margin response without reshaping it."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/user/get-funds-and-margin",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "success",
+        "data": {
+            "available_to_trade": {
+                "cash_available_to_trade": {
+                    "cash": {
+                        "opening_balance": 100000.0,
+                    }
+                }
+            },
+            "available_margin": 92000.0,
+            "used_margin": 8000.0,
+            "payin_amount": 5000.0,
+        },
     }
 
 

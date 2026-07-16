@@ -167,7 +167,16 @@ GET /api/main/summary
 }
 ```
 
-`opening_balance`/`profit_loss`/`closing_balance` are unchanged from before. `available_margin` is the actual free-to-trade amount after margin blocked by open positions (falls back to `opening_balance` if Upstox doesn't expose it for this account); `margin_used` is margin currently locked by open positions; `payin_amount` is funds added today. The latter three are best-effort (found by field name anywhere in Upstox's funds response, not a hardcoded path) since only `opening_balance`'s exact nesting has been confirmed against a live account -- verify against real data and report back if they read as consistently 0.
+`opening_balance`/`closing_balance` are unchanged from before. `profit_loss` sums *every* position Upstox returns for the day, including ones already squared off (quantity 0) -- not just currently-open ones -- since a closed position still carries its realized P&L here; summing only open positions would read as 0 on a day that was all open-and-close scalps with nothing left open. `available_margin` is the actual free-to-trade amount after margin blocked by open positions (falls back to `opening_balance` if Upstox doesn't expose it for this account); `margin_used` is margin currently locked by open positions; `payin_amount` is funds added today. These three are best-effort (found by field name anywhere in Upstox's funds response, not a hardcoded path, trying a few plausible spellings) since only `opening_balance`'s exact nesting has been confirmed against a live account -- verify against real data and report back if they read as consistently 0.
+
+## Raw Funds and Margin
+
+```http
+GET /api/user/get-funds-and-margin
+```
+
+Returns the complete Upstox V3 `/user/get-funds-and-margin` response without reshaping it. Use
+`/api/main/summary` when the screen only needs the normalized summary fields.
 
 ## Refresh Cadence
 

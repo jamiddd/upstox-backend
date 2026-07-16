@@ -180,6 +180,19 @@ async def get_positions(
         raise _upstox_http_error(exc) from exc
 
 
+@protected_router.get("/user/get-funds-and-margin")
+async def get_funds_and_margin(
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return the raw Upstox V3 funds-and-margin payload."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await service.get_funds_and_margin(access_token)
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
 @protected_router.get("/main/bootstrap")
 async def main_bootstrap(
     underlying_key: str = DEFAULT_UNDERLYING_KEY,

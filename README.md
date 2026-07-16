@@ -77,6 +77,7 @@ X-API-Key: <MOBILE_API_KEY>
 - `GET /api/market/quotes?instrument_key=...`
 - `GET /api/portfolio/holdings`
 - `GET /api/portfolio/positions`
+- `GET /api/user/get-funds-and-margin`
 
 ## Deployment
 Production API base URL:

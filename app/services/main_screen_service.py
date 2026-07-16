@@ -191,11 +191,21 @@ class MainScreenService:
         funds_payload = await self.upstox.get_funds_and_margin(access_token)
         positions_payload = await self.upstox.get_positions(access_token)
         opening_balance = _opening_balance(funds_payload)
-        profit_loss = _positions_pnl(_positions_data(positions_payload))
+        # _all_positions_data, not _positions_data -- the day's total P&L must include positions
+        # already squared off today (quantity 0), which _positions_data deliberately filters out
+        # for *display* purposes. Using the filtered list here was the bug that made "Today's
+        # P&L" read as 0 on a day with lots of open-and-close scalps.
+        profit_loss = _positions_pnl(_all_positions_data(positions_payload))
 
-        available_margin = _find_numeric_field(funds_payload, "available_margin")
-        margin_used = _find_numeric_field(funds_payload, "used_margin")
-        payin_amount = _find_numeric_field(funds_payload, "payin_amount")
+        # Multiple candidate spellings per field -- Upstox's exact V3 naming for these three
+        # isn't confirmed against a live account; see _find_numeric_field's doc comment.
+        available_margin = _find_numeric_field(
+            funds_payload, "available_margin", "available_balance", "net_available_margin",
+        )
+        margin_used = _find_numeric_field(
+            funds_payload, "used_margin", "utilised_margin", "utilized_margin", "margin_utilised",
+        )
+        payin_amount = _find_numeric_field(funds_payload, "payin_amount", "payin", "pay_in_amount")
 
         summary = {
             "opening_balance": opening_balance,
@@ -310,11 +320,24 @@ def _contracts_data(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _positions_data(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Positions to *display* as "open positions" -- filters out anything already squared off
+    (quantity 0) today. NOT what the day's total P&L should be summed over -- see
+    `_all_positions_data`/`summary()`, since Upstox still reports a squared-off position's
+    realized P&L for the day here even though its quantity is now 0, and this filter would
+    silently drop it.
+    """
+    return [position for position in _all_positions_data(payload) if _number_value(position, "quantity") != 0]
+
+
+def _all_positions_data(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every position Upstox returned for today, open or already squared off -- use this (not
+    `_positions_data`) for anything that needs the day's *total* P&L, since a fully closed
+    position still carries its realized P&L here even though its quantity is 0.
+    """
     data = payload.get("data")
     if not isinstance(data, list):
         return []
-    positions = [item for item in data if isinstance(item, dict)]
-    return [position for position in positions if _number_value(position, "quantity") != 0]
+    return [item for item in data if isinstance(item, dict)]
 
 
 def _extract_expiries(payload: dict[str, Any]) -> list[str]:
@@ -387,24 +410,28 @@ def _positions_pnl(positions: list[dict[str, Any]]) -> float:
     return sum(_number_value(position, "pnl") for position in positions)
 
 
-def _find_numeric_field(payload: Any, field_name: str) -> Optional[float]:
-    """Recursively searches `payload` for the first numeric value at a key named
-    `field_name`, at any depth (dicts and lists). Used for funds/margin fields whose exact
-    nesting in Upstox's V3 response isn't confirmed -- a name-based search degrades gracefully
-    (returns None) if the field is missing or the shape differs, rather than a hardcoded `.get()`
-    chain that would just as silently return nothing but look like a real, verified path.
+def _find_numeric_field(payload: Any, *field_names: str) -> Optional[float]:
+    """Recursively searches `payload` for the first numeric value at a key matching any of
+    `field_names`, at any depth (dicts and lists). Used for funds/margin fields whose exact
+    nesting (and, in some cases, exact spelling) in Upstox's V3 response isn't confirmed -- a
+    name-based search degrades gracefully (returns None) if every candidate is missing, rather
+    than a hardcoded `.get()` chain that would just as silently return nothing but look like a
+    real, verified path. Multiple `field_names` let one call try several plausible spellings
+    (e.g. `used_margin` vs `utilised_margin`) without needing a live response to confirm which
+    one Upstox actually uses.
     """
     if isinstance(payload, dict):
-        value = payload.get(field_name)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
+        for field_name in field_names:
+            value = payload.get(field_name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
         for nested in payload.values():
-            found = _find_numeric_field(nested, field_name)
+            found = _find_numeric_field(nested, *field_names)
             if found is not None:
                 return found
     elif isinstance(payload, list):
         for item in payload:
-            found = _find_numeric_field(item, field_name)
+            found = _find_numeric_field(item, *field_names)
             if found is not None:
                 return found
     return None
