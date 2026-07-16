@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Optional
 
 from app.core.exceptions import UpstoxApiError
 from app.services.upstox_service import UpstoxService
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_UNDERLYING_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_UNDERLYING_SYMBOL = "NIFTY"
@@ -173,16 +176,30 @@ class MainScreenService:
             return {"positions": []}
 
         quotes = await self._quotes(access_token, keys)
-        return {
-            "positions": [
+        positions = []
+        for key in keys:
+            quote = _find_quote(quotes, key)
+            if not quote:
+                # Diagnostic for the Global Instruments ticker (GIFT NIFTY, S&P 500, etc.) --
+                # Upstox keys its quotes response by a colon-separated "EXCHANGE:SYMBOL" form,
+                # not the pipe-separated instrument_key used in the request, so _find_quote's
+                # fallback match relies on each quote's own "instrument_token" field lining up
+                # with what was requested. If that field is absent/differently formatted for a
+                # given segment, the lookup silently misses -- log the raw response keys here so
+                # a mismatch is visible in `docker compose logs` instead of just showing "--".
+                logger.warning(
+                    "position_quotes: no quote found for %s -- response data keys: %s",
+                    key,
+                    list(quotes.get("data", {}).keys()) if isinstance(quotes.get("data"), dict) else quotes.get("data"),
+                )
+            positions.append(
                 {
                     "instrument_key": key,
-                    "ltp": _last_price(_find_quote(quotes, key)),
-                    "previous_close": _previous_close(_find_quote(quotes, key)),
+                    "ltp": _last_price(quote),
+                    "previous_close": _previous_close(quote),
                 }
-                for key in keys
-            ]
-        }
+            )
+        return {"positions": positions}
 
     async def summary(self, access_token: str) -> dict[str, Any]:
         """Return the balance/margin/P&L summary for the screen.
