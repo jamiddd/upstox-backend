@@ -159,6 +159,41 @@ def test_place_gtt_order_posts_to_v3_gtt_endpoint() -> None:
     assert payload == {"status": "success", "data": {"gtt_order_ids": ["GTT-123"]}}
 
 
+def test_modify_order_puts_to_v3_modify_endpoint() -> None:
+    """Modify an open order through the current V3 endpoint."""
+    order = {
+        "order_id": "240108010918222",
+        "validity": "DAY",
+        "price": 126.5,
+        "order_type": "LIMIT",
+        "trigger_price": 0.0,
+        "quantity": 75,
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        assert request.url.path == "/v3/order/modify"
+        assert request.headers["Accept"] == "application/json"
+        assert request.headers["Content-Type"] == "application/json"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        assert json.loads((await request.aread()).decode("utf-8")) == order
+        return httpx.Response(
+            200,
+            json={"status": "success", "data": {"order_id": order["order_id"]}},
+        )
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.modify_order("upstox-token", order)
+
+    payload = anyio.run(run)
+    assert payload == {
+        "status": "success",
+        "data": {"order_id": "240108010918222"},
+    }
+
+
 def test_get_option_contracts_sends_underlying_and_expiry() -> None:
     """Fetch option contracts with the selected underlying and expiry."""
     async def handler(request: httpx.Request) -> httpx.Response:

@@ -128,6 +128,27 @@ class UpstoxService:
             raise UpstoxApiError("Unexpected Upstox GTT order response")
         return payload
 
+    async def modify_order(
+        self,
+        access_token: str,
+        order: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Modify an open or pending order through the V3 endpoint."""
+        response = await self._request(
+            "PUT",
+            f"{self.settings.upstox_api_v3_base_url}/order/modify",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+            json=order,
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox modify order response")
+        return payload
+
     async def get_option_contracts(
         self,
         access_token: str,

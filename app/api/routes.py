@@ -24,6 +24,7 @@ from app.services.instrument_rules_service import (
 )
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 from app.services.order_history_service import OrderHistoryService
+from app.services.order_modification_service import OrderModificationService
 from app.services.search_screen_service import SearchScreenService
 from app.services.smart_order_service import SmartOrderService
 
@@ -45,6 +46,25 @@ class SmartBracketOrderRequest(BaseModel):
     trailing_gap: Optional[float] = Field(default=None, gt=0)
     market_protection: Optional[int] = Field(default=None, ge=-1, le=25)
     slice_quantity: Optional[int] = Field(default=None, gt=0)
+
+
+class ModifyOrderRequest(BaseModel):
+    """Fields accepted by the Upstox V3 modify-order endpoint."""
+
+    order_id: str = Field(min_length=1)
+    validity: Literal["DAY", "IOC"]
+    price: float = Field(ge=0)
+    order_type: Literal["MARKET", "LIMIT", "SL", "SL-M"]
+    trigger_price: float = Field(ge=0)
+    quantity: Optional[int] = Field(default=None, gt=0)
+    disclosed_quantity: Optional[int] = Field(default=None, ge=0)
+    market_protection: Optional[int] = Field(default=None, ge=-1, le=25)
+
+
+class ModifyOrdersRequest(BaseModel):
+    """A non-empty collection with no application-level order-count cap."""
+
+    orders: list[ModifyOrderRequest] = Field(min_length=1)
 
 
 @protected_router.get("/status")
@@ -334,6 +354,18 @@ async def place_smart_bracket_order(
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
+
+
+@protected_router.put("/orders/modify")
+async def modify_orders(
+    request: ModifyOrdersRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Modify any number of open or pending orders."""
+    access_token = _load_access_token(token_store)
+    orders = [order.model_dump(exclude_none=True) for order in request.orders]
+    return await OrderModificationService(service).modify_orders(access_token, orders)
 
 
 def _load_access_token(token_store: EncryptedTokenStore) -> str:

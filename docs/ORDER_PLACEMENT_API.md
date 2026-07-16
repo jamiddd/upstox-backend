@@ -133,3 +133,66 @@ For BUY entry, Upstox treats TARGET/STOPLOSS as SELL exits; for SELL entry, exit
 TARGET and STOPLOSS trigger_type are always IMMEDIATE as required by Upstox.
 Normal Upstox v3 place-order supports slice=true, but GTT place order does not document slice=true, so the backend handles slicing for smart bracket orders.
 ```
+
+## Modify Orders
+
+```http
+PUT /api/orders/modify
+```
+
+This endpoint modifies one or more regular open/pending orders through Upstox V3. The
+backend does not impose an order-count limit: it submits each modification separately
+and continues after individual Upstox rejections.
+
+Request:
+
+```json
+{
+  "orders": [
+    {
+      "order_id": "240108010918222",
+      "validity": "DAY",
+      "price": 126.5,
+      "order_type": "LIMIT",
+      "trigger_price": 0,
+      "quantity": 75,
+      "disclosed_quantity": 0
+    }
+  ]
+}
+```
+
+`order_id`, `validity`, `price`, `order_type`, and `trigger_price` are required for
+each item. `quantity`, `disclosed_quantity`, and `market_protection` are optional.
+
+Response:
+
+```json
+{
+  "status": "partial_success",
+  "summary": {
+    "total": 2,
+    "success": 1,
+    "failed": 1
+  },
+  "orders": [
+    {
+      "order_id": "240108010918222",
+      "status": "success",
+      "upstox_response": {}
+    },
+    {
+      "order_id": "240108010918223",
+      "status": "error",
+      "error": {
+        "message": "Order cannot be modified",
+        "upstox_code": "UDAPI100041"
+      }
+    }
+  ]
+}
+```
+
+The top-level status is `success`, `partial_success`, or `error`. A failed item does
+not roll back successful modifications because Upstox processes them as independent
+orders.

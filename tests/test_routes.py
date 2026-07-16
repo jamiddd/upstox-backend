@@ -217,6 +217,25 @@ class FakeUpstoxService:
             "echo": order,
         }
 
+    async def modify_order(
+        self,
+        access_token: str,
+        order: dict[str, Any],
+    ) -> dict[str, Any]:
+        if order["order_id"] == "order-fail":
+            from app.core.exceptions import UpstoxApiError
+
+            raise UpstoxApiError(
+                "Order cannot be modified",
+                status_code=400,
+                upstox_code="UDAPI100041",
+            )
+        return {
+            "status": "success",
+            "data": {"order_id": order["order_id"]},
+            "echo": order,
+        }
+
     async def get_option_contracts(
         self,
         access_token: str,
@@ -847,6 +866,73 @@ def test_place_smart_bracket_order_slices_large_quantity() -> None:
         1800,
         150,
     ]
+
+
+def test_modify_orders_accepts_more_than_upstream_multi_order_limit() -> None:
+    """Process every order without imposing a bulk request count limit."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    orders = [
+        {
+            "order_id": f"order-{index}",
+            "validity": "DAY",
+            "price": 125.0 + index,
+            "order_type": "LIMIT",
+            "trigger_price": 0,
+            "quantity": 75,
+        }
+        for index in range(25)
+    ]
+    try:
+        response = client.put(
+            "/api/orders/modify",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"orders": orders},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["summary"] == {"total": 25, "success": 25, "failed": 0}
+    assert [order["order_id"] for order in payload["orders"]] == [
+        f"order-{index}" for index in range(25)
+    ]
+    assert payload["orders"][-1]["upstox_response"]["echo"] == orders[-1]
+
+
+def test_modify_orders_continues_after_an_individual_failure() -> None:
+    """Return partial results and still attempt orders after a rejected one."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    orders = [
+        {
+            "order_id": order_id,
+            "validity": "DAY",
+            "price": 125.0,
+            "order_type": "LIMIT",
+            "trigger_price": 0,
+        }
+        for order_id in ("order-1", "order-fail", "order-3")
+    ]
+    try:
+        response = client.put(
+            "/api/orders/modify",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"orders": orders},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "partial_success"
+    assert payload["summary"] == {"total": 3, "success": 2, "failed": 1}
+    assert [order["status"] for order in payload["orders"]] == [
+        "success",
+        "error",
+        "success",
+    ]
+    assert payload["orders"][1]["error"]["upstox_code"] == "UDAPI100041"
 
 
 def test_place_smart_bracket_order_rejects_invalid_lot_size() -> None:
