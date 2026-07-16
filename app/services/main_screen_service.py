@@ -48,6 +48,12 @@ class MainScreenService:
                 "symbol": _underlying_symbol(underlying_key, contracts),
                 "name": _underlying_name(underlying_key, contracts),
                 "spot_price": _last_price(_find_quote(quote, underlying_key)),
+                # Previous trading day's close -- lets the app show a "(+0.40%)" change badge
+                # next to the spot price without a separate OHLC/history call. Comes from the
+                # same full-quote call already made for spot_price above (Upstox's quote payload
+                # includes an `ohlc` block per instrument; `ohlc.close` is the prior session's
+                # close, not "today's close so far").
+                "previous_close": _previous_close(_find_quote(quote, underlying_key)),
             },
             "expiries": expiries,
             "selected_expiry": selected_expiry,
@@ -477,6 +483,13 @@ def _option_type(contract: dict[str, Any]) -> str:
 
 def _last_price(quote: dict[str, Any]) -> float:
     return _number_value(quote, "last_price", "ltp")
+
+
+def _previous_close(quote: dict[str, Any]) -> float:
+    ohlc = quote.get("ohlc")
+    if not isinstance(ohlc, dict):
+        return 0.0
+    return _number_value(ohlc, "close")
 
 
 def _best_depth_price(quote: dict[str, Any], side: str) -> float:

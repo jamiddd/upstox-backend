@@ -54,6 +54,12 @@ class FakeUpstoxService:
             "NSE_INDEX|Nifty 50": {
                 "instrument_token": "NSE_INDEX|Nifty 50",
                 "last_price": 25050.0,
+                "ohlc": {
+                    "open": 24900.0,
+                    "high": 25100.0,
+                    "low": 24850.0,
+                    "close": 24950.0,
+                },
             },
             "NSE_FO|111": {
                 "instrument_token": "NSE_FO|111",
@@ -524,6 +530,7 @@ def test_main_bootstrap_returns_screen_ready_payload() -> None:
         "symbol": "NIFTY",
         "name": "NIFTY",
         "spot_price": 25050.0,
+        "previous_close": 24950.0,
     }
     assert payload["expiries"] == ["2026-07-16", "2026-07-23"]
     assert payload["selected_expiry"] == "2026-07-16"

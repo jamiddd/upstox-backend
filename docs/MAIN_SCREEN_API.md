@@ -23,6 +23,10 @@ expiry_date=<nearest available expiry>
 ```
 
 Returns the underlying, available expiries, account summary, and currently open positions.
+`previous_close` is the underlying's last trading day's closing price (from the same full-quote
+call already made for `spot_price` -- Upstox's quote payload includes an `ohlc` block per
+instrument; `ohlc.close` is the prior session's close, not "today's close so far"), letting the
+app show a "(+0.40%)" change badge next to the spot price without a separate history/OHLC call.
 
 ```json
 {
@@ -30,7 +34,8 @@ Returns the underlying, available expiries, account summary, and currently open 
     "instrument_key": "NSE_INDEX|Nifty 50",
     "symbol": "NIFTY",
     "name": "NIFTY",
-    "spot_price": 25050.0
+    "spot_price": 25050.0,
+    "previous_close": 24950.0
   },
   "expiries": ["2026-07-16", "2026-07-23"],
   "selected_expiry": "2026-07-16",
