@@ -11,6 +11,7 @@ import asyncio
 
 from app.core.config import Settings
 from app.core.exceptions import UpstoxApiError
+from app.services.main_screen_service import MainScreenService
 from app.services.token_store import EncryptedTokenStore
 from app.services.upstox_service import UpstoxService
 
@@ -51,6 +52,12 @@ async def main() -> None:
             print("OK  ltp   ", key, "->", list(data.get("data", {}).keys()))
         except UpstoxApiError as exc:
             print("FAIL ltp   ", key, "->", exc)
+
+    print("--- end-to-end position_quotes() with only the working GLOBAL_INDEX keys ---")
+    index_keys = [k for k in KEYS if k not in INDICATOR_KEYS]
+    result = await MainScreenService(svc).position_quotes(token, instrument_keys=index_keys)
+    for position in result["positions"]:
+        print(position)
 
 
 if __name__ == "__main__":
