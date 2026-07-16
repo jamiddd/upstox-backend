@@ -278,15 +278,25 @@ class FakeUpstoxService:
             "status": "success",
             "data": {
                 "available_to_trade": {
+                    "total": 99980.0,
                     "cash_available_to_trade": {
+                        "total": 91980.0,
                         "cash": {
                             "opening_balance": 100000.0,
-                        }
-                    }
+                            "added_today": 2000.0,
+                            "withdrawn_today": -100.0,
+                        },
+                        "margin_used": {
+                            "total": 9920.0,
+                        },
+                    },
+                    "pledge_available_to_trade": {
+                        "total": 8000.0,
+                        "margin_used": {
+                            "total": 80.0,
+                        },
+                    },
                 },
-                "available_margin": 92000.0,
-                "used_margin": 8000.0,
-                "payin_amount": 5000.0,
             },
         }
 
@@ -520,10 +530,10 @@ def test_main_bootstrap_returns_screen_ready_payload() -> None:
     assert payload["summary"] == {
         "opening_balance": 100000.0,
         "profit_loss": 400.0,
-        "closing_balance": 100400.0,
-        "available_margin": 92000.0,
-        "margin_used": 8000.0,
-        "payin_amount": 5000.0,
+        "closing_balance": 102300.0,
+        "available_margin": 99980.0,
+        "margin_used": 10000.0,
+        "payin_amount": 1900.0,
     }
     assert payload["open_positions"] == [
         {
@@ -605,10 +615,10 @@ def test_main_summary_returns_balance_pnl_and_closing_balance() -> None:
     assert response.json() == {
         "opening_balance": 100000.0,
         "profit_loss": 400.0,
-        "closing_balance": 100400.0,
-        "available_margin": 92000.0,
-        "margin_used": 8000.0,
-        "payin_amount": 5000.0,
+        "closing_balance": 102300.0,
+        "available_margin": 99980.0,
+        "margin_used": 10000.0,
+        "payin_amount": 1900.0,
     }
 
 
@@ -628,15 +638,25 @@ def test_get_funds_and_margin_returns_raw_upstox_payload() -> None:
         "status": "success",
         "data": {
             "available_to_trade": {
+                "total": 99980.0,
                 "cash_available_to_trade": {
+                    "total": 91980.0,
                     "cash": {
                         "opening_balance": 100000.0,
-                    }
-                }
+                        "added_today": 2000.0,
+                        "withdrawn_today": -100.0,
+                    },
+                    "margin_used": {
+                        "total": 9920.0,
+                    },
+                },
+                "pledge_available_to_trade": {
+                    "total": 8000.0,
+                    "margin_used": {
+                        "total": 80.0,
+                    },
+                },
             },
-            "available_margin": 92000.0,
-            "used_margin": 8000.0,
-            "payin_amount": 5000.0,
         },
     }
 

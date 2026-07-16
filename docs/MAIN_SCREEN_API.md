@@ -36,11 +36,11 @@ Returns the underlying, available expiries, account summary, and currently open 
   "selected_expiry": "2026-07-16",
   "summary": {
     "opening_balance": 100000.0,
-    "profit_loss": 375.0,
-    "closing_balance": 100375.0,
-    "available_margin": 92000.0,
-    "margin_used": 8000.0,
-    "payin_amount": 5000.0
+    "profit_loss": 400.0,
+    "closing_balance": 102300.0,
+    "available_margin": 99980.0,
+    "margin_used": 10000.0,
+    "payin_amount": 1900.0
   },
   "open_positions": [
     {
@@ -159,15 +159,22 @@ GET /api/main/summary
 ```json
 {
   "opening_balance": 100000.0,
-  "profit_loss": 375.0,
-  "closing_balance": 100375.0,
-  "available_margin": 92000.0,
-  "margin_used": 8000.0,
-  "payin_amount": 5000.0
+  "profit_loss": 400.0,
+  "closing_balance": 102300.0,
+  "available_margin": 99980.0,
+  "margin_used": 10000.0,
+  "payin_amount": 1900.0
 }
 ```
 
-`opening_balance`/`closing_balance` are unchanged from before. `profit_loss` sums *every* position Upstox returns for the day, including ones already squared off (quantity 0) -- not just currently-open ones -- since a closed position still carries its realized P&L here; summing only open positions would read as 0 on a day that was all open-and-close scalps with nothing left open. `available_margin` is the actual free-to-trade amount after margin blocked by open positions (falls back to `opening_balance` if Upstox doesn't expose it for this account); `margin_used` is margin currently locked by open positions; `payin_amount` is funds added today. These three are best-effort (found by field name anywhere in Upstox's funds response, not a hardcoded path, trying a few plausible spellings) since only `opening_balance`'s exact nesting has been confirmed against a live account -- verify against real data and report back if they read as consistently 0.
+All six fields' source paths are confirmed against a real `GET /v3/user/get-funds-and-margin` response (see "Raw Funds and Margin" below):
+
+- `opening_balance` (`available_to_trade.cash_available_to_trade.cash.opening_balance`) is a genuine static start-of-day snapshot -- it does NOT move when cash is added/withdrawn intraday.
+- `profit_loss` sums *every* position Upstox returns for the day, including ones already squared off (quantity 0) -- not just currently-open ones -- since a closed position still carries its realized P&L here; summing only open positions would read as 0 on a day that was all open-and-close scalps with nothing left open.
+- `available_margin` (`available_to_trade.total`) is the actual "can I place another order right now" number: cash + pledge margin, already net of margin blocked by open positions and today's cash movement.
+- `margin_used` sums `cash_available_to_trade.margin_used.total` and `pledge_available_to_trade.margin_used.total` -- margin currently locked by open positions.
+- `payin_amount` is `cash.added_today + cash.withdrawn_today` (the latter already negative) -- net cash movement today.
+- `closing_balance` = `opening_balance + payin_amount + profit_loss` -- includes today's net cash movement (not just `opening_balance + profit_loss` as before), since a mid-day deposit is real money added to the account, not "profit".
 
 ## Raw Funds and Margin
 

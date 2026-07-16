@@ -170,18 +170,25 @@ class MainScreenService:
     async def summary(self, access_token: str) -> dict[str, float]:
         """Return the balance/margin/P&L summary for the screen.
 
-        `opening_balance`/`profit_loss`/`closing_balance` are the original three fields (kept
-        exactly as before for backward compatibility) -- despite the name, `opening_balance` is
-        actually re-fetched live on every call (only cached for 5s), so it already reflects
-        same-day fund additions/withdrawals; it just isn't *labeled* that way to the user.
+        Field shapes below are confirmed against a real `GET /v3/user/get-funds-and-margin`
+        response (see `docs/MAIN_SCREEN_API.md`'s "Raw Funds and Margin" passthrough route) --
+        not guessed:
 
-        `available_margin`/`margin_used`/`payin_amount` are new: pulled from the same funds
-        payload via `_find_numeric_field`, a tolerant recursive search rather than a hardcoded
-        path -- Upstox's V3 funds response isn't fully documented/verified against a live account
-        in this codebase (only the `opening_balance` leaf was previously confirmed), so a search
-        by field name is safer than guessing an exact nesting that might silently return nothing.
-        Each falls back to a sensible default (never null) if Upstox doesn't include that field
-        for this account.
+        - `opening_balance` (`available_to_trade.cash_available_to_trade.cash.opening_balance`)
+          really is a static start-of-day snapshot -- it does NOT move when cash is added/
+          withdrawn intraday. Kept only because `closing_balance` is defined in terms of it.
+        - `available_margin` (`available_to_trade.total`) is the true "can I place another order
+          right now" number: cash + pledge margin, already net of margin blocked by open
+          positions and today's cash additions/withdrawals.
+        - `margin_used` sums `cash_available_to_trade.margin_used.total` and
+          `pledge_available_to_trade.margin_used.total` -- margin currently locked by open
+          positions, from both cash and pledged collateral.
+        - `payin_amount` is `cash.added_today + cash.withdrawn_today` (the latter already
+          negative) -- net cash movement today, which is exactly the "I added money mid-day"
+          case `available_margin`/`closing_balance` should (and now do) reflect.
+        - `closing_balance` = `opening_balance + payin_amount + profit_loss` -- extended from the
+          original `opening_balance + profit_loss` to also account for today's net cash
+          movement, since a mid-day deposit is real money added to the account, not "profit".
         """
         cache_key = ("summary",)
         cached = _cache_get(cache_key)
@@ -197,25 +204,17 @@ class MainScreenService:
         # P&L" read as 0 on a day with lots of open-and-close scalps.
         profit_loss = _positions_pnl(_all_positions_data(positions_payload))
 
-        # Multiple candidate spellings per field -- Upstox's exact V3 naming for these three
-        # isn't confirmed against a live account; see _find_numeric_field's doc comment.
-        available_margin = _find_numeric_field(
-            funds_payload, "available_margin", "available_balance", "net_available_margin",
-        )
-        margin_used = _find_numeric_field(
-            funds_payload, "used_margin", "utilised_margin", "utilized_margin", "margin_utilised",
-        )
-        payin_amount = _find_numeric_field(funds_payload, "payin_amount", "payin", "pay_in_amount")
+        available_margin = _available_margin_total(funds_payload)
+        margin_used = _margin_used_total(funds_payload)
+        payin_amount = _net_cash_added_today(funds_payload)
 
         summary = {
             "opening_balance": opening_balance,
             "profit_loss": profit_loss,
-            "closing_balance": opening_balance + profit_loss,
-            # Falls back to opening_balance (today's live cash, pre-margin-block) if Upstox
-            # doesn't surface a dedicated available_margin field for this account/segment.
-            "available_margin": available_margin if available_margin is not None else opening_balance,
-            "margin_used": margin_used if margin_used is not None else 0.0,
-            "payin_amount": payin_amount if payin_amount is not None else 0.0,
+            "closing_balance": opening_balance + payin_amount + profit_loss,
+            "available_margin": available_margin,
+            "margin_used": margin_used,
+            "payin_amount": payin_amount,
         }
         _cache_set(cache_key, summary, ttl_seconds=5.0)
         return summary
@@ -390,51 +389,66 @@ def _entry_price(position: dict[str, Any]) -> float:
     return 0.0
 
 
-def _opening_balance(payload: dict[str, Any]) -> float:
+def _available_to_trade(payload: dict[str, Any]) -> dict[str, Any]:
+    """The `data.available_to_trade` object shared by every funds/margin field below -- see
+    `docs/MAIN_SCREEN_API.md`'s "Raw Funds and Margin" section for the confirmed real shape.
+    """
     data = payload.get("data")
     if not isinstance(data, dict):
-        return 0.0
+        return {}
     available = data.get("available_to_trade")
-    if not isinstance(available, dict):
-        return 0.0
-    cash_available = available.get("cash_available_to_trade")
+    return available if isinstance(available, dict) else {}
+
+
+def _cash_block(payload: dict[str, Any]) -> dict[str, Any]:
+    cash_available = _available_to_trade(payload).get("cash_available_to_trade")
     if not isinstance(cash_available, dict):
-        return 0.0
+        return {}
     cash = cash_available.get("cash")
-    if not isinstance(cash, dict):
-        return 0.0
-    return _number_value(cash, "opening_balance")
+    return cash if isinstance(cash, dict) else {}
+
+
+def _opening_balance(payload: dict[str, Any]) -> float:
+    """A genuine start-of-day snapshot (confirmed against a live response -- it does NOT move
+    when cash is added/withdrawn intraday, unlike what an earlier pass here assumed).
+    """
+    return _number_value(_cash_block(payload), "opening_balance")
+
+
+def _net_cash_added_today(payload: dict[str, Any]) -> float:
+    """`added_today + withdrawn_today` (the latter already negative in Upstox's response) --
+    net cash movement today, e.g. +110 added and -130 withdrawn nets to -20.
+    """
+    cash = _cash_block(payload)
+    return _number_value(cash, "added_today") + _number_value(cash, "withdrawn_today")
+
+
+def _available_margin_total(payload: dict[str, Any]) -> float:
+    """`available_to_trade.total` -- cash + pledge margin, already net of margin blocked by open
+    positions and today's cash movement. The actual "can I place another order right now" number.
+    """
+    return _number_value(_available_to_trade(payload), "total")
+
+
+def _margin_used_total(payload: dict[str, Any]) -> float:
+    """Margin currently locked by open positions, summed across both cash and pledged
+    collateral (`cash_available_to_trade.margin_used.total` + `pledge_available_to_trade
+    .margin_used.total`).
+    """
+    available = _available_to_trade(payload)
+    total = 0.0
+    for segment_key in ("cash_available_to_trade", "pledge_available_to_trade"):
+        segment = available.get(segment_key)
+        if not isinstance(segment, dict):
+            continue
+        margin_used = segment.get("margin_used")
+        if isinstance(margin_used, dict):
+            total += _number_value(margin_used, "total")
+    return total
 
 
 def _positions_pnl(positions: list[dict[str, Any]]) -> float:
     return sum(_number_value(position, "pnl") for position in positions)
-
-
-def _find_numeric_field(payload: Any, *field_names: str) -> Optional[float]:
-    """Recursively searches `payload` for the first numeric value at a key matching any of
-    `field_names`, at any depth (dicts and lists). Used for funds/margin fields whose exact
-    nesting (and, in some cases, exact spelling) in Upstox's V3 response isn't confirmed -- a
-    name-based search degrades gracefully (returns None) if every candidate is missing, rather
-    than a hardcoded `.get()` chain that would just as silently return nothing but look like a
-    real, verified path. Multiple `field_names` let one call try several plausible spellings
-    (e.g. `used_margin` vs `utilised_margin`) without needing a live response to confirm which
-    one Upstox actually uses.
-    """
-    if isinstance(payload, dict):
-        for field_name in field_names:
-            value = payload.get(field_name)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return float(value)
-        for nested in payload.values():
-            found = _find_numeric_field(nested, *field_names)
-            if found is not None:
-                return found
-    elif isinstance(payload, list):
-        for item in payload:
-            found = _find_numeric_field(item, *field_names)
-            if found is not None:
-                return found
-    return None
 
 
 def _underlying_symbol(underlying_key: str, contracts_payload: dict[str, Any]) -> str:
