@@ -235,11 +235,11 @@ def test_get_funds_and_margin_uses_v3_api() -> None:
     assert payload == {"status": "success", "data": {}}
 
 
-def test_get_market_feed_authorize_uses_v2_authorize_endpoint() -> None:
-    """Fetch a one-time WebSocket authorization URL for market streaming."""
+def test_get_market_feed_authorize_uses_v3_authorize_endpoint() -> None:
+    """Fetch a one-time V3 WebSocket authorization URL for market streaming."""
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
-        assert request.url.path == "/v2/feed/market-data-feed/authorize"
+        assert request.url.path == "/v3/feed/market-data-feed/authorize"
         assert request.headers["Accept"] == "application/json"
         assert request.headers["Authorization"] == "Bearer upstox-token"
         return httpx.Response(

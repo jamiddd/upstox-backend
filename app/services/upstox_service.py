@@ -211,7 +211,7 @@ class UpstoxService:
         """Fetch a one-time V3 market data WebSocket authorization URL."""
         response = await self._request(
             "GET",
-            f"{self.settings.upstox_api_base_url}/feed/market-data-feed/authorize",
+            f"{self.settings.upstox_api_v3_base_url}/feed/market-data-feed/authorize",
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {access_token}",
