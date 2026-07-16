@@ -306,3 +306,47 @@ def test_upstox_errors_are_normalized() -> None:
     assert exc_info.value.status_code == 400
     assert exc_info.value.upstox_code == "UDAPI1087"
     assert exc_info.value.message == "Invalid instrument"
+
+
+def test_upstox_errors_extract_message_from_nested_errors_list() -> None:
+    """Upstox's real error envelope nests the message inside `errors[0]`, not a flat string --
+    e.g. {"status": "error", "errors": [{"errorCode": "UDAPI100072", "message": "..."}]}. This is
+    the shape Upstox actually sends (confirmed against a live account hitting the funds/margin
+    endpoint during its nightly maintenance window); a `_build_api_error` that only handled a
+    flat `message`/`errors` string previously left `message` stuck on the generic "Upstox request
+    failed" fallback for every real Upstox error, silently hiding the real reason from both the
+    backend logs and the app.
+    """
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            423,
+            json={
+                "status": "error",
+                "errors": [
+                    {
+                        "errorCode": "UDAPI100072",
+                        "message": (
+                            "The Funds service is accessible from 5:30 AM to 12:00 AM IST "
+                            "daily. Please try again during these service hours."
+                        ),
+                        "propertyPath": None,
+                        "invalidValue": None,
+                    }
+                ],
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            await service.get_funds_and_margin("upstox-token")
+
+    with pytest.raises(UpstoxApiError) as exc_info:
+        anyio.run(run)
+
+    assert exc_info.value.status_code == 423
+    assert exc_info.value.upstox_code == "UDAPI100072"
+    assert exc_info.value.message == (
+        "The Funds service is accessible from 5:30 AM to 12:00 AM IST daily. Please try again "
+        "during these service hours."
+    )

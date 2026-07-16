@@ -279,7 +279,7 @@ async def main_position_quotes(
 async def main_summary(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Return opening balance, current P&L, and closing balance."""
     access_token = _load_access_token(token_store)
     try:

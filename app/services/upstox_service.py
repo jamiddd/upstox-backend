@@ -258,7 +258,17 @@ class UpstoxService:
 
     @staticmethod
     def _build_api_error(response: httpx.Response) -> UpstoxApiError:
-        """Normalize an Upstox error response into an exception."""
+        """Normalize an Upstox error response into an exception.
+
+        FIX: Upstox's actual error envelope is `{"status": "error", "errors": [{"errorCode":
+        "...", "message": "..."}]}` -- `errors` is a *list* of objects, not a plain string. The
+        `isinstance(message_value, str)` check below only ever matched the (rarer) shape where
+        `message`/`errors` is itself a string, so for the common list-of-objects shape `message`
+        silently stayed the generic "Upstox request failed" fallback -- e.g. Upstox's real
+        "Funds service is only available 5:30 AM - 12:00 AM IST" explanation was present in the
+        response the whole time, just never extracted, so every caller (including what the app
+        shows the user) only ever saw the useless generic fallback instead.
+        """
         try:
             payload = response.json()
         except ValueError:
@@ -276,6 +286,15 @@ class UpstoxService:
             code_value = payload.get("code") or payload.get("errorCode")
             if isinstance(message_value, str):
                 message = message_value
+            elif isinstance(message_value, list) and message_value:
+                first_error = message_value[0]
+                if isinstance(first_error, dict):
+                    nested_message = first_error.get("message")
+                    if isinstance(nested_message, str):
+                        message = nested_message
+                    nested_code = first_error.get("errorCode") or first_error.get("error_code")
+                    if isinstance(nested_code, str):
+                        code_value = nested_code
             if isinstance(code_value, str):
                 upstox_code = code_value
 

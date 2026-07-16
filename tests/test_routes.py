@@ -280,6 +280,34 @@ class FakeUpstoxService:
         return {"status": "success", "data": contracts}
 
     async def get_funds_and_margin(self, access_token: str) -> dict[str, Any]:
+        if access_token == "funds-unavailable-token":
+            # Mirrors Upstox's real nightly maintenance-window error (UDAPI100072) -- see
+            # main_screen_service.summary()'s doc comment for why this must not take down the
+            # whole bootstrap call.
+            from app.core.exceptions import UpstoxApiError
+
+            # Message/upstox_code here match what UpstoxService._build_api_error now extracts
+            # from this exact real error shape (see that function's own test coverage) --
+            # FakeUpstoxService stands in for UpstoxService entirely, so it must simulate that
+            # extraction's result, not the raw response shape.
+            raise UpstoxApiError(
+                "The Funds service is accessible from 5:30 AM to 12:00 AM IST daily. Please "
+                "try again during these service hours.",
+                status_code=423,
+                upstox_code="UDAPI100072",
+                details={
+                    "status": "error",
+                    "errors": [
+                        {
+                            "errorCode": "UDAPI100072",
+                            "message": (
+                                "The Funds service is accessible from 5:30 AM to 12:00 AM IST "
+                                "daily. Please try again during these service hours."
+                            ),
+                        }
+                    ],
+                },
+            )
         return {
             "status": "success",
             "data": {
@@ -541,6 +569,7 @@ def test_main_bootstrap_returns_screen_ready_payload() -> None:
         "available_margin": 99980.0,
         "margin_used": 10000.0,
         "payin_amount": 1900.0,
+        "funds_unavailable_note": None,
     }
     assert payload["open_positions"] == [
         {
@@ -552,6 +581,40 @@ def test_main_bootstrap_returns_screen_ready_payload() -> None:
             "pnl": 375.0,
         }
     ]
+
+
+def test_main_bootstrap_degrades_gracefully_when_funds_service_unavailable() -> None:
+    """A funds/margin failure (e.g. Upstox's nightly maintenance window) must not take down the
+    whole bootstrap call -- spot price, expiries, and positions are all independently available.
+    """
+    client = _client(FakeTokenStore(token="funds-unavailable-token"))
+    try:
+        response = client.get(
+            "/api/main/bootstrap",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    # Unaffected -- these don't depend on the funds/margin call at all.
+    assert payload["underlying"]["spot_price"] == 25050.0
+    assert payload["expiries"] == ["2026-07-16", "2026-07-23"]
+    assert payload["open_positions"] != []
+    # Funds-derived fields degrade to 0 rather than the whole request failing, with a note
+    # explaining why instead of silently looking like an empty/zero account.
+    summary = payload["summary"]
+    assert summary["opening_balance"] == 0.0
+    assert summary["available_margin"] == 0.0
+    assert summary["margin_used"] == 0.0
+    assert summary["payin_amount"] == 0.0
+    # profit_loss is unaffected since it comes from positions, not funds.
+    assert summary["profit_loss"] == 400.0
+    assert summary["funds_unavailable_note"] == (
+        "The Funds service is accessible from 5:30 AM to 12:00 AM IST daily. Please try again "
+        "during these service hours."
+    )
 
 
 def test_main_selected_quote_returns_bid_and_ask_for_selected_strike() -> None:
@@ -626,6 +689,7 @@ def test_main_summary_returns_balance_pnl_and_closing_balance() -> None:
         "available_margin": 99980.0,
         "margin_used": 10000.0,
         "payin_amount": 1900.0,
+        "funds_unavailable_note": None,
     }
 
 

@@ -173,7 +173,7 @@ class MainScreenService:
             ]
         }
 
-    async def summary(self, access_token: str) -> dict[str, float]:
+    async def summary(self, access_token: str) -> dict[str, Any]:
         """Return the balance/margin/P&L summary for the screen.
 
         Field shapes below are confirmed against a real `GET /v3/user/get-funds-and-margin`
@@ -195,13 +195,27 @@ class MainScreenService:
         - `closing_balance` = `opening_balance + payin_amount + profit_loss` -- extended from the
           original `opening_balance + profit_loss` to also account for today's net cash
           movement, since a mid-day deposit is real money added to the account, not "profit".
+
+        FIX: Upstox's funds-and-margin endpoint has a documented daily maintenance window
+        (~12:00 AM - 5:30 AM IST, Upstox error code UDAPI100072, "The Funds service is
+        accessible from 5:30 AM to 12:00 AM IST daily") during which it reliably fails. That
+        used to take down this *entire* bootstrap call (spot price, expiries, positions are all
+        otherwise independently available) since the exception wasn't caught here and propagated
+        all the way up as a 423. Now only the funds-derived fields degrade (to 0, with
+        `funds_unavailable_note` explaining why) -- the rest of the screen still loads.
         """
         cache_key = ("summary",)
         cached = _cache_get(cache_key)
         if cached is not None:
             return cached
 
-        funds_payload = await self.upstox.get_funds_and_margin(access_token)
+        funds_payload: dict[str, Any] = {}
+        funds_unavailable_note: Optional[str] = None
+        try:
+            funds_payload = await self.upstox.get_funds_and_margin(access_token)
+        except UpstoxApiError as exc:
+            funds_unavailable_note = exc.message or "Funds and margin data is temporarily unavailable."
+
         positions_payload = await self.upstox.get_positions(access_token)
         opening_balance = _opening_balance(funds_payload)
         # _all_positions_data, not _positions_data -- the day's total P&L must include positions
@@ -214,13 +228,14 @@ class MainScreenService:
         margin_used = _margin_used_total(funds_payload)
         payin_amount = _net_cash_added_today(funds_payload)
 
-        summary = {
+        summary: dict[str, Any] = {
             "opening_balance": opening_balance,
             "profit_loss": profit_loss,
             "closing_balance": opening_balance + payin_amount + profit_loss,
             "available_margin": available_margin,
             "margin_used": margin_used,
             "payin_amount": payin_amount,
+            "funds_unavailable_note": funds_unavailable_note,
         }
         _cache_set(cache_key, summary, ttl_seconds=5.0)
         return summary
