@@ -175,18 +175,35 @@ class MainScreenService:
         if not keys:
             return {"positions": []}
 
-        quotes = await self._quotes(access_token, keys)
+        # FIX: a single instrument Upstox doesn't actually recognize (confirmed for its
+        # GLOBAL_INDICATOR segment -- USDINR/BZUSD/CLUSD are listed in Upstox's own Global
+        # Instruments file but rejected by both the quotes and LTP endpoints with "One of either
+        # symbol or instrument_key is invalid") makes Upstox reject the *entire* batched request,
+        # not just that key -- so every other instrument in the same call (e.g. the Global
+        # ticker's otherwise-working GIFT NIFTY/S&P 500/etc.) silently got no data too. Falling
+        # back to fetching one instrument at a time when the batch fails means one bad key only
+        # blanks itself out, not everyone requested alongside it.
+        try:
+            quotes = await self._quotes(access_token, keys)
+        except UpstoxApiError:
+            quotes = {"data": {}}
+            for key in keys:
+                try:
+                    single = await self._quotes(access_token, [key])
+                except UpstoxApiError:
+                    logger.warning("position_quotes: Upstox rejected instrument key %s", key)
+                    continue
+                quotes["data"].update(single.get("data") or {})
+
         positions = []
         for key in keys:
             quote = _find_quote(quotes, key)
             if not quote:
-                # Diagnostic for the Global Instruments ticker (GIFT NIFTY, S&P 500, etc.) --
                 # Upstox keys its quotes response by a colon-separated "EXCHANGE:SYMBOL" form,
                 # not the pipe-separated instrument_key used in the request, so _find_quote's
                 # fallback match relies on each quote's own "instrument_token" field lining up
-                # with what was requested. If that field is absent/differently formatted for a
-                # given segment, the lookup silently misses -- log the raw response keys here so
-                # a mismatch is visible in `docker compose logs` instead of just showing "--".
+                # with what was requested -- log the raw response keys here so a mismatch is
+                # visible in `docker compose logs` instead of just showing "--".
                 logger.warning(
                     "position_quotes: no quote found for %s -- response data keys: %s",
                     key,
