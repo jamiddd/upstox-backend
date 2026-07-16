@@ -142,14 +142,20 @@ sometimes only have one side listed).
 GET /api/main/position-quotes?instrument_keys=NSE_FO%7C111,NSE_FO%7C222
 ```
 
-Returns compact LTP snapshots for open positions so the app can update local P&L.
+Returns compact LTP + previous-close snapshots for any instrument keys -- originally for open
+positions, but it's a generic quote call, also used to poll the toolbar's watchlist ticker
+(regular NSE/BSE instruments AND Upstox's Global Instruments, e.g. `GLOBAL_INDEX|^GSPC` for S&P
+500, `GLOBAL_INDEX|SGX NIFTY` for GIFT NIFTY, `GLOBAL_INDICATOR|USDINR` -- see Upstox's Global
+Instruments file; the underlying Full Market Quote call supports these directly). `previous_close`
+lets the app color each entry by direction (up/down vs. yesterday's close).
 
 ```json
 {
   "positions": [
     {
       "instrument_key": "NSE_FO|111",
-      "ltp": 125.0
+      "ltp": 125.0,
+      "previous_close": 120.0
     }
   ]
 }

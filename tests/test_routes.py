@@ -77,6 +77,11 @@ class FakeUpstoxService:
                     "sell": [{"price": 90.5}],
                 },
             },
+            "GLOBAL_INDEX|^GSPC": {
+                "instrument_token": "GLOBAL_INDEX|^GSPC",
+                "last_price": 5555.5,
+                "ohlc": {"open": 5500.0, "high": 5560.0, "low": 5495.0, "close": 5540.0},
+            },
         }
         return {
             "status": "success",
@@ -664,8 +669,29 @@ def test_main_position_quotes_returns_ltp_for_requested_keys() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "positions": [
-            {"instrument_key": "NSE_FO|111", "ltp": 125.0},
-            {"instrument_key": "NSE_FO|222", "ltp": 90.0},
+            {"instrument_key": "NSE_FO|111", "ltp": 125.0, "previous_close": 0.0},
+            {"instrument_key": "NSE_FO|222", "ltp": 90.0, "previous_close": 0.0},
+        ]
+    }
+
+
+def test_main_position_quotes_supports_global_instrument_keys() -> None:
+    """The same generic quote call also works for Upstox's Global Instruments (e.g. S&P 500) --
+    used to poll the toolbar's Global watchlist ticker, which has no WebSocket feed support.
+    """
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/main/position-quotes?instrument_keys=GLOBAL_INDEX%7C%5EGSPC",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "positions": [
+            {"instrument_key": "GLOBAL_INDEX|^GSPC", "ltp": 5555.5, "previous_close": 5540.0},
         ]
     }
 

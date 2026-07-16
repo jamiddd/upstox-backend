@@ -157,7 +157,17 @@ class MainScreenService:
         *,
         instrument_keys: list[str],
     ) -> dict[str, Any]:
-        """Return LTP snapshots for currently open position instruments."""
+        """Return LTP (+ previous close) snapshots for any instrument keys.
+
+        Originally written for open positions, but this is really just a generic
+        "give me a quote for these instrument keys" call -- the app also uses it to poll the
+        Main screen toolbar's watchlist ticker (both the regular NSE/BSE watchlist and the
+        Global Instruments ticker, e.g. `GLOBAL_INDEX|^GSPC`/`GLOBAL_INDICATOR|USDINR` -- see
+        Upstox's Global Instruments file, which the Full Market Quote endpoint this wraps
+        (`_quotes`/`get_quotes`) supports directly). `previous_close` lets the app color each
+        entry by direction (up/down vs. yesterday's close) the same way the underlying's own
+        spot-price change badge does.
+        """
         keys = _dedupe([key for key in instrument_keys if key])
         if not keys:
             return {"positions": []}
@@ -168,6 +178,7 @@ class MainScreenService:
                 {
                     "instrument_key": key,
                     "ltp": _last_price(_find_quote(quotes, key)),
+                    "previous_close": _previous_close(_find_quote(quotes, key)),
                 }
                 for key in keys
             ]
