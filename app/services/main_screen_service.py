@@ -96,6 +96,55 @@ class MainScreenService:
             },
         }
 
+    async def option_chain(
+        self,
+        access_token: str,
+        *,
+        underlying_key: str,
+        expiry_date: str,
+    ) -> dict[str, Any]:
+        """Return every strike's CE/PE contract metadata for one underlying + expiry.
+
+        Clients use this to figure out the real strike interval and the at-the-money
+        strike themselves, from the actual listed strikes -- there's no reliable way to
+        guess a strike step (it varies by underlying: 50 for NIFTY, 100 for BANKNIFTY,
+        arbitrary for stocks) without seeing the real option chain.
+
+        Unlike `selected_quote`, this does not fetch live bid/ask quotes for every
+        strike (that would be one Upstox quote call per strike times two, on every
+        expiry change) -- it only returns contract metadata (instrument keys, lot
+        size, tick size) needed to resolve which contract is ATM. The client then
+        calls `selected_quote` for that one strike to get its live price.
+        """
+        contracts = await self._option_contracts(
+            access_token,
+            underlying_key,
+            expiry_date=expiry_date,
+        )
+        by_strike: dict[float, dict[str, Any]] = {}
+        for contract in _contracts_data(contracts):
+            if contract.get("expiry") != expiry_date:
+                continue
+            option_type = _option_type(contract)
+            if option_type not in ("CE", "PE"):
+                continue
+            strike = _number_value(contract, "strike_price")
+            entry = by_strike.setdefault(strike, {"strike_price": strike})
+            entry[option_type.lower()] = {
+                "instrument_key": _string_value(contract, "instrument_key"),
+                "trading_symbol": _string_value(contract, "trading_symbol", "tradingsymbol"),
+                "lot_size": _number_value(contract, "lot_size"),
+                "freeze_quantity": _number_value(contract, "freeze_quantity"),
+                "tick_size": _tick_size(contract),
+            }
+
+        strikes = sorted(by_strike.values(), key=lambda item: item["strike_price"])
+        return {
+            "underlying_key": underlying_key,
+            "expiry_date": expiry_date,
+            "strikes": strikes,
+        }
+
     async def position_quotes(
         self,
         access_token: str,

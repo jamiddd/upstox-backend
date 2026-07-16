@@ -222,6 +222,25 @@ async def main_selected_quote(
         raise _upstox_http_error(exc) from exc
 
 
+@protected_router.get("/main/option-chain")
+async def main_option_chain(
+    expiry_date: str = Query(min_length=1),
+    underlying_key: str = DEFAULT_UNDERLYING_KEY,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return every strike's CE/PE contract metadata for the underlying + expiry."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await MainScreenService(service).option_chain(
+            access_token,
+            underlying_key=underlying_key,
+            expiry_date=expiry_date,
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
 @protected_router.get("/main/position-quotes")
 async def main_position_quotes(
     instrument_keys: str = Query(default=""),

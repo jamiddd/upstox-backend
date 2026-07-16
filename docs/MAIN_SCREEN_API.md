@@ -87,6 +87,47 @@ The app sends the selected strike and CE/PE toggle. The backend resolves the mat
 }
 ```
 
+## Option Chain
+
+```http
+GET /api/main/option-chain?expiry_date=2026-07-16&underlying_key=NSE_INDEX|Nifty 50
+```
+
+Returns every listed strike's CE/PE contract metadata for the given underlying + expiry, so the
+app can determine the real strike interval and the at-the-money strike from the actual listed
+strikes instead of guessing a step size (it varies by underlying: 50 for NIFTY, 100 for
+BANKNIFTY, arbitrary for stocks). This does not include live bid/ask prices -- call
+`selected-quote` for the one strike the app resolves as ATM to get its live price.
+
+```json
+{
+  "underlying_key": "NSE_INDEX|Nifty 50",
+  "expiry_date": "2026-07-16",
+  "strikes": [
+    {
+      "strike_price": 25000.0,
+      "ce": {
+        "instrument_key": "NSE_FO|111",
+        "trading_symbol": "NIFTY26JUL25000CE",
+        "lot_size": 65.0,
+        "freeze_quantity": 1755.0,
+        "tick_size": 0.05
+      },
+      "pe": {
+        "instrument_key": "NSE_FO|222",
+        "trading_symbol": "NIFTY26JUL25000PE",
+        "lot_size": 65.0,
+        "freeze_quantity": 1755.0,
+        "tick_size": 0.05
+      }
+    }
+  ]
+}
+```
+
+A strike missing a listed CE or PE contract simply omits that key (e.g. deep ITM/OTM strikes
+sometimes only have one side listed).
+
 ## Position Quotes
 
 ```http
