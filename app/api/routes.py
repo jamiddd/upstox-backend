@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -30,6 +31,8 @@ from app.services.smart_order_service import SmartOrderService
 
 public_router = APIRouter()
 protected_router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
+
+logger = logging.getLogger(__name__)
 
 
 class SmartBracketOrderRequest(BaseModel):
@@ -419,7 +422,22 @@ def _http_error(status_code: int, message: str) -> HTTPException:
 
 
 def _upstox_http_error(exc: UpstoxApiError) -> HTTPException:
-    """Build a normalized HTTP response for an Upstox API failure."""
+    """Build a normalized HTTP response for an Upstox API failure.
+
+    Logged here (not just returned to the client) because Upstox's raw response body was
+    previously undiagnosable from `docker compose logs` -- uvicorn's access log only records the
+    resulting status code (e.g. "GET /api/main/bootstrap ... 423 Locked"), never the body Upstox
+    actually sent back explaining *why*. The Android app now also surfaces `exc.details` in its
+    own error message (see the app repo's `ApiResult.parseErrorBody`), but logging it here too
+    means it's visible without needing a client rebuild to see it.
+    """
+    logger.error(
+        "Upstox API failure: status_code=%s upstox_code=%s message=%s details=%s",
+        exc.status_code,
+        exc.upstox_code,
+        exc.message,
+        exc.details,
+    )
     detail: dict[str, Any] = {
         "status": "error",
         "message": exc.message,
