@@ -168,7 +168,21 @@ class MainScreenService:
         }
 
     async def summary(self, access_token: str) -> dict[str, float]:
-        """Return the opening/P&L/closing balance summary for the screen."""
+        """Return the balance/margin/P&L summary for the screen.
+
+        `opening_balance`/`profit_loss`/`closing_balance` are the original three fields (kept
+        exactly as before for backward compatibility) -- despite the name, `opening_balance` is
+        actually re-fetched live on every call (only cached for 5s), so it already reflects
+        same-day fund additions/withdrawals; it just isn't *labeled* that way to the user.
+
+        `available_margin`/`margin_used`/`payin_amount` are new: pulled from the same funds
+        payload via `_find_numeric_field`, a tolerant recursive search rather than a hardcoded
+        path -- Upstox's V3 funds response isn't fully documented/verified against a live account
+        in this codebase (only the `opening_balance` leaf was previously confirmed), so a search
+        by field name is safer than guessing an exact nesting that might silently return nothing.
+        Each falls back to a sensible default (never null) if Upstox doesn't include that field
+        for this account.
+        """
         cache_key = ("summary",)
         cached = _cache_get(cache_key)
         if cached is not None:
@@ -178,10 +192,20 @@ class MainScreenService:
         positions_payload = await self.upstox.get_positions(access_token)
         opening_balance = _opening_balance(funds_payload)
         profit_loss = _positions_pnl(_positions_data(positions_payload))
+
+        available_margin = _find_numeric_field(funds_payload, "available_margin")
+        margin_used = _find_numeric_field(funds_payload, "used_margin")
+        payin_amount = _find_numeric_field(funds_payload, "payin_amount")
+
         summary = {
             "opening_balance": opening_balance,
             "profit_loss": profit_loss,
             "closing_balance": opening_balance + profit_loss,
+            # Falls back to opening_balance (today's live cash, pre-margin-block) if Upstox
+            # doesn't surface a dedicated available_margin field for this account/segment.
+            "available_margin": available_margin if available_margin is not None else opening_balance,
+            "margin_used": margin_used if margin_used is not None else 0.0,
+            "payin_amount": payin_amount if payin_amount is not None else 0.0,
         }
         _cache_set(cache_key, summary, ttl_seconds=5.0)
         return summary
@@ -361,6 +385,29 @@ def _opening_balance(payload: dict[str, Any]) -> float:
 
 def _positions_pnl(positions: list[dict[str, Any]]) -> float:
     return sum(_number_value(position, "pnl") for position in positions)
+
+
+def _find_numeric_field(payload: Any, field_name: str) -> Optional[float]:
+    """Recursively searches `payload` for the first numeric value at a key named
+    `field_name`, at any depth (dicts and lists). Used for funds/margin fields whose exact
+    nesting in Upstox's V3 response isn't confirmed -- a name-based search degrades gracefully
+    (returns None) if the field is missing or the shape differs, rather than a hardcoded `.get()`
+    chain that would just as silently return nothing but look like a real, verified path.
+    """
+    if isinstance(payload, dict):
+        value = payload.get(field_name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        for nested in payload.values():
+            found = _find_numeric_field(nested, field_name)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_numeric_field(item, field_name)
+            if found is not None:
+                return found
+    return None
 
 
 def _underlying_symbol(underlying_key: str, contracts_payload: dict[str, Any]) -> str:

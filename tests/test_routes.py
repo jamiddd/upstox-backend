@@ -283,7 +283,10 @@ class FakeUpstoxService:
                             "opening_balance": 100000.0,
                         }
                     }
-                }
+                },
+                "available_margin": 92000.0,
+                "used_margin": 8000.0,
+                "payin_amount": 5000.0,
             },
         }
 
@@ -518,6 +521,9 @@ def test_main_bootstrap_returns_screen_ready_payload() -> None:
         "opening_balance": 100000.0,
         "profit_loss": 375.0,
         "closing_balance": 100375.0,
+        "available_margin": 92000.0,
+        "margin_used": 8000.0,
+        "payin_amount": 5000.0,
     }
     assert payload["open_positions"] == [
         {
@@ -600,6 +606,9 @@ def test_main_summary_returns_balance_pnl_and_closing_balance() -> None:
         "opening_balance": 100000.0,
         "profit_loss": 375.0,
         "closing_balance": 100375.0,
+        "available_margin": 92000.0,
+        "margin_used": 8000.0,
+        "payin_amount": 5000.0,
     }
 
 

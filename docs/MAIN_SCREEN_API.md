@@ -37,7 +37,10 @@ Returns the underlying, available expiries, account summary, and currently open 
   "summary": {
     "opening_balance": 100000.0,
     "profit_loss": 375.0,
-    "closing_balance": 100375.0
+    "closing_balance": 100375.0,
+    "available_margin": 92000.0,
+    "margin_used": 8000.0,
+    "payin_amount": 5000.0
   },
   "open_positions": [
     {
@@ -157,9 +160,14 @@ GET /api/main/summary
 {
   "opening_balance": 100000.0,
   "profit_loss": 375.0,
-  "closing_balance": 100375.0
+  "closing_balance": 100375.0,
+  "available_margin": 92000.0,
+  "margin_used": 8000.0,
+  "payin_amount": 5000.0
 }
 ```
+
+`opening_balance`/`profit_loss`/`closing_balance` are unchanged from before. `available_margin` is the actual free-to-trade amount after margin blocked by open positions (falls back to `opening_balance` if Upstox doesn't expose it for this account); `margin_used` is margin currently locked by open positions; `payin_amount` is funds added today. The latter three are best-effort (found by field name anywhere in Upstox's funds response, not a hardcoded path) since only `opening_balance`'s exact nesting has been confirmed against a live account -- verify against real data and report back if they read as consistently 0.
 
 ## Refresh Cadence
 
