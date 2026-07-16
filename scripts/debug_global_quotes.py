@@ -30,6 +30,9 @@ KEYS = [
 ]
 
 
+INDICATOR_KEYS = [k for k in KEYS if k.startswith("GLOBAL_INDICATOR")]
+
+
 async def main() -> None:
     settings = Settings.from_env()
     token = EncryptedTokenStore(settings).load_access_token()
@@ -37,9 +40,17 @@ async def main() -> None:
     for key in KEYS:
         try:
             data = await svc.get_quotes(token, key)
-            print("OK  ", key, "->", list(data.get("data", {}).keys()))
+            print("OK  quotes", key, "->", list(data.get("data", {}).keys()))
         except UpstoxApiError as exc:
-            print("FAIL", key, "->", exc)
+            print("FAIL quotes", key, "->", exc)
+
+    print("--- retrying GLOBAL_INDICATOR keys via /market-quote/ltp instead ---")
+    for key in INDICATOR_KEYS:
+        try:
+            data = await svc.get_ltp(token, key)
+            print("OK  ltp   ", key, "->", list(data.get("data", {}).keys()))
+        except UpstoxApiError as exc:
+            print("FAIL ltp   ", key, "->", exc)
 
 
 if __name__ == "__main__":
