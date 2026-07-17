@@ -322,10 +322,13 @@ async def search_underlyings(
     query: str = Query(default="", max_length=50),
     limit: int = Query(default=20, ge=1, le=30),
     page_number: int = Query(default=1, ge=1),
+    include_futures: bool = Query(default=False),
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Search only option-capable index/equity underlyings."""
+    """Search option-capable index/equity underlyings, optionally also matching futures contracts
+    (see SearchScreenService.search_underlyings' doc comment for why include_futures is opt-in).
+    """
     access_token = _load_access_token(token_store)
     try:
         return await SearchScreenService(service).search_underlyings(
@@ -333,6 +336,7 @@ async def search_underlyings(
             query=query,
             limit=limit,
             page_number=page_number,
+            include_futures=include_futures,
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc

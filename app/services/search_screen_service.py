@@ -102,15 +102,23 @@ class SearchScreenService:
         query: str,
         limit: int = 20,
         page_number: int = 1,
+        include_futures: bool = False,
     ) -> dict[str, Any]:
-        """Return deduped index/equity underlyings that have option contracts."""
+        """Return deduped index/equity underlyings that have option contracts.
+
+        [include_futures] additionally merges in matching current-month futures contracts
+        (instrument_type FUT) -- see _shape_futures' doc comment for why these need their own
+        opt-in flag rather than always being included. Only the Watchlist "Add" flow (not the
+        Search screen's underlying picker, which needs a real option-capable underlying to hand
+        off to the Main screen's bootstrap call) should ever pass this true.
+        """
         normalized_query = query.strip()
         safe_limit = min(max(limit, 1), 30)
         safe_page = max(page_number, 1)
         if not normalized_query:
             return _default_indices(limit=safe_limit, page_number=safe_page)
 
-        cache_key = (normalized_query.upper(), safe_limit, safe_page)
+        cache_key = (normalized_query.upper(), safe_limit, safe_page, include_futures)
         cached = _cache_get(cache_key)
         if cached is not None:
             return cached
@@ -136,6 +144,19 @@ class SearchScreenService:
                     continue
                 results.append(item)
                 seen_keys.add(item["instrument_key"])
+            if include_futures and len(results) < safe_limit:
+                futures_payload = await self.upstox.search_instruments(
+                    access_token,
+                    query=normalized_query,
+                    instrument_types="FUT",
+                    page_number=1,
+                    records=safe_limit - len(results),
+                )
+                for item in _shape_futures(futures_payload, limit=safe_limit - len(results)):
+                    if item["instrument_key"] in seen_keys:
+                        continue
+                    results.append(item)
+                    seen_keys.add(item["instrument_key"])
         response = {
             "query": normalized_query,
             "results": results,
@@ -199,6 +220,51 @@ def _shape_underlyings(payload: dict[str, Any], *, limit: int) -> list[dict[str,
                 "name": _string_value(item, "name"),
                 "underlying_type": underlying_type,
                 "exchange": _exchange_from_key(underlying_key) or _string_value(item, "exchange"),
+                "lot_size": _number_value(item, "lot_size"),
+                "freeze_quantity": _number_value(item, "freeze_quantity"),
+                "tick_size": _tick_size(item),
+            }
+        )
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def _shape_futures(payload: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    """Shapes instrument_types=FUT search results as their own watchlist-only entries.
+
+    Unlike _shape_underlyings (which discards each CE/PE result and keeps only the *underlying*
+    it points to, via underlying_key/underlying_symbol), a futures contract IS the instrument to
+    watch -- there's no separate "underlying" indirection to resolve. underlying_type is
+    deliberately set to "FUTURES" (not a real Upstox value) so the Android app can tell these
+    apart from a real option-capable underlying if it ever needs to -- e.g. these are meaningless
+    to hand to the Main screen's bootstrap call (which expects an INDEX/EQUITY underlying key with
+    option contracts), only good for watching a live price.
+    """
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return []
+
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if _string_value(item, "instrument_type") != "FUT":
+            continue
+        instrument_key = _string_value(item, "instrument_key")
+        if not instrument_key or instrument_key in seen:
+            continue
+
+        seen.add(instrument_key)
+        results.append(
+            {
+                "instrument_key": instrument_key,
+                "symbol": _string_value(item, "trading_symbol"),
+                "name": _string_value(item, "name"),
+                "underlying_type": "FUTURES",
+                "exchange": _exchange_from_key(instrument_key) or _string_value(item, "exchange"),
                 "lot_size": _number_value(item, "lot_size"),
                 "freeze_quantity": _number_value(item, "freeze_quantity"),
                 "tick_size": _tick_size(item),

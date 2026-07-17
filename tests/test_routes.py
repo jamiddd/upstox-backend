@@ -523,6 +523,8 @@ class FakeUpstoxService:
                     "name": "Nifty Future",
                     "exchange": "NSE",
                     "instrument_type": "FUT",
+                    "instrument_key": "NSE_FO|53216",
+                    "trading_symbol": "NIFTY FUT 31 JUL 26",
                     "underlying_key": "NSE_INDEX|Nifty 50",
                     "underlying_type": "INDEX",
                     "underlying_symbol": "NIFTY",
@@ -1040,6 +1042,33 @@ def test_search_underlyings_returns_only_option_capable_indices_and_stocks() -> 
             "total_pages": 1,
         },
     }
+
+
+def test_search_underlyings_include_futures_merges_futures_contract() -> None:
+    """include_futures=true additionally matches a FUT contract as its own watchlist-only entry
+    -- excluded by default (see test_search_underlyings_returns_only_option_capable_indices_and_stocks).
+    """
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/search/underlyings?query=nifty&limit=10&include_futures=true",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert {
+        "instrument_key": "NSE_FO|53216",
+        "symbol": "NIFTY FUT 31 JUL 26",
+        "name": "Nifty Future",
+        "underlying_type": "FUTURES",
+        "exchange": "NSE",
+        "lot_size": 75.0,
+        "freeze_quantity": 1800.0,
+        "tick_size": 0.05,
+    } in body["results"]
 
 
 def test_search_underlyings_empty_query_returns_default_option_indices() -> None:
