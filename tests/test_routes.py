@@ -109,6 +109,41 @@ class FakeUpstoxService:
             },
         }
 
+    async def get_brokerage(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        quantity: int,
+        product: str,
+        transaction_type: str,
+        price: float,
+    ) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": {
+                "charges": {
+                    "total": 24.58,
+                    "brokerage": 20.0,
+                    "taxes": {"gst": 3.6, "stt": 0.75, "stamp_duty": 0.06},
+                    "other_charges": {
+                        "transaction": 0.12,
+                        "clearing": 0.0,
+                        "ipft": 0.03,
+                        "sebi_turnover": 0.02,
+                    },
+                },
+                "request": {
+                    "access_token": access_token,
+                    "instrument_key": instrument_key,
+                    "quantity": quantity,
+                    "product": product,
+                    "transaction_type": transaction_type,
+                    "price": price,
+                },
+            },
+        }
+
     async def get_holdings(self, access_token: str) -> dict[str, Any]:
         return {"status": "success", "data": [{"token": access_token}]}
 
@@ -991,6 +1026,45 @@ def test_get_funds_and_margin_returns_raw_upstox_payload() -> None:
             },
         },
     }
+
+
+def test_get_brokerage_returns_upstox_charge_estimate() -> None:
+    """Forward a valid order estimate request to Upstox's brokerage calculator."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/charges/brokerage?instrument_key=NSE_FO%7C111&quantity=75"
+            "&product=I&transaction_type=BUY&price=125.5",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["data"]["charges"]["total"] == 24.58
+    assert response.json()["data"]["request"] == {
+        "access_token": "stored-token",
+        "instrument_key": "NSE_FO|111",
+        "quantity": 75,
+        "product": "I",
+        "transaction_type": "BUY",
+        "price": 125.5,
+    }
+
+
+def test_get_brokerage_rejects_invalid_order_parameters() -> None:
+    """Reject invalid brokerage requests before a call reaches Upstox."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/charges/brokerage?instrument_key=NSE_FO%7C111&quantity=0"
+            "&product=I&transaction_type=BUY&price=0",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422
 
 
 def test_market_feed_authorize_returns_one_time_websocket_url() -> None:

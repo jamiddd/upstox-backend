@@ -75,6 +75,7 @@ X-API-Key: <MOBILE_API_KEY>
 - `GET /api/market/feed/authorize`
 - `GET /api/market/ltp?instrument_key=...`
 - `GET /api/market/quotes?instrument_key=...`
+- `GET /api/charges/brokerage?instrument_key=...&quantity=...&product=...&transaction_type=...&price=...`
 - `GET /api/portfolio/holdings`
 - `GET /api/portfolio/positions`
 - `GET /api/user/get-funds-and-margin`
@@ -93,3 +94,4 @@ See `docs/VPS_DEPLOYMENT.md` for the VPS checklist, smoke test steps, OAuth vali
 - Search screen backend contract: `docs/SEARCH_SCREEN_API.md`
 - Order history screen backend contract: `docs/ORDER_HISTORY_SCREEN_API.md`
 - Order placement backend contract: `docs/ORDER_PLACEMENT_API.md`
+- Brokerage estimation backend contract: `docs/BROKERAGE_API.md`

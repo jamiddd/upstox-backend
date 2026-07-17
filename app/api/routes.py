@@ -173,6 +173,31 @@ async def get_quotes(
         raise _upstox_http_error(exc) from exc
 
 
+@protected_router.get("/charges/brokerage")
+async def get_brokerage(
+    instrument_key: str = Query(min_length=1),
+    quantity: int = Query(gt=0),
+    product: Literal["I", "D", "MTF"] = Query(),
+    transaction_type: Literal["BUY", "SELL"] = Query(),
+    price: float = Query(gt=0),
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return Upstox's estimated brokerage, taxes, and other charges for one order."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await service.get_brokerage(
+            access_token,
+            instrument_key=instrument_key,
+            quantity=quantity,
+            product=product,
+            transaction_type=transaction_type,
+            price=price,
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
 @protected_router.get("/portfolio/holdings")
 async def get_holdings(
     service: UpstoxService = Depends(get_upstox_service),

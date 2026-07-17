@@ -72,6 +72,34 @@ class UpstoxService:
             params={"instrument_key": instrument_key},
         )
 
+    async def get_brokerage(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        quantity: int,
+        product: str,
+        transaction_type: str,
+        price: float,
+    ) -> dict[str, Any]:
+        """Calculate Upstox's estimated charges for one proposed order.
+
+        The public Upstox API calls the identifier ``instrument_token``. The rest of this
+        backend consistently calls the same value ``instrument_key``, so the translation is
+        deliberately kept here at the upstream boundary.
+        """
+        return await self._get_json(
+            "/charges/brokerage",
+            access_token,
+            params={
+                "instrument_token": instrument_key,
+                "quantity": str(quantity),
+                "product": product,
+                "transaction_type": transaction_type,
+                "price": str(price),
+            },
+        )
+
     async def get_profile(self, access_token: str) -> dict[str, Any]:
         """Fetch the logged-in Upstox user's profile -- the lightest authenticated call Upstox
         offers, used purely to confirm a stored token is still actually valid (Upstox access

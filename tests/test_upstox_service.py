@@ -77,6 +77,37 @@ def test_get_ltp_sends_bearer_token() -> None:
     assert payload == {"status": "success", "data": {}}
 
 
+def test_get_brokerage_sends_order_parameters() -> None:
+    """Calculate estimated brokerage using Upstox's charges endpoint."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v2/charges/brokerage"
+        assert dict(request.url.params) == {
+            "instrument_token": "NSE_FO|35271",
+            "quantity": "75",
+            "product": "I",
+            "transaction_type": "BUY",
+            "price": "125.5",
+        }
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": {"charges": {}}})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_brokerage(
+                "upstox-token",
+                instrument_key="NSE_FO|35271",
+                quantity=75,
+                product="I",
+                transaction_type="BUY",
+                price=125.5,
+            )
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": {"charges": {}}}
+
+
 def test_get_order_book_uses_current_day_order_endpoint() -> None:
     """Fetch today's order book."""
     async def handler(request: httpx.Request) -> httpx.Response:
