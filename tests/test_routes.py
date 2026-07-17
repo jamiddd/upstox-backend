@@ -905,10 +905,37 @@ def test_search_underlyings_empty_query_returns_default_option_indices() -> None
         "page": {
             "page_number": 1,
             "records": 2,
-            "total_records": 4,
-            "total_pages": 2,
+            "total_records": 5,
+            "total_pages": 3,
         },
     }
+
+
+def test_search_underlyings_query_matches_non_optionable_index() -> None:
+    """India VIX has no listed options, so Upstox's F&O search can never return it -- see
+    NON_OPTIONABLE_INDICES's doc comment. Confirms it's merged in by name/symbol match anyway.
+    """
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/search/underlyings?query=vix&limit=10",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert {
+        "instrument_key": "NSE_INDEX|India VIX",
+        "symbol": "INDIA VIX",
+        "name": "India VIX",
+        "underlying_type": "INDEX",
+        "exchange": "NSE",
+        "lot_size": 0.0,
+        "freeze_quantity": 0.0,
+        "tick_size": 0.0,
+    } in body["results"]
 
 
 def test_order_history_today_returns_categorized_current_day_orders() -> None:

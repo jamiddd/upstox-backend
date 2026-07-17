@@ -65,6 +65,29 @@ DEFAULT_OPTION_INDICES = [
     },
 ]
 
+# FIX: this search endpoint's underlying query (see UpstoxService.search_instruments) is scoped to
+# segments="FO", instrument_types="CE,PE" -- it only ever searches *option contracts* and infers
+# the underlying from each one's `underlying_key` field. An index with no listed options at all
+# (India VIX -- there's no NSE VIX options/futures market) can therefore never appear in these
+# results no matter what's typed, even though it's a perfectly real, quotable NSE index a user
+# might reasonably want in their watchlist for reference (volatility context), just not to trade.
+# Merged into both the default (empty-query) list and query-matched results in
+# search_underlyings() below, confirmed against Upstox's own instrument master directly (not
+# guessed) -- same reasoning/precedent as GlobalInstruments.ALL on the Android app side for
+# instruments that exist but aren't reachable through the normal option-search path.
+NON_OPTIONABLE_INDICES = [
+    {
+        "instrument_key": "NSE_INDEX|India VIX",
+        "symbol": "INDIA VIX",
+        "name": "India VIX",
+        "underlying_type": "INDEX",
+        "exchange": "NSE",
+        "lot_size": 0.0,
+        "freeze_quantity": 0.0,
+        "tick_size": 0.0,
+    },
+]
+
 
 class SearchScreenService:
     """Build search-screen payloads for option-capable underlyings."""
@@ -99,6 +122,20 @@ class SearchScreenService:
             records=safe_limit,
         )
         results = _shape_underlyings(payload, limit=safe_limit)
+        # See NON_OPTIONABLE_INDICES's doc comment -- these can never come back from the F&O
+        # search above, so they're matched against the query text here and merged in directly.
+        # Only on page 1 (they're a small fixed list, not worth paginating), and only far enough
+        # to not push safe_limit -- a real Upstox match still wins the remaining slots.
+        if safe_page == 1:
+            matches = _matching_non_optionable_indices(normalized_query)
+            seen_keys = {item["instrument_key"] for item in results}
+            for item in matches:
+                if len(results) >= safe_limit:
+                    break
+                if item["instrument_key"] in seen_keys:
+                    continue
+                results.append(item)
+                seen_keys.add(item["instrument_key"])
         response = {
             "query": normalized_query,
             "results": results,
@@ -108,14 +145,24 @@ class SearchScreenService:
         return response
 
 
+def _matching_non_optionable_indices(query: str) -> list[dict[str, Any]]:
+    normalized = query.upper()
+    return [
+        item
+        for item in NON_OPTIONABLE_INDICES
+        if normalized in item["symbol"].upper() or normalized in item["name"].upper()
+    ]
+
+
 def _default_indices(*, limit: int, page_number: int) -> dict[str, Any]:
+    all_indices = DEFAULT_OPTION_INDICES + NON_OPTIONABLE_INDICES
     start = (page_number - 1) * limit
     end = start + limit
-    total_records = len(DEFAULT_OPTION_INDICES)
+    total_records = len(all_indices)
     total_pages = (total_records + limit - 1) // limit
     return {
         "query": "",
-        "results": DEFAULT_OPTION_INDICES[start:end],
+        "results": all_indices[start:end],
         "page": {
             "page_number": page_number,
             "records": limit,
