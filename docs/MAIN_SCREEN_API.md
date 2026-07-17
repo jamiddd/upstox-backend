@@ -108,32 +108,56 @@ The app sends the selected strike and CE/PE toggle. The backend resolves the mat
 GET /api/main/option-chain?expiry_date=2026-07-16&underlying_key=NSE_INDEX|Nifty 50
 ```
 
-Returns every listed strike's CE/PE contract metadata for the given underlying + expiry, so the
-app can determine the real strike interval and the at-the-money strike from the actual listed
-strikes instead of guessing a step size (it varies by underlying: 50 for NIFTY, 100 for
-BANKNIFTY, arbitrary for stocks). This does not include live bid/ask prices -- call
-`selected-quote` for the one strike the app resolves as ATM to get its live price.
+Returns every listed strike's **live** CE/PE market data and option greeks for the given
+underlying + expiry -- powers the app's smart strike selector (ATM/delta-target/liquidity/
+manual-offset/DTE-aware modes all pick from this same per-strike data, client-side; see
+`ui/main/strikeselection/StrikeSelector.kt` in the app repo).
+
+FIX: this used to wrap Upstox's `/option/contract` endpoint, which only returns bare contract
+metadata (instrument key, lot size, tick size) -- no LTP, no bid/ask, no OI, no greeks, so there
+was no data to build anything "smart" from. Now wraps Upstox's `/option/chain` endpoint instead,
+which returns everything needed for every strike in one call. Cached much more briefly than
+before (15s, not 600s) since this data is live-changing throughout the day, not static.
 
 ```json
 {
   "underlying_key": "NSE_INDEX|Nifty 50",
   "expiry_date": "2026-07-16",
+  "underlying_spot_price": 25050.0,
   "strikes": [
     {
       "strike_price": 25000.0,
       "ce": {
         "instrument_key": "NSE_FO|111",
-        "trading_symbol": "NIFTY26JUL25000CE",
-        "lot_size": 65.0,
-        "freeze_quantity": 1755.0,
-        "tick_size": 0.05
+        "ltp": 125.0,
+        "bid_price": 124.5,
+        "ask_price": 125.5,
+        "bid_qty": 300.0,
+        "ask_qty": 450.0,
+        "oi": 1250000.0,
+        "prev_oi": 1180000.0,
+        "volume": 5400000.0,
+        "delta": 0.52,
+        "gamma": 0.0012,
+        "theta": -18.4,
+        "vega": 12.1,
+        "iv": 14.2
       },
       "pe": {
         "instrument_key": "NSE_FO|222",
-        "trading_symbol": "NIFTY26JUL25000PE",
-        "lot_size": 65.0,
-        "freeze_quantity": 1755.0,
-        "tick_size": 0.05
+        "ltp": 90.0,
+        "bid_price": 89.5,
+        "ask_price": 90.5,
+        "bid_qty": 200.0,
+        "ask_qty": 350.0,
+        "oi": 980000.0,
+        "prev_oi": 1020000.0,
+        "volume": 4100000.0,
+        "delta": -0.47,
+        "gamma": 0.0012,
+        "theta": -17.9,
+        "vega": 12.0,
+        "iv": 13.9
       }
     }
   ]

@@ -112,45 +112,44 @@ class MainScreenService:
         underlying_key: str,
         expiry_date: str,
     ) -> dict[str, Any]:
-        """Return every strike's CE/PE contract metadata for one underlying + expiry.
+        """Return every strike's live CE/PE market data + greeks for one underlying + expiry --
+        powers the app's smart strike selector (ATM/delta-target/liquidity/manual-offset/
+        DTE-aware modes all pick from this same per-strike data, client-side).
 
-        Clients use this to figure out the real strike interval and the at-the-money
-        strike themselves, from the actual listed strikes -- there's no reliable way to
-        guess a strike step (it varies by underlying: 50 for NIFTY, 100 for BANKNIFTY,
-        arbitrary for stocks) without seeing the real option chain.
-
-        Unlike `selected_quote`, this does not fetch live bid/ask quotes for every
-        strike (that would be one Upstox quote call per strike times two, on every
-        expiry change) -- it only returns contract metadata (instrument keys, lot
-        size, tick size) needed to resolve which contract is ATM. The client then
-        calls `selected_quote` for that one strike to get its live price.
+        FIX: this used to call Upstox's `/option/contract` endpoint, which only returns bare
+        contract metadata (instrument key, lot size, tick size) -- no LTP, no bid/ask, no OI, no
+        greeks, so there was no data to build anything "smart" from. Upstox's `/option/chain`
+        endpoint returns everything needed for every strike in one call: LTP/volume/OI/bid-ask
+        (`market_data`) and delta/gamma/theta/vega/iv (`option_greeks`), for both call_options and
+        put_options -- see `UpstoxService.get_option_chain`. Cached far more briefly than the old
+        per-contract metadata (see `_option_chain_live`) since this data is live-changing
+        (LTP/OI/greeks drift all day), not static.
         """
-        contracts = await self._option_contracts(
-            access_token,
-            underlying_key,
-            expiry_date=expiry_date,
-        )
-        by_strike: dict[float, dict[str, Any]] = {}
-        for contract in _contracts_data(contracts):
-            if contract.get("expiry") != expiry_date:
-                continue
-            option_type = _option_type(contract)
-            if option_type not in ("CE", "PE"):
-                continue
-            strike = _number_value(contract, "strike_price")
-            entry = by_strike.setdefault(strike, {"strike_price": strike})
-            entry[option_type.lower()] = {
-                "instrument_key": _string_value(contract, "instrument_key"),
-                "trading_symbol": _string_value(contract, "trading_symbol", "tradingsymbol"),
-                "lot_size": _number_value(contract, "lot_size"),
-                "freeze_quantity": _number_value(contract, "freeze_quantity"),
-                "tick_size": _tick_size(contract),
-            }
+        payload = await self._option_chain_live(access_token, underlying_key, expiry_date=expiry_date)
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            return {"underlying_key": underlying_key, "expiry_date": expiry_date, "strikes": []}
 
-        strikes = sorted(by_strike.values(), key=lambda item: item["strike_price"])
+        underlying_spot_price = 0.0
+        strikes: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if underlying_spot_price == 0.0:
+                underlying_spot_price = _number_value(row, "underlying_spot_price")
+            strikes.append(
+                {
+                    "strike_price": _number_value(row, "strike_price"),
+                    "ce": _option_side(row.get("call_options")),
+                    "pe": _option_side(row.get("put_options")),
+                }
+            )
+        strikes.sort(key=lambda item: item["strike_price"])
+
         return {
             "underlying_key": underlying_key,
             "expiry_date": expiry_date,
+            "underlying_spot_price": underlying_spot_price,
             "strikes": strikes,
         }
 
@@ -335,6 +334,25 @@ class MainScreenService:
             expiry_date=expiry_date,
         )
         _cache_set(cache_key, payload, ttl_seconds=600.0)
+        return payload
+
+    async def _option_chain_live(
+        self,
+        access_token: str,
+        underlying_key: str,
+        *,
+        expiry_date: str,
+    ) -> dict[str, Any]:
+        # A distinct cache key/namespace from _option_contracts above -- and a much shorter TTL
+        # (15s, not 600s), since this call's LTP/OI/greeks genuinely drift throughout the day,
+        # unlike _option_contracts' static instrument metadata.
+        cache_key = ("option_chain_live", underlying_key, expiry_date)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        payload = await self.upstox.get_option_chain(access_token, underlying_key, expiry_date=expiry_date)
+        _cache_set(cache_key, payload, ttl_seconds=15.0)
         return payload
 
     async def _quotes(self, access_token: str, instrument_keys: list[str]) -> dict[str, Any]:
@@ -539,6 +557,35 @@ def _underlying_name(underlying_key: str, contracts_payload: dict[str, Any]) -> 
 
 def _option_type(contract: dict[str, Any]) -> str:
     return _string_value(contract, "instrument_type", "option_type").upper()
+
+
+def _option_side(side: Any) -> Optional[dict[str, Any]]:
+    """Reshapes one `call_options`/`put_options` entry from Upstox's `/option/chain` response
+    into a flat dict -- None if this strike simply has no listed contract for that side (Upstox
+    omits the key entirely for those, same as the old `/option/contract`-based behavior).
+    """
+    if not isinstance(side, dict):
+        return None
+    market_data = side.get("market_data")
+    market_data = market_data if isinstance(market_data, dict) else {}
+    greeks = side.get("option_greeks")
+    greeks = greeks if isinstance(greeks, dict) else {}
+    return {
+        "instrument_key": _string_value(side, "instrument_key"),
+        "ltp": _number_value(market_data, "ltp"),
+        "bid_price": _number_value(market_data, "bid_price"),
+        "ask_price": _number_value(market_data, "ask_price"),
+        "bid_qty": _number_value(market_data, "bid_qty"),
+        "ask_qty": _number_value(market_data, "ask_qty"),
+        "oi": _number_value(market_data, "oi"),
+        "prev_oi": _number_value(market_data, "prev_oi"),
+        "volume": _number_value(market_data, "volume"),
+        "delta": _number_value(greeks, "delta"),
+        "gamma": _number_value(greeks, "gamma"),
+        "theta": _number_value(greeks, "theta"),
+        "vega": _number_value(greeks, "vega"),
+        "iv": _number_value(greeks, "iv"),
+    }
 
 
 def _last_price(quote: dict[str, Any]) -> float:

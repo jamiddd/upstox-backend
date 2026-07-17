@@ -217,6 +217,29 @@ def test_get_option_contracts_sends_underlying_and_expiry() -> None:
     assert payload == {"status": "success", "data": []}
 
 
+def test_get_option_chain_sends_underlying_and_expiry() -> None:
+    """Fetch the full live option chain (market data + greeks) for an underlying + expiry."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v2/option/chain"
+        assert request.url.params["instrument_key"] == "NSE_INDEX|Nifty 50"
+        assert request.url.params["expiry_date"] == "2026-07-16"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": []})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_option_chain(
+                "upstox-token",
+                "NSE_INDEX|Nifty 50",
+                expiry_date="2026-07-16",
+            )
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": []}
+
+
 def test_get_funds_and_margin_uses_v3_api() -> None:
     """Fetch funds from the V3 account endpoint."""
     async def handler(request: httpx.Request) -> httpx.Response:

@@ -301,6 +301,101 @@ class FakeUpstoxService:
             contracts = [contract for contract in contracts if contract["expiry"] == expiry_date]
         return {"status": "success", "data": contracts}
 
+    async def get_option_chain(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        expiry_date: str,
+    ) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "expiry": expiry_date,
+                    "pcr": 0.92,
+                    "strike_price": 25000.0,
+                    "underlying_key": instrument_key,
+                    "underlying_spot_price": 25050.0,
+                    "call_options": {
+                        "instrument_key": "NSE_FO|111",
+                        "market_data": {
+                            "ltp": 125.0,
+                            "volume": 5400000.0,
+                            "oi": 1250000.0,
+                            "close_price": 118.0,
+                            "bid_price": 124.5,
+                            "bid_qty": 300.0,
+                            "ask_price": 125.5,
+                            "ask_qty": 450.0,
+                            "prev_oi": 1180000.0,
+                        },
+                        "option_greeks": {
+                            "vega": 12.1,
+                            "theta": -18.4,
+                            "gamma": 0.0012,
+                            "delta": 0.52,
+                            "iv": 14.2,
+                            "pop": 48.0,
+                        },
+                    },
+                    "put_options": {
+                        "instrument_key": "NSE_FO|222",
+                        "market_data": {
+                            "ltp": 90.0,
+                            "volume": 4100000.0,
+                            "oi": 980000.0,
+                            "close_price": 95.0,
+                            "bid_price": 89.5,
+                            "bid_qty": 200.0,
+                            "ask_price": 90.5,
+                            "ask_qty": 350.0,
+                            "prev_oi": 1020000.0,
+                        },
+                        "option_greeks": {
+                            "vega": 12.0,
+                            "theta": -17.9,
+                            "gamma": 0.0012,
+                            "delta": -0.47,
+                            "iv": 13.9,
+                            "pop": 45.0,
+                        },
+                    },
+                },
+                {
+                    "expiry": expiry_date,
+                    "pcr": 0.88,
+                    "strike_price": 25100.0,
+                    "underlying_key": instrument_key,
+                    "underlying_spot_price": 25050.0,
+                    "call_options": {
+                        "instrument_key": "NSE_FO|333",
+                        "market_data": {
+                            "ltp": 80.0,
+                            "volume": 3000000.0,
+                            "oi": 900000.0,
+                            "close_price": 76.0,
+                            "bid_price": 79.0,
+                            "bid_qty": 150.0,
+                            "ask_price": 81.5,
+                            "ask_qty": 200.0,
+                            "prev_oi": 870000.0,
+                        },
+                        "option_greeks": {
+                            "vega": 11.0,
+                            "theta": -16.0,
+                            "gamma": 0.0011,
+                            "delta": 0.38,
+                            "iv": 14.0,
+                            "pop": 40.0,
+                        },
+                    },
+                    # No put_options here on purpose -- a deep strike with only one side listed
+                    # (see option_chain()'s doc comment on this).
+                },
+            ],
+        }
+
     async def get_funds_and_margin(self, access_token: str) -> dict[str, Any]:
         if access_token == "funds-unavailable-token":
             # Mirrors Upstox's real nightly maintenance-window error (UDAPI100072) -- see
@@ -695,6 +790,87 @@ def test_main_selected_quote_returns_bid_and_ask_for_selected_strike() -> None:
             "bid_price": 124.5,
             "ask_price": 125.5,
         },
+    }
+
+
+def test_main_option_chain_returns_live_market_data_and_greeks_per_strike() -> None:
+    """Every strike's CE/PE market_data + option_greeks, reshaped flat -- see option_chain()'s
+    doc comment for why this replaced the old bare-contract-metadata shape (powers the app's
+    smart strike selector).
+    """
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/main/option-chain?expiry_date=2026-07-16&underlying_key=NSE_INDEX|Nifty 50",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "underlying_key": "NSE_INDEX|Nifty 50",
+        "expiry_date": "2026-07-16",
+        "underlying_spot_price": 25050.0,
+        "strikes": [
+            {
+                "strike_price": 25000.0,
+                "ce": {
+                    "instrument_key": "NSE_FO|111",
+                    "ltp": 125.0,
+                    "bid_price": 124.5,
+                    "ask_price": 125.5,
+                    "bid_qty": 300.0,
+                    "ask_qty": 450.0,
+                    "oi": 1250000.0,
+                    "prev_oi": 1180000.0,
+                    "volume": 5400000.0,
+                    "delta": 0.52,
+                    "gamma": 0.0012,
+                    "theta": -18.4,
+                    "vega": 12.1,
+                    "iv": 14.2,
+                },
+                "pe": {
+                    "instrument_key": "NSE_FO|222",
+                    "ltp": 90.0,
+                    "bid_price": 89.5,
+                    "ask_price": 90.5,
+                    "bid_qty": 200.0,
+                    "ask_qty": 350.0,
+                    "oi": 980000.0,
+                    "prev_oi": 1020000.0,
+                    "volume": 4100000.0,
+                    "delta": -0.47,
+                    "gamma": 0.0012,
+                    "theta": -17.9,
+                    "vega": 12.0,
+                    "iv": 13.9,
+                },
+            },
+            {
+                "strike_price": 25100.0,
+                "ce": {
+                    "instrument_key": "NSE_FO|333",
+                    "ltp": 80.0,
+                    "bid_price": 79.0,
+                    "ask_price": 81.5,
+                    "bid_qty": 150.0,
+                    "ask_qty": 200.0,
+                    "oi": 900000.0,
+                    "prev_oi": 870000.0,
+                    "volume": 3000000.0,
+                    "delta": 0.38,
+                    "gamma": 0.0011,
+                    "theta": -16.0,
+                    "vega": 11.0,
+                    "iv": 14.0,
+                },
+                # A strike missing a listed PE contract simply omits that side -- see
+                # FakeUpstoxService.get_option_chain's second row.
+                "pe": None,
+            },
+        ],
     }
 
 

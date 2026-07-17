@@ -169,6 +169,25 @@ class UpstoxService:
             params["expiry_date"] = expiry_date
         return await self._get_json("/option/contract", access_token, params=params)
 
+    async def get_option_chain(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        expiry_date: str,
+    ) -> dict[str, Any]:
+        """Fetch the full per-strike option chain for an underlying + expiry -- unlike
+        get_option_contracts (bare contract metadata only: instrument key/lot size/tick size),
+        this returns live market_data (ltp/bid/ask/oi/volume) AND option_greeks
+        (delta/gamma/theta/vega/iv) for both call_options and put_options at every strike, in one
+        call. Used by MainScreenService.option_chain() to power the app's smart strike selector.
+        """
+        return await self._get_json(
+            "/option/chain",
+            access_token,
+            params={"instrument_key": instrument_key, "expiry_date": expiry_date},
+        )
+
     async def search_instruments(
         self,
         access_token: str,
