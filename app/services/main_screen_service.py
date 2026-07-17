@@ -461,15 +461,14 @@ def _shape_position(position: dict[str, Any]) -> dict[str, Any]:
 
 
 def _entry_price(position: dict[str, Any]) -> float:
-    average_price = position.get("average_price")
-    if isinstance(average_price, (int, float)):
-        return float(average_price)
-    buy_price = position.get("buy_price")
-    if isinstance(buy_price, (int, float)):
-        return float(buy_price)
-    sell_price = position.get("sell_price")
-    if isinstance(sell_price, (int, float)):
-        return float(sell_price)
+    # Upstox can report average_price as exactly 0 for a moment right after a fresh fill, before
+    # its own position-keeping has caught up -- even though buy_price/sell_price (set from the
+    # order itself) are already correct by then. Treat 0 the same as missing and fall through,
+    # rather than locking in a known-wrong entry price for the rest of the day.
+    for key in ("average_price", "buy_price", "sell_price"):
+        value = position.get(key)
+        if isinstance(value, (int, float)) and value != 0:
+            return float(value)
     return 0.0
 
 
