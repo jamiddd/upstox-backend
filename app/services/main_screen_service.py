@@ -546,10 +546,23 @@ def _last_price(quote: dict[str, Any]) -> float:
 
 
 def _previous_close(quote: dict[str, Any]) -> float:
-    ohlc = quote.get("ohlc")
-    if not isinstance(ohlc, dict):
-        return 0.0
-    return _number_value(ohlc, "close")
+    """The last trading session's closing price, for computing "change since previous close".
+
+    FIX: this used to read `ohlc.close`, but Upstox documents that field as "the most recent
+    closing price of the symbol" -- in practice it tracks the *current, still-forming* session's
+    close and converges to `last_price` while that session is live/open, rather than staying
+    pinned to the prior session's actual close. That made every ticker's "(+x.xx%)" badge read
+    ~0% for anything trading right now, only becoming meaningful once a symbol's session had
+    fully ended for the day.
+
+    Upstox separately documents `net_change` as "the absolute change from yesterday's close to
+    last traded price" -- i.e. `last_price - net_change` gives the real previous close directly,
+    independent of whether today's session has closed yet.
+    """
+    net_change = quote.get("net_change")
+    if isinstance(net_change, (int, float)):
+        return _last_price(quote) - float(net_change)
+    return 0.0
 
 
 def _best_depth_price(quote: dict[str, Any], side: str) -> float:

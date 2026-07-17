@@ -24,9 +24,16 @@ expiry_date=<nearest available expiry>
 
 Returns the underlying, available expiries, account summary, and currently open positions.
 `previous_close` is the underlying's last trading day's closing price (from the same full-quote
-call already made for `spot_price` -- Upstox's quote payload includes an `ohlc` block per
-instrument; `ohlc.close` is the prior session's close, not "today's close so far"), letting the
-app show a "(+0.40%)" change badge next to the spot price without a separate history/OHLC call.
+call already made for `spot_price`), letting the app show a "(+0.40%)" change badge next to the
+spot price without a separate history/OHLC call.
+
+FIX: this is derived as `last_price - net_change`, not `ohlc.close`. Upstox documents `ohlc.close`
+as "the most recent closing price of the symbol", but in practice it tracks the *current,
+still-forming* session's close and converges to `last_price` while that session is live/open --
+using it made every "(+x.xx%)" badge in the app read ~0% for anything actively trading, only
+becoming meaningful once a symbol's session had fully ended for the day. `net_change` is
+separately documented as "the absolute change from yesterday's close to last traded price", which
+gives the real previous close directly regardless of whether today's session has closed yet.
 
 ```json
 {

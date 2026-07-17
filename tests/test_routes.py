@@ -69,8 +69,13 @@ class FakeUpstoxService:
                     "open": 24900.0,
                     "high": 25100.0,
                     "low": 24850.0,
-                    "close": 24950.0,
+                    "close": 25050.0,
                 },
+                # previous_close is derived from net_change (last_price - net_change), not
+                # ohlc.close -- see _previous_close's doc comment for why. ohlc.close above is
+                # deliberately set equal to last_price, matching what Upstox actually sends for a
+                # live/open session, to prove the fix doesn't fall back to reading it.
+                "net_change": 100.0,
             },
             "NSE_FO|111": {
                 "instrument_token": "NSE_FO|111",
@@ -91,7 +96,8 @@ class FakeUpstoxService:
             "GLOBAL_INDEX|^GSPC": {
                 "instrument_token": "GLOBAL_INDEX|^GSPC",
                 "last_price": 5555.5,
-                "ohlc": {"open": 5500.0, "high": 5560.0, "low": 5495.0, "close": 5540.0},
+                "ohlc": {"open": 5500.0, "high": 5560.0, "low": 5495.0, "close": 5555.5},
+                "net_change": 15.5,
             },
         }
         return {
