@@ -47,7 +47,14 @@ DEFAULT_OPTION_INDICES = [
         "tick_size": 0.05,
     },
     {
-        "instrument_key": "NSE_INDEX|Nifty Midcap Select",
+        # FIX: this was "NSE_INDEX|Nifty Midcap Select" -- not a real Upstox instrument key (the
+        # real one uses the exchange's actual index name, "NIFTY MID SELECT", confirmed against
+        # Upstox's own instrument master). The typo'd key doesn't match anything on Upstox's side,
+        # so the option-contract lookup silently returned zero contracts for it -- the backend
+        # then correctly returned expiries: [] / selected_expiry: null, but the Android app's
+        # bootstrap DTO used to declare selectedExpiry non-nullable, so selecting MIDCPNIFTY
+        # crashed instead of just showing "no contracts" (that's now fixed on the app side too).
+        "instrument_key": "NSE_INDEX|NIFTY MID SELECT",
         "symbol": "MIDCPNIFTY",
         "name": "Nifty Midcap Select",
         "underlying_type": "INDEX",
