@@ -46,6 +46,17 @@ class FakeUpstoxService:
     async def exchange_code_for_token(self, code: str) -> dict[str, Any]:
         return {"access_token": f"token-for-{code}"}
 
+    async def get_profile(self, access_token: str) -> dict[str, Any]:
+        if access_token == "expired-token":
+            from app.core.exceptions import UpstoxApiError
+
+            raise UpstoxApiError(
+                "Invalid token used to access api",
+                status_code=401,
+                upstox_code="UDAPI100050",
+            )
+        return {"status": "success", "data": {"user_name": "Test User"}}
+
     async def get_ltp(self, access_token: str, instrument_key: str) -> dict[str, Any]:
         return {"status": "success", "data": {"token": access_token, "key": instrument_key}}
 
@@ -472,7 +483,7 @@ def test_health_is_public() -> None:
 
 
 def test_auth_status_reports_stored_token() -> None:
-    """Return whether an Upstox token is present."""
+    """Return whether an Upstox token is present AND still actually valid."""
     client = _client(FakeTokenStore(token="upstox-token"))
     try:
         response = client.get("/api/auth/status", headers={"X-API-Key": "mobile-secret"})
@@ -481,6 +492,32 @@ def test_auth_status_reports_stored_token() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"authenticated": True}
+
+
+def test_auth_status_reports_expired_token_as_unauthenticated() -> None:
+    """FIX: a stored token *file* can exist while Upstox itself has expired it overnight -- this
+    must actually probe Upstox (via get_profile), not just check that a file is present.
+    """
+    client = _client(FakeTokenStore(token="expired-token"))
+    try:
+        response = client.get("/api/auth/status", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"authenticated": False}
+
+
+def test_auth_status_reports_no_token_as_unauthenticated() -> None:
+    """No stored token at all -- should short-circuit without calling Upstox."""
+    client = _client(FakeTokenStore(token=None))
+    try:
+        response = client.get("/api/auth/status", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"authenticated": False}
 
 
 def test_auth_callback_saves_token() -> None:

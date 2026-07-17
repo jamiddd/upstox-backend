@@ -72,6 +72,13 @@ class UpstoxService:
             params={"instrument_key": instrument_key},
         )
 
+    async def get_profile(self, access_token: str) -> dict[str, Any]:
+        """Fetch the logged-in Upstox user's profile -- the lightest authenticated call Upstox
+        offers, used purely to confirm a stored token is still actually valid (Upstox access
+        tokens expire nightly; the encrypted token *file* otherwise stays present until a fresh
+        login overwrites it, so its mere existence doesn't mean it still works)."""
+        return await self._get_json("/user/profile", access_token)
+
     async def get_holdings(self, access_token: str) -> dict[str, Any]:
         """Fetch long-term holdings for the logged-in Upstox account."""
         return await self._get_json("/portfolio/long-term-holdings", access_token)

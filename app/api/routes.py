@@ -106,15 +106,31 @@ async def auth_callback(
 
 
 @protected_router.get("/auth/status")
-def auth_status(
+async def auth_status(
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    service: UpstoxService = Depends(get_upstox_service),
 ) -> dict[str, bool]:
-    """Report whether an encrypted Upstox token is available."""
+    """Report whether the stored Upstox token is actually still valid.
+
+    FIX: this used to only check `token_store.has_token()` -- whether an encrypted token *file*
+    exists -- which stays true even after Upstox's nightly token expiry, since only a fresh login
+    overwrites/deletes that file. The Connect screen was using this to show "Connected and
+    ready" on a genuinely expired token, with the user only finding out something was wrong when
+    an actual trading call failed with UDAPI100050 ("Invalid token"). Now this makes a real,
+    cheap authenticated call (get_profile) so an expired token is reported truthfully.
+    """
     try:
-        authenticated = token_store.has_token()
+        if not token_store.has_token():
+            return {"authenticated": False}
+        access_token = token_store.load_access_token()
     except TokenStoreError as exc:
         raise _http_error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
-    return {"authenticated": authenticated}
+
+    try:
+        await service.get_profile(access_token)
+    except UpstoxApiError:
+        return {"authenticated": False}
+    return {"authenticated": True}
 
 
 @protected_router.post("/auth/logout")
