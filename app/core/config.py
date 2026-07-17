@@ -25,6 +25,9 @@ class Settings:
     token_store_path: Path
     upstox_api_base_url: str = "https://api.upstox.com/v2"
     upstox_api_v3_base_url: str = "https://api.upstox.com/v3"
+    # Place Order V3 is only documented on this separate low-latency host, not api.upstox.com --
+    # see UpstoxService.place_market_order.
+    upstox_api_hft_base_url: str = "https://api-hft.upstox.com/v3"
     upstox_login_url: str = "https://api.upstox.com/v2/login/authorization/dialog"
     upstox_token_url: str = "https://api.upstox.com/v2/login/authorization/token"
     upstox_instrument_master_url: str = (
@@ -46,6 +49,10 @@ class Settings:
             upstox_api_v3_base_url=os.getenv(
                 "UPSTOX_API_V3_BASE_URL",
                 "https://api.upstox.com/v3",
+            ),
+            upstox_api_hft_base_url=os.getenv(
+                "UPSTOX_API_HFT_BASE_URL",
+                "https://api-hft.upstox.com/v3",
             ),
             upstox_login_url=os.getenv(
                 "UPSTOX_LOGIN_URL",

@@ -135,6 +135,51 @@ class UpstoxService:
             raise UpstoxApiError("Unexpected Upstox GTT order response")
         return payload
 
+    async def place_market_order(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        transaction_type: str,
+        quantity: int,
+        product: str,
+    ) -> dict[str, Any]:
+        """Places an immediate market order via Place Order V3 -- unlike place_gtt_order (a
+        conditional GTT rule, this app's only other order-placement path, used for every normal
+        Buy/Sell tap), this fills right away at whatever the market gives. Used to actually flatten
+        a position (see SmartOrderService.exit_all_positions), where a GTT rule would be too slow/
+        indirect for something meant to happen right now.
+
+        Only documented on the separate api-hft.upstox.com host (upstox_api_hft_base_url), not the
+        regular v3 base URL the rest of this class's order endpoints use.
+        """
+        order = {
+            "quantity": quantity,
+            "product": product,
+            "validity": "DAY",
+            "price": 0,
+            "instrument_token": instrument_key,
+            "order_type": "MARKET",
+            "transaction_type": transaction_type,
+            "disclosed_quantity": 0,
+            "trigger_price": 0,
+            "is_amo": False,
+        }
+        response = await self._request(
+            "POST",
+            f"{self.settings.upstox_api_hft_base_url}/order/place",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+            json=order,
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox place order response")
+        return payload
+
     async def modify_order(
         self,
         access_token: str,

@@ -411,6 +411,21 @@ async def place_smart_bracket_order(
         raise _upstox_http_error(exc) from exc
 
 
+@protected_router.post("/orders/exit-all")
+async def exit_all_positions(
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Flattens every currently open position with an immediate market order -- backs the app's
+    max-loss auto square-off. See SmartOrderService.exit_all_positions.
+    """
+    access_token = _load_access_token(token_store)
+    try:
+        return await SmartOrderService(service).exit_all_positions(access_token)
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
 @protected_router.put("/orders/modify")
 async def modify_orders(
     request: ModifyOrdersRequest,

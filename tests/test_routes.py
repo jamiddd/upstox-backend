@@ -245,6 +245,20 @@ class FakeUpstoxService:
             "echo": order,
         }
 
+    async def place_market_order(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        transaction_type: str,
+        quantity: int,
+        product: str,
+    ) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": {"order_ids": [f"MKT-{instrument_key}"]},
+        }
+
     async def modify_order(
         self,
         access_token: str,
@@ -1296,6 +1310,85 @@ def test_place_smart_bracket_order_slices_large_quantity() -> None:
         1800,
         150,
     ]
+
+
+class _ExitAllFakeUpstoxService(FakeUpstoxService):
+    """Two open positions (one long, one short) plus one already-closed one that must be
+    skipped, and one instrument whose market order deliberately fails -- to verify exit-all is
+    correctly signed per side and doesn't stop after one failure."""
+
+    async def get_positions(self, access_token: str) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "instrument_token": "NSE_FO|111",
+                    "trading_symbol": "NIFTY26JUL25000CE",
+                    "quantity": 75,
+                    "product": "I",
+                    "average_price": 120.0,
+                    "last_price": 125.0,
+                    "pnl": 375.0,
+                },
+                {
+                    "instrument_token": "NSE_FO|222",
+                    "trading_symbol": "NIFTY26JUL25000PE",
+                    "quantity": -150,
+                    "product": "I",
+                    "average_price": 90.0,
+                    "last_price": 85.0,
+                    "pnl": 750.0,
+                },
+                {
+                    "instrument_token": "NSE_FO|closed",
+                    "trading_symbol": "NIFTY26JUL24000PE",
+                    "quantity": 0,
+                    "product": "I",
+                    "average_price": 80.0,
+                    "last_price": 80.0,
+                    "pnl": 25.0,
+                },
+            ],
+        }
+
+    async def place_market_order(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        transaction_type: str,
+        quantity: int,
+        product: str,
+    ) -> dict[str, Any]:
+        if instrument_key == "NSE_FO|222":
+            from app.core.exceptions import UpstoxApiError
+
+            raise UpstoxApiError("Order rejected", status_code=400, upstox_code="UDAPI100041")
+        return {"status": "success", "data": {"order_ids": [f"MKT-{instrument_key}"]}}
+
+
+def test_exit_all_positions_flattens_every_open_position() -> None:
+    """SELLs a long, BUYs a short (opposite-signed exit), skips the already-closed position, and
+    keeps going after one instrument's exit order fails."""
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["positions_found"] == 2
+    results_by_key = {item["instrument_key"]: item for item in payload["results"]}
+    assert results_by_key["NSE_FO|111"]["transaction_type"] == "SELL"
+    assert results_by_key["NSE_FO|111"]["quantity"] == 75
+    assert results_by_key["NSE_FO|111"]["status"] == "success"
+    assert results_by_key["NSE_FO|222"]["transaction_type"] == "BUY"
+    assert results_by_key["NSE_FO|222"]["quantity"] == 150
+    assert results_by_key["NSE_FO|222"]["status"] == "error"
 
 
 def test_modify_orders_accepts_more_than_upstream_multi_order_limit() -> None:
