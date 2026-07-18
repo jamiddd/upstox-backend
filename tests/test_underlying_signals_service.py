@@ -185,8 +185,10 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
     assert below == ["Below opening range by 10.00"]
 
 
-def test_build_tags_adds_caution_when_near_an_or_target() -> None:
-    tags = signals._build_tags(
+def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None:
+    # LTP is exactly on the target here -> signed distance is 0.00, which should still render
+    # with an explicit "+" (Python's :+.2f format spec), not a bare "0.00".
+    on_target = signals._build_tags(
         ltp=25110.0,
         ema9_5m_value=None,
         ema9_5m_position=None,
@@ -199,11 +201,39 @@ def test_build_tags_adds_caution_when_near_an_or_target() -> None:
         nearest_level=None,
         nearest_or_target={"label": "OR Target 1", "value": 25110.0, "distance_percent": 0.0},
     )
+    # LTP is 2 points *past* the target (overshot it) -> positive signed distance.
+    past_target = signals._build_tags(
+        ltp=25112.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=25100.0,
+        opening_range_low=25000.0,
+        opening_range_position="above",
+        nearest_level=None,
+        nearest_or_target={"label": "OR Target 1", "value": 25110.0, "distance_percent": 0.01},
+    )
+    # LTP (24988.0) hasn't reached its downside target (24990.0) yet -> negative signed
+    # distance, and "bounce" (not "pullback") is the reversal word on this side.
+    below_target = signals._build_tags(
+        ltp=24988.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=25100.0,
+        opening_range_low=25000.0,
+        opening_range_position="below",
+        nearest_level=None,
+        nearest_or_target={"label": "OR Target 1", "value": 24990.0, "distance_percent": 0.01},
+    )
 
-    assert tags == [
-        "Above opening range by 10.00",
-        "Near OR Target 1 by 0.00 - caution, possible pullback",
-    ]
+    assert on_target == ["Above opening range by 10.00 (near OR Target 1 by +0.00, caution: possible pullback)"]
+    assert past_target == ["Above opening range by 12.00 (near OR Target 1 by +2.00, caution: possible pullback)"]
+    assert below_target == ["Below opening range by 12.00 (near OR Target 1 by -2.00, caution: possible bounce)"]
 
 
 def test_or_targets_are_ordinal_multiples_of_the_or_size() -> None:

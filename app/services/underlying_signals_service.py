@@ -493,9 +493,12 @@ def _build_tags(
     user wants the magnitude at a glance, not just the sign.
 
     A breakout that's also sitting on one of the OR's measured-move target levels
-    ([nearest_or_target], see _nearest_or_target) gets an extra caution tag right after the
-    "Above/Below opening range" one -- still bullish/bearish, just flagged as a level price has
-    historically tended to stall or reverse at, not a contradiction of the breakout itself.
+    ([nearest_or_target], see _nearest_or_target) folds its caution straight into the same
+    "Above/Below opening range" tag -- one line, not a second tag -- still bullish/bearish, just
+    flagged as a level price has historically tended to stall or reverse at, not a contradiction
+    of the breakout itself. That caution's own distance is signed (LTP minus the target value,
+    with an explicit +/-), not absolute -- the sign tells you which side of the exact target
+    price currently sits on.
     """
     tags: list[str] = []
     if ema9_5m_position and ema9_5m_value is not None:
@@ -505,16 +508,22 @@ def _build_tags(
     if atr14_5m is not None:
         tags.append(f"ATR {round(atr14_5m, 1):g}")
     if opening_range_position == "above" and opening_range_high is not None:
-        tags.append(f"Above opening range by {ltp - opening_range_high:.2f}")
+        tags.append(f"Above opening range by {ltp - opening_range_high:.2f}{_or_target_caution(ltp, nearest_or_target, 'pullback')}")
     elif opening_range_position == "below" and opening_range_low is not None:
-        tags.append(f"Below opening range by {opening_range_low - ltp:.2f}")
+        tags.append(f"Below opening range by {opening_range_low - ltp:.2f}{_or_target_caution(ltp, nearest_or_target, 'bounce')}")
     elif opening_range_position == "inside":
         tags.append("Inside opening range")
-    if nearest_or_target:
-        reversal_word = "pullback" if opening_range_position == "above" else "bounce"
-        distance = abs(ltp - nearest_or_target["value"])
-        tags.append(f"Near {nearest_or_target['label']} by {distance:.2f} - caution, possible {reversal_word}")
     if nearest_level:
         distance = abs(ltp - nearest_level["value"])
         tags.append(f"Near {nearest_level['label']} by {distance:.2f}")
     return tags
+
+
+def _or_target_caution(ltp: float, nearest_or_target: Optional[dict[str, Any]], reversal_word: str) -> str:
+    """The `" (near OR Target N by +/-Y.YY, caution: possible pullback/bounce)"` suffix appended
+    to the opening-range breakout tag -- empty string if LTP isn't currently near any target.
+    """
+    if not nearest_or_target:
+        return ""
+    signed_distance = ltp - nearest_or_target["value"]
+    return f" (near {nearest_or_target['label']} by {signed_distance:+.2f}, caution: possible {reversal_word})"

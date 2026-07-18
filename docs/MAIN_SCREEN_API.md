@@ -255,7 +255,7 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
 {
   "opening_range": {"window_minutes": 15, "high": 25100.0, "low": 25000.0, "position": "above"},
   "nearest_or_target": {"label": "OR Target 1", "value": 25150.0, "distance_percent": 0.03},
-  "tags": ["Above opening range by 50.00", "Near OR Target 1 by 0.30 - caution, possible pullback"]
+  "tags": ["Above opening range by 50.00 (near OR Target 1 by +0.30, caution: possible pullback)"]
 }
 ```
 
@@ -285,8 +285,10 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   4" = 2x. `nearest_or_target` is whichever of those four LTP is currently closest to, if within
   0.15% of LTP -- `null` if none are that close. A breakout past the OR is a genuinely bullish/
   bearish signal on its own; sitting right on one of these targets too doesn't contradict that,
-  it just adds a "this exact level has historically tended to see a stall/reversal" caution on
-  top -- see the `tags` example above.
+  it just adds a "this exact level has historically tended to see a stall/reversal" caution --
+  folded straight into the *same* `"Above/Below opening range"` tag (not a separate one), with a
+  signed (`+`/`-`) point distance to the target, e.g. `"Above opening range by 50.00 (near OR
+  Target 1 by +0.30, caution: possible pullback)"`.
 - `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50"`,
   `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`) built from the fields above -- the client can display
   these directly without any string-building of its own. Every directional tag (EMA above/below,
