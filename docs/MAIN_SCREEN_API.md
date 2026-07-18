@@ -243,7 +243,19 @@ on the premium itself would be meaningless here.
   "pivots": {"p": 24993.3, "r1": 25086.6, "r2": 25193.3, "s1": 24886.6, "s2": 24793.3},
   "round_step": 50.0,
   "nearest_level": {"label": "R1 Pivot", "value": 25086.6, "distance_percent": 0.15},
+  "nearest_or_target": null,
   "tags": ["Above 5m EMA9 by 39.50", "Above 15m EMA9 by 60.00", "Inside opening range", "Near R1 Pivot by 36.60"]
+}
+```
+
+A breakout that's also sitting on one of the opening range's own measured-move target levels
+looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Target 1"):
+
+```json
+{
+  "opening_range": {"window_minutes": 15, "high": 25100.0, "low": 25000.0, "position": "above"},
+  "nearest_or_target": {"label": "OR Target 1", "value": 25150.0, "distance_percent": 0.03},
+  "tags": ["Above opening range by 50.00", "Near OR Target 1 by 0.30 - caution, possible pullback"]
 }
 ```
 
@@ -266,6 +278,15 @@ on the premium itself would be meaningless here.
 - `nearest_level`: whichever of `previous_day`'s three values, the five pivot levels, or the two
   round numbers is closest to LTP, **only if** it's within 0.15% of LTP -- `null` if nothing is
   that close right now.
+- `nearest_or_target`: **only** computed once `opening_range.position` is `"above"` or `"below"`
+  (a genuine breakout -- `null` for `"inside"` or unknown). Four measured-move target levels are
+  projected beyond whichever side broke out, as multiples of the OR's own size (high - low): "OR
+  Target 1" = breakout side +/- 0.5x the OR, "OR Target 2" = 1x, "OR Target 3" = 1.5x, "OR Target
+  4" = 2x. `nearest_or_target` is whichever of those four LTP is currently closest to, if within
+  0.15% of LTP -- `null` if none are that close. A breakout past the OR is a genuinely bullish/
+  bearish signal on its own; sitting right on one of these targets too doesn't contradict that,
+  it just adds a "this exact level has historically tended to see a stall/reversal" caution on
+  top -- see the `tags` example above.
 - `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50"`,
   `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`) built from the fields above -- the client can display
   these directly without any string-building of its own. Every directional tag (EMA above/below,

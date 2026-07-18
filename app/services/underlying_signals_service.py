@@ -17,6 +17,13 @@ _NEAREST_LEVEL_TOLERANCE_PERCENT = 0.15
 # 5-minute candles (9:15-9:30 IST).
 _OPENING_RANGE_CANDLES = 3
 
+# Opening-range "measured move" target levels, as multiples of the OR's own size (high - low),
+# projected beyond whichever side price has broken out of -- OR Target 1 = breakout side +/- 0.5x
+# the OR, Target 2 = 1x, Target 3 = 1.5x, Target 4 = 2x. A breakout is genuinely bullish/bearish,
+# but each of these is also a level price has historically tended to stall/reverse at -- see
+# _nearest_or_target's doc comment for why that matters to the tag shown.
+_OR_TARGET_MULTIPLIERS = (0.5, 1.0, 1.5, 2.0)
+
 
 @dataclass
 class Candle:
@@ -100,6 +107,14 @@ class UnderlyingSignalsService:
         ema9_15m_position = _position(ltp, ema9_15m)
         opening_range_position = _range_position(ltp, opening_range_high, opening_range_low)
 
+        nearest_or_target = _nearest_or_target(
+            ltp,
+            opening_range_high=opening_range_high,
+            opening_range_low=opening_range_low,
+            opening_range_position=opening_range_position,
+            tolerance_percent=_NEAREST_LEVEL_TOLERANCE_PERCENT,
+        )
+
         tags = _build_tags(
             ltp=ltp,
             ema9_5m_value=ema9_5m,
@@ -111,6 +126,7 @@ class UnderlyingSignalsService:
             opening_range_low=opening_range_low,
             opening_range_position=opening_range_position,
             nearest_level=nearest_level,
+            nearest_or_target=nearest_or_target,
         )
 
         return {
@@ -132,6 +148,7 @@ class UnderlyingSignalsService:
             "pivots": {key: round(value, 2) for key, value in pivots.items()},
             "round_step": round_step,
             "nearest_level": nearest_level,
+            "nearest_or_target": nearest_or_target,
             "tags": tags,
         }
 
@@ -412,6 +429,50 @@ def _round_or_none(value: Optional[float]) -> Optional[float]:
     return round(value, 2) if value is not None else None
 
 
+def _or_targets(anchor: float, or_range: float, *, sign: int) -> dict[str, float]:
+    """The four measured-move target levels beyond `anchor` (the opening range's high for an
+    upside breakout, its low for a downside one) -- `sign` is +1 for upside (targets *above*
+    anchor) or -1 for downside (targets *below*). "OR Target 1" is the nearest (0.5x the OR's own
+    size) through "OR Target 4" (2x), matching the ordinal numbering the app's user thinks in.
+    """
+    return {
+        f"OR Target {index}": anchor + sign * multiplier * or_range
+        for index, multiplier in enumerate(_OR_TARGET_MULTIPLIERS, start=1)
+    }
+
+
+def _nearest_or_target(
+    ltp: float,
+    *,
+    opening_range_high: Optional[float],
+    opening_range_low: Optional[float],
+    opening_range_position: Optional[str],
+    tolerance_percent: float,
+) -> Optional[dict[str, Any]]:
+    """Whichever OR measured-move target (see _or_targets) LTP is currently closest to, if
+    within [tolerance_percent] -- **only** once price has actually broken out of the opening
+    range (`opening_range_position` is "above" or "below"; "inside" or unknown never has a
+    target to be near). A breakout past the OR is a genuinely bullish/bearish signal on its own,
+    but each of these target levels is also a level price has historically tended to stall or
+    reverse at -- so a breakout that's also sitting right on one of them is the same directional
+    signal with an added "don't chase this exact level" caution, not a contradiction of it.
+    """
+    if opening_range_high is None or opening_range_low is None:
+        return None
+    or_range = opening_range_high - opening_range_low
+    if or_range <= 0:
+        return None
+
+    if opening_range_position == "above":
+        targets = _or_targets(opening_range_high, or_range, sign=1)
+    elif opening_range_position == "below":
+        targets = _or_targets(opening_range_low, or_range, sign=-1)
+    else:
+        return None
+
+    return _nearest_level(ltp, targets, tolerance_percent=tolerance_percent)
+
+
 def _build_tags(
     *,
     ltp: float,
@@ -424,11 +485,17 @@ def _build_tags(
     opening_range_low: Optional[float],
     opening_range_position: Optional[str],
     nearest_level: Optional[dict[str, Any]],
+    nearest_or_target: Optional[dict[str, Any]],
 ) -> list[str]:
     """Builds the ready-to-render tag strings -- every directional tag (EMA above/below, opening
     range above/below, a nearby level) spells out the absolute point distance from LTP, not just
     the direction, e.g. "Above 5m EMA9 by 12.30" rather than a bare "Above 5m EMA9" -- the app's
     user wants the magnitude at a glance, not just the sign.
+
+    A breakout that's also sitting on one of the OR's measured-move target levels
+    ([nearest_or_target], see _nearest_or_target) gets an extra caution tag right after the
+    "Above/Below opening range" one -- still bullish/bearish, just flagged as a level price has
+    historically tended to stall or reverse at, not a contradiction of the breakout itself.
     """
     tags: list[str] = []
     if ema9_5m_position and ema9_5m_value is not None:
@@ -443,6 +510,10 @@ def _build_tags(
         tags.append(f"Below opening range by {opening_range_low - ltp:.2f}")
     elif opening_range_position == "inside":
         tags.append("Inside opening range")
+    if nearest_or_target:
+        reversal_word = "pullback" if opening_range_position == "above" else "bounce"
+        distance = abs(ltp - nearest_or_target["value"])
+        tags.append(f"Near {nearest_or_target['label']} by {distance:.2f} - caution, possible {reversal_word}")
     if nearest_level:
         distance = abs(ltp - nearest_level["value"])
         tags.append(f"Near {nearest_level['label']} by {distance:.2f}")

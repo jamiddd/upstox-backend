@@ -141,6 +141,7 @@ def test_build_tags_composes_readable_short_labels_with_absolute_point_distances
         opening_range_low=None,
         opening_range_position="inside",
         nearest_level={"label": "R1 Pivot", "value": 25086.6, "distance_percent": 0.1},
+        nearest_or_target=None,
     )
 
     assert tags == [
@@ -164,6 +165,7 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         opening_range_low=25000.0,
         opening_range_position="above",
         nearest_level=None,
+        nearest_or_target=None,
     )
     below = signals._build_tags(
         ltp=24990.0,
@@ -176,10 +178,85 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         opening_range_low=25000.0,
         opening_range_position="below",
         nearest_level=None,
+        nearest_or_target=None,
     )
 
     assert above == ["Above opening range by 10.00"]
     assert below == ["Below opening range by 10.00"]
+
+
+def test_build_tags_adds_caution_when_near_an_or_target() -> None:
+    tags = signals._build_tags(
+        ltp=25110.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=25100.0,
+        opening_range_low=25000.0,
+        opening_range_position="above",
+        nearest_level=None,
+        nearest_or_target={"label": "OR Target 1", "value": 25110.0, "distance_percent": 0.0},
+    )
+
+    assert tags == [
+        "Above opening range by 10.00",
+        "Near OR Target 1 by 0.00 - caution, possible pullback",
+    ]
+
+
+def test_or_targets_are_ordinal_multiples_of_the_or_size() -> None:
+    up_targets = signals._or_targets(25100.0, 100.0, sign=1)
+    down_targets = signals._or_targets(25000.0, 100.0, sign=-1)
+
+    assert up_targets == {
+        "OR Target 1": 25150.0,
+        "OR Target 2": 25200.0,
+        "OR Target 3": 25250.0,
+        "OR Target 4": 25300.0,
+    }
+    assert down_targets == {
+        "OR Target 1": 24950.0,
+        "OR Target 2": 24900.0,
+        "OR Target 3": 24850.0,
+        "OR Target 4": 24800.0,
+    }
+
+
+def test_nearest_or_target_only_considers_the_breakout_side() -> None:
+    # LTP sitting right on the upside Target 1 (25150.0) -- should match when the breakout is
+    # "above", but never even be considered when it's "below" (wrong side) or "inside" (no
+    # breakout at all).
+    above = signals._nearest_or_target(
+        25150.0, opening_range_high=25100.0, opening_range_low=25000.0,
+        opening_range_position="above", tolerance_percent=0.15,
+    )
+    below = signals._nearest_or_target(
+        25150.0, opening_range_high=25100.0, opening_range_low=25000.0,
+        opening_range_position="below", tolerance_percent=0.15,
+    )
+    inside = signals._nearest_or_target(
+        25150.0, opening_range_high=25100.0, opening_range_low=25000.0,
+        opening_range_position="inside", tolerance_percent=0.15,
+    )
+
+    assert above == {"label": "OR Target 1", "value": 25150.0, "distance_percent": 0.0}
+    assert below is None
+    assert inside is None
+
+
+def test_nearest_or_target_returns_none_without_a_valid_opening_range() -> None:
+    assert signals._nearest_or_target(
+        25150.0, opening_range_high=None, opening_range_low=25000.0,
+        opening_range_position="above", tolerance_percent=0.15,
+    ) is None
+    # A zero/negative-size OR (shouldn't happen in practice, but guard it) has no meaningful
+    # measured-move targets to compute.
+    assert signals._nearest_or_target(
+        25150.0, opening_range_high=25000.0, opening_range_low=25000.0,
+        opening_range_position="above", tolerance_percent=0.15,
+    ) is None
 
 
 # --- end-to-end wiring via a fake UpstoxService double ------------------------------------
