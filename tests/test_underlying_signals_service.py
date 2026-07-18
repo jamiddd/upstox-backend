@@ -129,22 +129,57 @@ def test_range_position_reports_above_below_and_inside() -> None:
     assert signals._range_position(100.0, high=110.0, low=90.0) == "inside"
 
 
-def test_build_tags_composes_readable_short_labels() -> None:
+def test_build_tags_composes_readable_short_labels_with_absolute_point_distances() -> None:
     tags = signals._build_tags(
+        ltp=25100.0,
+        ema9_5m_value=25050.0,
         ema9_5m_position="above",
+        ema9_15m_value=25150.0,
         ema9_15m_position="below",
         atr14_5m=42.349,
+        opening_range_high=None,
+        opening_range_low=None,
         opening_range_position="inside",
         nearest_level={"label": "R1 Pivot", "value": 25086.6, "distance_percent": 0.1},
     )
 
     assert tags == [
-        "Above 5m EMA9",
-        "Below 15m EMA9",
+        "Above 5m EMA9 by 50.00",
+        "Below 15m EMA9 by 50.00",
         "ATR 42.3",
         "Inside opening range",
-        "Near R1 Pivot",
+        "Near R1 Pivot by 13.40",
     ]
+
+
+def test_build_tags_reports_opening_range_breakout_distance() -> None:
+    above = signals._build_tags(
+        ltp=25110.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=25100.0,
+        opening_range_low=25000.0,
+        opening_range_position="above",
+        nearest_level=None,
+    )
+    below = signals._build_tags(
+        ltp=24990.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=25100.0,
+        opening_range_low=25000.0,
+        opening_range_position="below",
+        nearest_level=None,
+    )
+
+    assert above == ["Above opening range by 10.00"]
+    assert below == ["Below opening range by 10.00"]
 
 
 # --- end-to-end wiring via a fake UpstoxService double ------------------------------------
@@ -218,6 +253,8 @@ def test_get_signals_wires_everything_into_tags() -> None:
     assert result["opening_range"]["position"] == "above"
     assert result["previous_day"] == {"high": 110.0, "low": 95.0, "close": 105.0}
     assert result["round_step"] == 50.0
-    assert "Above 5m EMA9" in result["tags"]
-    assert "Above 15m EMA9" in result["tags"]
-    assert "Above opening range" in result["tags"]
+    # Prefix checks (not exact-match) since every directional tag now also spells out the
+    # absolute point distance -- see _build_tags -- which this wiring test isn't pinning down.
+    assert any(tag.startswith("Above 5m EMA9 by ") for tag in result["tags"])
+    assert any(tag.startswith("Above 15m EMA9 by ") for tag in result["tags"])
+    assert any(tag.startswith("Above opening range by ") for tag in result["tags"])

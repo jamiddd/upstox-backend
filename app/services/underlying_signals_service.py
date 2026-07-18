@@ -101,9 +101,14 @@ class UnderlyingSignalsService:
         opening_range_position = _range_position(ltp, opening_range_high, opening_range_low)
 
         tags = _build_tags(
+            ltp=ltp,
+            ema9_5m_value=ema9_5m,
             ema9_5m_position=ema9_5m_position,
+            ema9_15m_value=ema9_15m,
             ema9_15m_position=ema9_15m_position,
             atr14_5m=atr14_5m,
+            opening_range_high=opening_range_high,
+            opening_range_low=opening_range_low,
             opening_range_position=opening_range_position,
             nearest_level=nearest_level,
         )
@@ -409,21 +414,36 @@ def _round_or_none(value: Optional[float]) -> Optional[float]:
 
 def _build_tags(
     *,
+    ltp: float,
+    ema9_5m_value: Optional[float],
     ema9_5m_position: Optional[str],
+    ema9_15m_value: Optional[float],
     ema9_15m_position: Optional[str],
     atr14_5m: Optional[float],
+    opening_range_high: Optional[float],
+    opening_range_low: Optional[float],
     opening_range_position: Optional[str],
     nearest_level: Optional[dict[str, Any]],
 ) -> list[str]:
+    """Builds the ready-to-render tag strings -- every directional tag (EMA above/below, opening
+    range above/below, a nearby level) spells out the absolute point distance from LTP, not just
+    the direction, e.g. "Above 5m EMA9 by 12.30" rather than a bare "Above 5m EMA9" -- the app's
+    user wants the magnitude at a glance, not just the sign.
+    """
     tags: list[str] = []
-    if ema9_5m_position:
-        tags.append(f"{ema9_5m_position.capitalize()} 5m EMA9")
-    if ema9_15m_position:
-        tags.append(f"{ema9_15m_position.capitalize()} 15m EMA9")
+    if ema9_5m_position and ema9_5m_value is not None:
+        tags.append(f"{ema9_5m_position.capitalize()} 5m EMA9 by {abs(ltp - ema9_5m_value):.2f}")
+    if ema9_15m_position and ema9_15m_value is not None:
+        tags.append(f"{ema9_15m_position.capitalize()} 15m EMA9 by {abs(ltp - ema9_15m_value):.2f}")
     if atr14_5m is not None:
         tags.append(f"ATR {round(atr14_5m, 1):g}")
-    if opening_range_position:
-        tags.append(f"{opening_range_position.capitalize()} opening range")
+    if opening_range_position == "above" and opening_range_high is not None:
+        tags.append(f"Above opening range by {ltp - opening_range_high:.2f}")
+    elif opening_range_position == "below" and opening_range_low is not None:
+        tags.append(f"Below opening range by {opening_range_low - ltp:.2f}")
+    elif opening_range_position == "inside":
+        tags.append("Inside opening range")
     if nearest_level:
-        tags.append(f"Near {nearest_level['label']}")
+        distance = abs(ltp - nearest_level["value"])
+        tags.append(f"Near {nearest_level['label']} by {distance:.2f}")
     return tags

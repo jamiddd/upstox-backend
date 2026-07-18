@@ -243,7 +243,7 @@ on the premium itself would be meaningless here.
   "pivots": {"p": 24993.3, "r1": 25086.6, "r2": 25193.3, "s1": 24886.6, "s2": 24793.3},
   "round_step": 50.0,
   "nearest_level": {"label": "R1 Pivot", "value": 25086.6, "distance_percent": 0.15},
-  "tags": ["Above 5m EMA9", "Above 15m EMA9", "Inside opening range", "Near R1 Pivot"]
+  "tags": ["Above 5m EMA9 by 39.50", "Above 15m EMA9 by 60.00", "Inside opening range", "Near R1 Pivot by 36.60"]
 }
 ```
 
@@ -266,9 +266,12 @@ on the premium itself would be meaningless here.
 - `nearest_level`: whichever of `previous_day`'s three values, the five pivot levels, or the two
   round numbers is closest to LTP, **only if** it's within 0.15% of LTP -- `null` if nothing is
   that close right now.
-- `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9"`, `"ATR 42.3"`,
-  `"Near R1 Pivot"`) built from the fields above -- the client can display these directly without
-  any string-building of its own.
+- `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50"`,
+  `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`) built from the fields above -- the client can display
+  these directly without any string-building of its own. Every directional tag (EMA above/below,
+  opening-range above/below, a nearby level) spells out the absolute point distance from LTP, not
+  just the direction -- `ATR` and `"Inside opening range"` are the only two with no direction/
+  distance to report.
 
 Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round step) are cached
 ~60 seconds -- they only meaningfully change when a new candle closes, not on every feed tick.

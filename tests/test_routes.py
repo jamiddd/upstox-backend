@@ -1044,11 +1044,16 @@ def test_main_underlying_signals_returns_ema_atr_opening_range_and_nearest_level
     # LTP (25050.0) exactly matches the fake previous-day close -> that's the unambiguous nearest
     # level, 0% away.
     assert payload["nearest_level"] == {"label": "Prev Day Close", "value": 25050.0, "distance_percent": 0.0}
-    assert "Above 5m EMA9" in payload["tags"]
-    assert "Above 15m EMA9" in payload["tags"]
+    # Every directional tag now spells out the absolute point distance from LTP too (see
+    # UnderlyingSignalsService._build_tags) -- prefix checks for the EMA tags (exact distance
+    # depends on the fake series' EMA math, already covered by the service's own unit tests) and
+    # exact strings for the two hand-computable ones (opening range high/low and nearest_level's
+    # value are both known constants above).
+    assert any(tag.startswith("Above 5m EMA9 by ") for tag in payload["tags"])
+    assert any(tag.startswith("Above 15m EMA9 by ") for tag in payload["tags"])
     assert "ATR 10" in payload["tags"]
-    assert "Above opening range" in payload["tags"]
-    assert "Near Prev Day Close" in payload["tags"]
+    assert "Above opening range by 143.00" in payload["tags"]
+    assert "Near Prev Day Close by 0.00" in payload["tags"]
 
 
 def test_main_summary_returns_balance_pnl_and_closing_balance() -> None:
