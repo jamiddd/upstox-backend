@@ -218,6 +218,63 @@ All six fields' source paths are confirmed against a real `GET /v3/user/get-fund
 - `payin_amount` is `cash.added_today + cash.withdrawn_today` (the latter already negative) -- net cash movement today.
 - `closing_balance` = `opening_balance + payin_amount + profit_loss` -- includes today's net cash movement (not just `opening_balance + profit_loss` as before), since a mid-day deposit is real money added to the account, not "profit".
 
+## Underlying Signals
+
+```http
+GET /api/main/underlying-signals
+GET /api/main/underlying-signals?underlying_key=NSE_INDEX%7CNifty%2050
+```
+
+Glanceable technical-analysis tags for the underlying -- shown to the app's user just before they
+place a strike order, so they can see e.g. "is the underlying above its 9 EMA" without leaving the
+trading screen. Deliberately computed on the **underlying's** own price action (spot/futures),
+not the option contract about to be traded -- an option premium is dominated by theta decay and
+IV changes rather than the underlying's own trend/momentum, so an EMA/ATR/opening-range reading
+on the premium itself would be meaningless here.
+
+```json
+{
+  "ltp": 25050.0,
+  "ema9_5m": {"value": 25010.5, "position": "above"},
+  "ema9_15m": {"value": 24990.0, "position": "above"},
+  "atr14_5m": 42.3,
+  "opening_range": {"window_minutes": 15, "high": 25080.0, "low": 24990.0, "position": "inside"},
+  "previous_day": {"high": 25100.0, "low": 24900.0, "close": 24980.0},
+  "pivots": {"p": 24993.3, "r1": 25086.6, "r2": 25193.3, "s1": 24886.6, "s2": 24793.3},
+  "round_step": 50.0,
+  "nearest_level": {"label": "R1 Pivot", "value": 25086.6, "distance_percent": 0.15},
+  "tags": ["Above 5m EMA9", "Above 15m EMA9", "Inside opening range", "Near R1 Pivot"]
+}
+```
+
+- `ema9_5m` / `ema9_15m`: 9-period EMA of closes on 5-minute and 15-minute candles respectively --
+  the 5m read is meant for scalping timing, the 15m read for the broader intraday bias. `position`
+  is `"above"`/`"below"`/`"at"` LTP relative to the EMA value; either can be `null` (with `value`
+  also `null`) if there isn't yet enough candle history to compute it.
+- `atr14_5m`: 14-period Average True Range (Wilder's smoothing) on the 5-minute series -- a
+  volatility gauge, in underlying price units (e.g. NIFTY points).
+- `opening_range`: the high/low of the first 15 minutes of today's session (9:15-9:30 IST, the
+  first three 5-minute candles), and where LTP currently sits relative to that range
+  (`"above"`/`"below"`/`"inside"`).
+- `previous_day`: the prior completed trading session's high/low/close, straight off the daily
+  candle series.
+- `pivots`: classic pivot points (`p`/`r1`/`r2`/`s1`/`s2`) computed from `previous_day`'s
+  high/low/close.
+- `round_step`: the underlying's own strike spacing (the most common gap between consecutive
+  option-chain strikes for this underlying), used to find the two round psychological numbers
+  bracketing LTP. `0.0` if there isn't enough strike data to derive a step.
+- `nearest_level`: whichever of `previous_day`'s three values, the five pivot levels, or the two
+  round numbers is closest to LTP, **only if** it's within 0.15% of LTP -- `null` if nothing is
+  that close right now.
+- `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9"`, `"ATR 42.3"`,
+  `"Near R1 Pivot"`) built from the fields above -- the client can display these directly without
+  any string-building of its own.
+
+Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round step) are cached
+~60 seconds -- they only meaningfully change when a new candle closes, not on every feed tick.
+`ltp` and everything computed relative to it (`position` fields, `nearest_level`) are read fresh
+on every call.
+
 ## Raw Funds and Margin
 
 ```http
@@ -236,6 +293,7 @@ selected/position quote data: ~0.75 seconds
 positions: ~1 second
 summary: ~5 seconds
 option contracts/expiries: ~10 minutes
+underlying-signals candle-derived values (EMAs/ATR/opening range/pivots): ~60 seconds
 ```
 
 For millisecond-level flashing values, the next backend step should be a market data WebSocket bridge or authorization endpoint.

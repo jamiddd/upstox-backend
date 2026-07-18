@@ -261,6 +261,45 @@ class UpstoxService:
             params={"instrument_key": instrument_key, "expiry_date": expiry_date},
         )
 
+    async def get_historical_candle(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        unit: str,
+        interval: str,
+        to_date: str,
+        from_date: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Fetch completed-session candles via the V3 historical-candle endpoint.
+
+        `unit` is one of "minutes"/"hours"/"days"/"weeks"/"months"; `interval` is the bar size
+        within that unit (e.g. "5" for 5-minute candles). Only covers *completed* trading
+        sessions up to and including `to_date` -- today's still-forming candles come from
+        get_intraday_candle instead, since Upstox never includes the current session here.
+        """
+        segments = [instrument_key, unit, interval, to_date]
+        if from_date:
+            segments.append(from_date)
+        return await self._get_v3_json(f"/historical-candle/{'/'.join(segments)}", access_token)
+
+    async def get_intraday_candle(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        unit: str,
+        interval: str,
+    ) -> dict[str, Any]:
+        """Fetch today's still-forming candles via the V3 intraday historical-candle endpoint --
+        the only source for the current session's bars, since get_historical_candle only ever
+        returns completed sessions.
+        """
+        return await self._get_v3_json(
+            f"/historical-candle/intraday/{instrument_key}/{unit}/{interval}",
+            access_token,
+        )
+
     async def search_instruments(
         self,
         access_token: str,
@@ -331,6 +370,30 @@ class UpstoxService:
         response = await self._request(
             "GET",
             f"{self.settings.upstox_api_base_url}{path}",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+            params=params,
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox API response")
+        return payload
+
+    async def _get_v3_json(
+        self,
+        path: str,
+        access_token: str,
+        *,
+        params: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """Same shape as _get_json, but against the V3 base URL -- for endpoints (like
+        historical-candle) that only exist under /v3, not the V2 base most other GETs use.
+        """
+        response = await self._request(
+            "GET",
+            f"{self.settings.upstox_api_v3_base_url}{path}",
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {access_token}",

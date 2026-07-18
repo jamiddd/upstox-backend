@@ -28,6 +28,7 @@ from app.services.order_history_service import OrderHistoryService
 from app.services.order_modification_service import OrderModificationService
 from app.services.search_screen_service import SearchScreenService
 from app.services.smart_order_service import SmartOrderService
+from app.services.underlying_signals_service import UnderlyingSignalsService
 
 public_router = APIRouter()
 protected_router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
@@ -325,6 +326,23 @@ async def main_summary(
     access_token = _load_access_token(token_store)
     try:
         return await MainScreenService(service).summary(access_token)
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/main/underlying-signals")
+async def main_underlying_signals(
+    underlying_key: str = DEFAULT_UNDERLYING_KEY,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return 9 EMA (5m/15m)/ATR(14)/opening-range/crucial-level tags for the underlying -- shown
+    to the user just before they place a strike order. See UnderlyingSignalsService's doc comment
+    for why this is computed on the underlying itself, not the option contract being traded.
+    """
+    access_token = _load_access_token(token_store)
+    try:
+        return await UnderlyingSignalsService(service).get_signals(access_token, underlying_key=underlying_key)
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

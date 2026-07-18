@@ -404,3 +404,69 @@ def test_upstox_errors_extract_message_from_nested_errors_list() -> None:
         "The Funds service is accessible from 5:30 AM to 12:00 AM IST daily. Please try again "
         "during these service hours."
     )
+
+
+def test_get_historical_candle_builds_v3_path_with_from_date() -> None:
+    """Fetch completed-session candles from the V3 historical-candle path, with a from_date."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v3/historical-candle/NSE_INDEX|Nifty 50/minutes/5/2026-07-18/2026-07-12"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": {"candles": []}})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_historical_candle(
+                "upstox-token",
+                "NSE_INDEX|Nifty 50",
+                unit="minutes",
+                interval="5",
+                to_date="2026-07-18",
+                from_date="2026-07-12",
+            )
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": {"candles": []}}
+
+
+def test_get_historical_candle_omits_from_date_when_absent() -> None:
+    """from_date is optional -- the path shouldn't grow a trailing segment when it's not given."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v3/historical-candle/NSE_INDEX|Nifty 50/days/1/2026-07-18"
+        return httpx.Response(200, json={"status": "success", "data": {"candles": []}})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_historical_candle(
+                "upstox-token",
+                "NSE_INDEX|Nifty 50",
+                unit="days",
+                interval="1",
+                to_date="2026-07-18",
+            )
+
+    anyio.run(run)
+
+
+def test_get_intraday_candle_uses_v3_intraday_path() -> None:
+    """Fetch today's still-forming candles from the V3 intraday historical-candle path."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v3/historical-candle/intraday/NSE_INDEX|Nifty 50/minutes/5"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": {"candles": []}})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_intraday_candle(
+                "upstox-token",
+                "NSE_INDEX|Nifty 50",
+                unit="minutes",
+                interval="5",
+            )
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": {"candles": []}}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -12,6 +13,7 @@ from app.services import instrument_rules_service
 from app.services.instrument_rules_service import _MasterCache
 from app.services.main_screen_service import _CACHE
 from app.services.search_screen_service import _SEARCH_CACHE
+from app.services import underlying_signals_service
 
 
 class FakeTokenStore:
@@ -445,6 +447,49 @@ class FakeUpstoxService:
             ],
         }
 
+    async def get_historical_candle(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        unit: str,
+        interval: str,
+        to_date: str,
+        from_date: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if unit == "days":
+            return {
+                "status": "success",
+                "data": {"candles": [["2026-07-17T00:00:00+05:30", 24900.0, 25100.0, 24850.0, 25050.0, 500000]]},
+            }
+        # A short but EMA/ATR-warm-up-sized rising 5m/15m series -- enough bars for both a
+        # 9-period EMA and a 14-period ATR to produce a real (non-None) value. A constant 10-point
+        # high/low spread and a steady +1/candle close both keep the true range flat at exactly
+        # 10, so ATR(14) converges to a clean, hand-verifiable 10.0.
+        start = datetime(2026, 7, 16, 9, 15)
+        candles = [
+            [
+                (start + timedelta(minutes=5 * i)).isoformat() + "+05:30",
+                24900.0 + i,
+                24905.0 + i,
+                24895.0 + i,
+                24902.0 + i,
+                1000,
+            ]
+            for i in range(20)
+        ]
+        return {"status": "success", "data": {"candles": candles}}
+
+    async def get_intraday_candle(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        unit: str,
+        interval: str,
+    ) -> dict[str, Any]:
+        return {"status": "success", "data": {"candles": []}}
+
     async def get_funds_and_margin(self, access_token: str) -> dict[str, Any]:
         if access_token == "funds-unavailable-token":
             # Mirrors Upstox's real nightly maintenance-window error (UDAPI100072) -- see
@@ -608,6 +653,7 @@ def _settings() -> Settings:
 def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     _CACHE.clear()
     _SEARCH_CACHE.clear()
+    underlying_signals_service._CACHE = {}
     instrument_rules_service._CACHE = _MasterCache(
         expires_at=9999999999,
         by_key={
@@ -964,6 +1010,45 @@ def test_main_position_quotes_supports_global_instrument_keys() -> None:
             {"instrument_key": "GLOBAL_INDEX|^GSPC", "ltp": 5555.5, "previous_close": 5540.0},
         ]
     }
+
+
+def test_main_underlying_signals_returns_ema_atr_opening_range_and_nearest_level() -> None:
+    """End-to-end wiring for the underlying "trade tips" route -- exact EMA/ATR/pivot math is
+    covered by test_underlying_signals_service.py's focused unit tests; this just proves the
+    route/service/UpstoxService plumbing produces the right shape from FakeUpstoxService's fixed
+    fake data.
+    """
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/main/underlying-signals?underlying_key=NSE_INDEX|Nifty 50",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["ltp"] == 25050.0
+    assert payload["ema9_5m"]["position"] == "above"
+    assert payload["ema9_15m"]["position"] == "above"
+    # A flat 10-point true range across the whole fake series -> ATR converges to exactly 10.
+    assert payload["atr14_5m"] == 10.0
+    assert payload["opening_range"] == {"window_minutes": 15, "high": 24907.0, "low": 24895.0, "position": "above"}
+    assert payload["previous_day"] == {"high": 25100.0, "low": 24850.0, "close": 25050.0}
+    assert payload["pivots"] == {"p": 25000.0, "r1": 25150.0, "s1": 24900.0, "r2": 25250.0, "s2": 24750.0}
+    # Both fake contracts share strike_price 25000 -- only one unique strike, so there's no gap
+    # to derive a round-number step from.
+    assert payload["round_step"] == 0.0
+    # LTP (25050.0) exactly matches the fake previous-day close -> that's the unambiguous nearest
+    # level, 0% away.
+    assert payload["nearest_level"] == {"label": "Prev Day Close", "value": 25050.0, "distance_percent": 0.0}
+    assert "Above 5m EMA9" in payload["tags"]
+    assert "Above 15m EMA9" in payload["tags"]
+    assert "ATR 10" in payload["tags"]
+    assert "Above opening range" in payload["tags"]
+    assert "Near Prev Day Close" in payload["tags"]
 
 
 def test_main_summary_returns_balance_pnl_and_closing_balance() -> None:
