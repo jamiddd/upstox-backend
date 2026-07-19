@@ -294,10 +294,10 @@ not the option contract about to be traded -- an option premium is dominated by 
 IV changes rather than the underlying's own trend/momentum, so an EMA/ATR/opening-range reading
 on the premium itself would be meaningless here.
 
-`expiry_date` is optional -- when given, the response also includes PCR/max-pain tags (see `pcr`/
-`max_pain` below), reusing the existing OI Analysis endpoint's own service and 60s cache under the
-hood (see "OI Analysis" above). Omitting it just skips those two fields/tags; everything else is
-unaffected.
+`expiry_date` is optional -- when given, the response also includes PCR/max-pain/OI-support/
+OI-resistance tags (see `pcr`/`max_pain`/`oi_support`/`oi_resistance` below), reusing the existing
+OI Analysis endpoint's own service and 60s cache under the hood (see "OI Analysis" above).
+Omitting it just skips those four fields/tags; everything else is unaffected.
 
 ```json
 {
@@ -313,20 +313,25 @@ unaffected.
   "nearest_or_target": null,
   "pcr": {"value": 1.35, "bias": "bullish"},
   "max_pain": {"value": 25000.0, "pull": "bearish"},
+  "oi_support": {"value": 24900.0, "oi": 1200000.0},
+  "oi_resistance": {"value": 25200.0, "oi": 1500000.0},
   "tags": [
     "Above 5m EMA9 by 39.50",
     "Above 15m EMA9 by 60.00",
     "Inside opening range",
     "Near R1 Pivot by 36.60",
     "PCR 1.35 - Bullish bias",
-    "Max Pain 25000 by +50.00 - Bearish pull"
+    "Max Pain 25000 by +50.00 - Bearish pull",
+    "OI Support 24900 by +150.00",
+    "OI Resistance 25200 by -150.00"
   ]
 }
 ```
 
-`pcr`/`max_pain` (and their two tags) are only present when `expiry_date` was given -- both `null`
-otherwise, or if Upstox's OI endpoints fail for that expiry (this degrades quietly, same as
-`main/summary`'s funds-unavailable handling -- the rest of the response is unaffected).
+`pcr`/`max_pain`/`oi_support`/`oi_resistance` (and their tags) are only present when `expiry_date`
+was given -- all `null` otherwise, or if Upstox's OI endpoints fail for that expiry (this degrades
+quietly, same as `main/summary`'s funds-unavailable handling -- the rest of the response is
+unaffected).
 
 A breakout that's also sitting on one of the opening range's own measured-move target levels
 looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Target 1"):
@@ -376,14 +381,21 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   lose the least by expiry -- price tends to gravitate toward it as expiry approaches. `pull` is
   `"bullish"` if LTP is currently below it (expected pull up), `"bearish"` if above (pull down),
   `"neutral"` if exactly on it.
+- `oi_support` / `oi_resistance`: same availability as `pcr`, computed from the per-strike
+  `call_put_oi_data_list` the same OI Analysis call already returns. `oi_support` is the strike
+  with the single highest **put** OI (heavy put writing there reads as a level put writers will
+  defend, i.e. support); `oi_resistance` is the strike with the highest **call** OI (the mirror
+  image). `oi` on each is that strike's own OI count. `null` if there's no usable per-strike data.
 - `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50"`,
-  `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35 - Bullish bias"`) built from the fields
-  above -- the client can display these directly without any string-building of its own. Every
-  directional tag (EMA above/below, opening-range above/below, a nearby level, PCR bias, max-pain
-  pull) spells out its magnitude, not just the direction -- `ATR` and `"Inside opening range"` are
-  the only two with no direction/distance to report. The PCR/max-pain tags say `"Bullish"`/
-  `"Bearish"` explicitly (rather than starting with `"Above"`/`"Below"` like the others) since
-  neither phrasing fits those two signals -- the app's tag-sentiment classifier checks for both.
+  `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35 - Bullish bias"`, `"OI Support 24900 by
+  +150.00"`) built from the fields above -- the client can display these directly without any
+  string-building of its own. Every directional tag (EMA above/below, opening-range above/below, a
+  nearby level, PCR bias, max-pain pull, OI support/resistance) spells out its magnitude, not just
+  the direction -- `ATR` and `"Inside opening range"` are the only two with no direction/distance
+  to report. The PCR/max-pain tags say `"Bullish"`/`"Bearish"` explicitly (rather than starting
+  with `"Above"`/`"Below"` like the others) since neither phrasing fits those two signals -- the
+  app's tag-sentiment classifier checks for both. The OI support/resistance tags are informational
+  (no bullish/bearish framing) -- they render as neutral on the client.
 
 Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round step) are cached
 ~60 seconds -- they only meaningfully change when a new candle closes, not on every feed tick.

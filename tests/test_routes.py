@@ -1140,6 +1140,11 @@ def test_main_underlying_signals_includes_pcr_and_max_pain_when_expiry_date_is_g
     assert payload["max_pain"] == {"value": 25000.0, "pull": "bearish"}
     assert any(tag.startswith("PCR 1.2") and "Bullish bias" in tag for tag in payload["tags"])
     assert "Max Pain 25000 by +50.00 - Bearish pull" in payload["tags"]
+    # FakeUpstoxService.get_oi's call_put_oi_data_list is empty (shared with the OI Analysis
+    # route's own exact-match test, so not changed here) -- no per-strike data means no OI
+    # support/resistance to compute, not an error.
+    assert payload["oi_support"] is None
+    assert payload["oi_resistance"] is None
 
 
 def test_main_summary_returns_balance_pnl_and_closing_balance() -> None:

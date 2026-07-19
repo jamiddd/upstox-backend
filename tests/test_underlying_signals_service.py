@@ -163,6 +163,8 @@ def test_build_tags_composes_readable_short_labels_with_absolute_point_distances
         pcr_bias=None,
         max_pain=None,
         max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
     )
 
     assert tags == [
@@ -191,6 +193,8 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         pcr_bias=None,
         max_pain=None,
         max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
     )
     below = signals._build_tags(
         ltp=24990.0,
@@ -208,6 +212,8 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         pcr_bias=None,
         max_pain=None,
         max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
     )
 
     assert above == ["Above opening range by 10.00"]
@@ -233,6 +239,8 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         pcr_bias=None,
         max_pain=None,
         max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
     )
     # LTP is 2 points *past* the target (overshot it) -> positive signed distance.
     past_target = signals._build_tags(
@@ -251,6 +259,8 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         pcr_bias=None,
         max_pain=None,
         max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
     )
     # LTP (24988.0) hasn't reached its downside target (24990.0) yet -> negative signed
     # distance, and "bounce" (not "pullback") is the reversal word on this side.
@@ -270,6 +280,8 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         pcr_bias=None,
         max_pain=None,
         max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
     )
 
     assert on_target == ["Above opening range by 10.00 (near OR Target 1 by +0.00, caution: possible pullback)"]
@@ -294,6 +306,8 @@ def test_build_tags_adds_pcr_and_max_pain_tags() -> None:
         pcr_bias="bullish",
         max_pain=25000.0,
         max_pain_pull="bearish",
+        oi_support_strike=None,
+        oi_resistance_strike=None,
     )
 
     assert tags == [
@@ -319,9 +333,58 @@ def test_build_tags_omits_pcr_and_max_pain_when_unavailable() -> None:
         pcr_bias=None,
         max_pain=None,
         max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
     )
 
     assert tags == []
+
+
+def test_build_tags_adds_oi_support_and_resistance_tags() -> None:
+    tags = signals._build_tags(
+        ltp=25050.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
+        oi_support_strike=24900.0,
+        oi_resistance_strike=25200.0,
+    )
+
+    assert tags == [
+        "OI Support 24900 by +150.00",
+        "OI Resistance 25200 by -150.00",
+    ]
+
+
+def test_oi_support_resistance_picks_highest_put_and_call_oi_strikes() -> None:
+    rows = [
+        {"strike_price": 24900.0, "call_oi": 500000, "put_oi": 1200000},
+        {"strike_price": 25000.0, "call_oi": 800000, "put_oi": 900000},
+        {"strike_price": 25100.0, "call_oi": 1500000, "put_oi": 400000},
+    ]
+
+    support_strike, support_oi, resistance_strike, resistance_oi = signals._oi_support_resistance(rows)
+
+    assert (support_strike, support_oi) == (24900.0, 1200000.0)
+    assert (resistance_strike, resistance_oi) == (25100.0, 1500000.0)
+
+
+def test_oi_support_resistance_returns_none_for_empty_or_unusable_rows() -> None:
+    assert signals._oi_support_resistance([]) == (None, None, None, None)
+    assert signals._oi_support_resistance([{"strike_price": None, "call_oi": 100, "put_oi": 100}]) == (
+        None, None, None, None,
+    )
 
 
 def test_or_targets_are_ordinal_multiples_of_the_or_size() -> None:
@@ -396,6 +459,7 @@ class _FakeUpstoxService:
         ltp: float,
         pcr: float = 1.0,
         max_pain: float = 0.0,
+        oi_strike_rows: list[dict[str, object]] | None = None,
     ) -> None:
         self._minute_candles = minute_candles
         self._daily_candles = daily_candles
@@ -403,6 +467,7 @@ class _FakeUpstoxService:
         self._ltp = ltp
         self._pcr = pcr
         self._max_pain = max_pain
+        self._oi_strike_rows = oi_strike_rows or []
 
     async def get_historical_candle(self, access_token, instrument_key, *, unit, interval, to_date, from_date=None):
         candles = self._daily_candles if unit == "days" else self._minute_candles
@@ -418,7 +483,10 @@ class _FakeUpstoxService:
         return {"status": "success", "data": {instrument_key: {"last_price": self._ltp}}}
 
     async def get_oi(self, access_token, instrument_key, *, expiry, date):
-        return {"status": "success", "data": {"total_puts": 0, "total_calls": 0, "call_put_oi_data_list": []}}
+        return {
+            "status": "success",
+            "data": {"total_puts": 0, "total_calls": 0, "call_put_oi_data_list": self._oi_strike_rows},
+        }
 
     async def get_change_oi(self, access_token, instrument_key, *, expiry, date, interval):
         return {"status": "success", "data": {"call_put_oi_data_list": []}}
@@ -481,6 +549,8 @@ def test_get_signals_wires_everything_into_tags() -> None:
     # No expiry_date was passed -- OI analysis is skipped entirely, not just empty.
     assert result["pcr"] is None
     assert result["max_pain"] is None
+    assert result["oi_support"] is None
+    assert result["oi_resistance"] is None
 
 
 def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> None:
@@ -497,6 +567,10 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
             ltp=200.0,
             pcr=1.35,
             max_pain=190.0,
+            oi_strike_rows=[
+                {"strike_price": 190.0, "call_oi": 500000, "put_oi": 1200000},
+                {"strike_price": 210.0, "call_oi": 1500000, "put_oi": 400000},
+            ],
         ),
     )
 
@@ -509,5 +583,9 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
     assert result["pcr"] == {"value": 1.35, "bias": "bullish"}
     # LTP (200.0) is above max pain (190.0) -> bearish pull.
     assert result["max_pain"] == {"value": 190.0, "pull": "bearish"}
+    assert result["oi_support"] == {"value": 190.0, "oi": 1200000.0}
+    assert result["oi_resistance"] == {"value": 210.0, "oi": 1500000.0}
     assert any(tag.startswith("PCR 1.35 - Bullish bias") for tag in result["tags"])
     assert any(tag.startswith("Max Pain 190 by +10.00 - Bearish pull") for tag in result["tags"])
+    assert any(tag.startswith("OI Support 190 by +10.00") for tag in result["tags"])
+    assert any(tag.startswith("OI Resistance 210 by -10.00") for tag in result["tags"])

@@ -49,15 +49,34 @@ class _CacheEntry:
     value: Any
 
 
+@dataclass
+class _OiSummary:
+    """Everything derived from one OI Analysis call -- see UnderlyingSignalsService._oi_analysis.
+    All fields default to None (never a partial mix -- either the whole call succeeded or it
+    didn't) so a single check on any one field tells you whether OI data is available at all.
+    """
+
+    pcr: Optional[float] = None
+    max_pain: Optional[float] = None
+    # The strike with the single highest put OI -- heavy put writing there reads as a support
+    # level (put writers are betting price stays above it, and will defend that bet).
+    support_strike: Optional[float] = None
+    support_oi: Optional[float] = None
+    # The strike with the single highest call OI -- the resistance-level mirror of support_strike.
+    resistance_strike: Optional[float] = None
+    resistance_oi: Optional[float] = None
+
+
 _CACHE: dict[tuple[Any, ...], _CacheEntry] = {}
 
 
 class UnderlyingSignalsService:
     """Computes glanceable technical-analysis tags for the underlying -- 9 EMA (5m and 15m),
     ATR(14), today's opening-range position, proximity to a "crucial level" (previous-day H/L/C,
-    classic pivots, or a round psychological number), and (when [expiry_date] is given) a
-    PCR-based bias and Max Pain pull direction from open-interest data -- shown to the user just
-    before they place a strike order. See docs/MAIN_SCREEN_API.md's "Underlying Signals" section.
+    classic pivots, or a round psychological number), and (when [expiry_date] is given) PCR-based
+    bias, Max Pain pull direction, and OI support/resistance strikes from open-interest data --
+    shown to the user just before they place a strike order. See docs/MAIN_SCREEN_API.md's
+    "Underlying Signals" section.
 
     Deliberately computed on the *underlying's* own price action, not the option contract being
     traded: an option premium is dominated by theta decay and IV changes rather than the
@@ -130,9 +149,9 @@ class UnderlyingSignalsService:
             tolerance_percent=_NEAREST_LEVEL_TOLERANCE_PERCENT,
         )
 
-        pcr, max_pain = await self._oi_analysis(access_token, underlying_key, expiry_date, today)
-        pcr_bias = _pcr_bias(pcr)
-        max_pain_pull = _max_pain_pull(ltp, max_pain)
+        oi_summary = await self._oi_analysis(access_token, underlying_key, expiry_date, today)
+        pcr_bias = _pcr_bias(oi_summary.pcr)
+        max_pain_pull = _max_pain_pull(ltp, oi_summary.max_pain)
 
         tags = _build_tags(
             ltp=ltp,
@@ -146,10 +165,12 @@ class UnderlyingSignalsService:
             opening_range_position=opening_range_position,
             nearest_level=nearest_level,
             nearest_or_target=nearest_or_target,
-            pcr=pcr,
+            pcr=oi_summary.pcr,
             pcr_bias=pcr_bias,
-            max_pain=max_pain,
+            max_pain=oi_summary.max_pain,
             max_pain_pull=max_pain_pull,
+            oi_support_strike=oi_summary.support_strike,
+            oi_resistance_strike=oi_summary.resistance_strike,
         )
 
         return {
@@ -172,8 +193,22 @@ class UnderlyingSignalsService:
             "round_step": round_step,
             "nearest_level": nearest_level,
             "nearest_or_target": nearest_or_target,
-            "pcr": {"value": _round_or_none(pcr), "bias": pcr_bias} if pcr is not None else None,
-            "max_pain": {"value": _round_or_none(max_pain), "pull": max_pain_pull} if max_pain is not None else None,
+            "pcr": {"value": _round_or_none(oi_summary.pcr), "bias": pcr_bias} if oi_summary.pcr is not None else None,
+            "max_pain": (
+                {"value": _round_or_none(oi_summary.max_pain), "pull": max_pain_pull}
+                if oi_summary.max_pain is not None
+                else None
+            ),
+            "oi_support": (
+                {"value": oi_summary.support_strike, "oi": oi_summary.support_oi}
+                if oi_summary.support_strike is not None
+                else None
+            ),
+            "oi_resistance": (
+                {"value": oi_summary.resistance_strike, "oi": oi_summary.resistance_oi}
+                if oi_summary.resistance_strike is not None
+                else None
+            ),
             "tags": tags,
         }
 
@@ -183,15 +218,15 @@ class UnderlyingSignalsService:
         underlying_key: str,
         expiry_date: Optional[str],
         today: date,
-    ) -> tuple[Optional[float], Optional[float]]:
-        """PCR and max pain for [expiry_date], reusing the existing OIAnalysisService (its own
-        60s cache applies, nothing duplicated here) -- `(None, None)` if no expiry was given (a
-        contract-free underlying, or a caller that doesn't have one yet) or Upstox's OI endpoints
-        fail, same "degrade this one piece, not the whole response" posture as
-        MainScreenService.summary's funds-unavailable handling.
+    ) -> "_OiSummary":
+        """PCR/max pain/OI support-resistance for [expiry_date], reusing the existing
+        OIAnalysisService (its own 60s cache applies, nothing duplicated here) -- an all-`None`
+        [_OiSummary] if no expiry was given (a contract-free underlying, or a caller that doesn't
+        have one yet) or Upstox's OI endpoints fail, same "degrade this one piece, not the whole
+        response" posture as MainScreenService.summary's funds-unavailable handling.
         """
         if not expiry_date:
-            return None, None
+            return _OiSummary()
         try:
             analysis = await OIAnalysisService(self.upstox).get_analysis(
                 access_token,
@@ -202,13 +237,26 @@ class UnderlyingSignalsService:
                 bucket_interval=60,
             )
         except UpstoxApiError:
-            return None, None
+            return _OiSummary()
 
         pcr = analysis.get("pcr", {}).get("pcr")
         max_pain = analysis.get("max_pain", {}).get("max_pain")
         pcr = float(pcr) if isinstance(pcr, (int, float)) else None
         max_pain = float(max_pain) if isinstance(max_pain, (int, float)) else None
-        return pcr, max_pain
+
+        strike_rows = analysis.get("oi", {}).get("call_put_oi_data_list")
+        support_strike, support_oi, resistance_strike, resistance_oi = _oi_support_resistance(
+            strike_rows if isinstance(strike_rows, list) else [],
+        )
+
+        return _OiSummary(
+            pcr=pcr,
+            max_pain=max_pain,
+            support_strike=support_strike,
+            support_oi=support_oi,
+            resistance_strike=resistance_strike,
+            resistance_oi=resistance_oi,
+        )
 
     async def _minute_series(
         self,
@@ -559,6 +607,39 @@ def _max_pain_pull(ltp: float, max_pain: Optional[float]) -> Optional[str]:
     return "neutral"
 
 
+def _oi_support_resistance(
+    strike_rows: list[dict[str, Any]],
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Returns `(support_strike, support_oi, resistance_strike, resistance_oi)` from Upstox's
+    per-strike `call_put_oi_data_list` -- support is the strike with the single highest put OI,
+    resistance the strike with the single highest call OI (see _OiSummary's doc comment for why).
+    All `None` if [strike_rows] is empty or has no usable rows.
+    """
+    support_strike: Optional[float] = None
+    support_oi: Optional[float] = None
+    resistance_strike: Optional[float] = None
+    resistance_oi: Optional[float] = None
+
+    for row in strike_rows:
+        if not isinstance(row, dict):
+            continue
+        strike = row.get("strike_price")
+        if not isinstance(strike, (int, float)):
+            continue
+
+        put_oi = row.get("put_oi")
+        if isinstance(put_oi, (int, float)) and (support_oi is None or put_oi > support_oi):
+            support_oi = float(put_oi)
+            support_strike = float(strike)
+
+        call_oi = row.get("call_oi")
+        if isinstance(call_oi, (int, float)) and (resistance_oi is None or call_oi > resistance_oi):
+            resistance_oi = float(call_oi)
+            resistance_strike = float(strike)
+
+    return support_strike, support_oi, resistance_strike, resistance_oi
+
+
 def _build_tags(
     *,
     ltp: float,
@@ -576,6 +657,8 @@ def _build_tags(
     pcr_bias: Optional[str],
     max_pain: Optional[float],
     max_pain_pull: Optional[str],
+    oi_support_strike: Optional[float],
+    oi_resistance_strike: Optional[float],
 ) -> list[str]:
     """Builds the ready-to-render tag strings -- every directional tag (EMA above/below, opening
     range above/below, a nearby level) spells out the absolute point distance from LTP, not just
@@ -615,6 +698,10 @@ def _build_tags(
         tags.append(f"PCR {pcr:.2f} - {pcr_bias.capitalize()} bias")
     if max_pain is not None and max_pain_pull is not None:
         tags.append(f"Max Pain {max_pain:g} by {ltp - max_pain:+.2f} - {max_pain_pull.capitalize()} pull")
+    if oi_support_strike is not None:
+        tags.append(f"OI Support {oi_support_strike:g} by {ltp - oi_support_strike:+.2f}")
+    if oi_resistance_strike is not None:
+        tags.append(f"OI Resistance {oi_resistance_strike:g} by {ltp - oi_resistance_strike:+.2f}")
     return tags
 
 
