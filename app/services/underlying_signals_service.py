@@ -874,13 +874,28 @@ def _build_tags(
     of every other tag -- it's a warning not to act on the rest of the bulletin right now, so it
     needs to be the first thing the user reads, not buried after several bullish/bearish-looking
     reads that would otherwise seem to say "trade this".
+
+    The two 9 EMA reads (5m and 15m) are folded into a single line rather than two separate tags
+    -- the 5m read leads (it's the one meant for scalping timing, per this service's own doc
+    comment) and still drives the line's own "Above"/"Below" prefix (so the Android tag-sentiment
+    classifier keeps reading it correctly), with the 15m read parenthesized alongside it, same
+    "fold a second fact into the same line" pattern the OR-target caution above already uses.
+    When only one of the two is available (not enough candle history yet for the other), that one
+    stands alone instead, unparenthesized.
     """
     tags: list[str] = []
     if no_trade_zone and today_open is not None:
         tags.append(f"No-Trade Zone -- within {_NO_TRADE_ZONE_POINTS:g} of Day Open ({today_open:g})")
-    if ema9_5m_position and ema9_5m_value is not None:
+    have_5m = ema9_5m_position and ema9_5m_value is not None
+    have_15m = ema9_15m_position and ema9_15m_value is not None
+    if have_5m and have_15m:
+        tags.append(
+            f"{ema9_5m_position.capitalize()} 5m EMA9 by {abs(ltp - ema9_5m_value):.2f}"
+            f" (15m {ema9_15m_position.capitalize()} by {abs(ltp - ema9_15m_value):.2f})"
+        )
+    elif have_5m:
         tags.append(f"{ema9_5m_position.capitalize()} 5m EMA9 by {abs(ltp - ema9_5m_value):.2f}")
-    if ema9_15m_position and ema9_15m_value is not None:
+    elif have_15m:
         tags.append(f"{ema9_15m_position.capitalize()} 15m EMA9 by {abs(ltp - ema9_15m_value):.2f}")
     if atr14_5m is not None:
         tags.append(f"ATR {round(atr14_5m, 1):g}")

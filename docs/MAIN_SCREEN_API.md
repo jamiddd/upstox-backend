@@ -327,8 +327,7 @@ everything else is unaffected.
   "oi_resistance": {"value": 25200.0, "oi": 1500000.0},
   "vwap": {"value": 25040.25, "position": "above"},
   "tags": [
-    "Above 5m EMA9 by 39.50",
-    "Above 15m EMA9 by 60.00",
+    "Above 5m EMA9 by 39.50 (15m Above by 60.00)",
     "Inside opening range",
     "Near R1 Pivot by 36.60",
     "PCR 1.35 - Bullish bias",
@@ -422,13 +421,16 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   the resolved futures contract; `position` is `"above"`/`"below"`/`"at"` the *futures* contract's
   own LTP relative to it (not the underlying's LTP, since VWAP itself is a futures-contract-only
   concept here -- the index has no traded volume of its own to compute VWAP from).
-- `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50"`,
-  `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35 - Bullish bias"`, `"OI Support 24900 by
-  +150.00"`) built from the fields above -- the client can display these directly without any
-  string-building of its own. Every directional tag (EMA above/below, opening-range above/below, a
-  nearby level, PCR bias, max-pain pull, OI support/resistance) spells out its magnitude, not just
-  the direction -- `ATR` and `"Inside opening range"` are the only two with no direction/distance
-  to report. The PCR/max-pain tags say `"Bullish"`/`"Bearish"` explicitly (rather than starting
+- `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50 (15m Above by
+  60.00)"`, `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35 - Bullish bias"`, `"OI Support
+  24900 by +150.00"`) built from the fields above -- the client can display these directly without
+  any string-building of its own. The 5m and 15m EMA reads share a single line -- the 5m read (the
+  one meant for scalping timing) drives the line's leading `"Above"`/`"Below"`, with the 15m read
+  parenthesized alongside it; when only one of the two has enough candle history yet, that one
+  appears alone, unparenthesized. Every directional tag (EMA above/below, opening-range
+  above/below, a nearby level, PCR bias, max-pain pull, OI support/resistance) spells out its
+  magnitude, not just the direction -- `ATR` and `"Inside opening range"` are the only two with no
+  direction/distance to report. The PCR/max-pain tags say `"Bullish"`/`"Bearish"` explicitly (rather than starting
   with `"Above"`/`"Below"` like the others) since neither phrasing fits those two signals -- the
   app's tag-sentiment classifier checks for both. The OI support/resistance tags are informational
   (no bullish/bearish framing) -- they render as neutral on the client. When `no_trade_zone` is

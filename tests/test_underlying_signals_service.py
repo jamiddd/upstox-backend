@@ -182,12 +182,91 @@ def test_build_tags_composes_readable_short_labels_with_absolute_point_distances
     )
 
     assert tags == [
-        "Above 5m EMA9 by 50.00",
-        "Below 15m EMA9 by 50.00",
+        "Above 5m EMA9 by 50.00 (15m Below by 50.00)",
         "ATR 42.3",
         "Inside opening range",
         "Near R1 Pivot by 13.40",
     ]
+
+
+def test_build_tags_merges_5m_and_15m_ema_into_one_line_when_both_agree() -> None:
+    tags = signals._build_tags(
+        ltp=25100.0,
+        ema9_5m_value=25050.0,
+        ema9_5m_position="above",
+        ema9_15m_value=25000.0,
+        ema9_15m_position="above",
+        atr14_5m=None,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
+    )
+
+    assert tags == ["Above 5m EMA9 by 50.00 (15m Above by 100.00)"]
+
+
+def test_build_tags_shows_5m_or_15m_ema_alone_when_only_one_is_available() -> None:
+    only_5m = signals._build_tags(
+        ltp=25100.0,
+        ema9_5m_value=25050.0,
+        ema9_5m_position="above",
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
+    )
+    only_15m = signals._build_tags(
+        ltp=25100.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=25000.0,
+        ema9_15m_position="above",
+        atr14_5m=None,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
+    )
+
+    assert only_5m == ["Above 5m EMA9 by 50.00"]
+    assert only_15m == ["Above 15m EMA9 by 100.00"]
 
 
 def test_build_tags_reports_opening_range_breakout_distance() -> None:
@@ -759,9 +838,10 @@ def test_get_signals_wires_everything_into_tags() -> None:
     assert result["previous_day"] == {"high": 110.0, "low": 95.0, "close": 105.0}
     assert result["round_step"] == 50.0
     # Prefix checks (not exact-match) since every directional tag now also spells out the
-    # absolute point distance -- see _build_tags -- which this wiring test isn't pinning down.
-    assert any(tag.startswith("Above 5m EMA9 by ") for tag in result["tags"])
-    assert any(tag.startswith("Above 15m EMA9 by ") for tag in result["tags"])
+    # absolute point distance -- see _build_tags -- which this wiring test isn't pinning down. The
+    # 5m and 15m EMA reads are folded into a single line (both "above" here), with the 15m read
+    # parenthesized alongside the 5m one -- see _build_tags's merge doc comment.
+    assert any(tag.startswith("Above 5m EMA9 by ") and "(15m Above by " in tag for tag in result["tags"])
     assert any(tag.startswith("Above opening range by ") for tag in result["tags"])
     # No expiry_date was passed -- OI analysis is skipped entirely, not just empty.
     assert result["pcr"] is None

@@ -1181,8 +1181,9 @@ def test_main_underlying_signals_returns_ema_atr_opening_range_and_nearest_level
     # depends on the fake series' EMA math, already covered by the service's own unit tests) and
     # exact strings for the two hand-computable ones (opening range high/low and nearest_level's
     # value are both known constants above).
-    assert any(tag.startswith("Above 5m EMA9 by ") for tag in payload["tags"])
-    assert any(tag.startswith("Above 15m EMA9 by ") for tag in payload["tags"])
+    # The 5m and 15m EMA reads are folded into a single line (both "above" here) -- see
+    # UnderlyingSignalsService._build_tags's merge doc comment.
+    assert any(tag.startswith("Above 5m EMA9 by ") and "(15m Above by " in tag for tag in payload["tags"])
     assert "ATR 10" in payload["tags"]
     assert "Above opening range by 143.00" in payload["tags"]
     assert "Near Prev Day Close by 0.00" in payload["tags"]
