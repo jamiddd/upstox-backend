@@ -129,6 +129,16 @@ def test_range_position_reports_above_below_and_inside() -> None:
     assert signals._range_position(100.0, high=110.0, low=90.0) == "inside"
 
 
+def test_is_near_day_open_flags_ltp_within_the_fixed_point_tolerance() -> None:
+    assert signals._is_near_day_open(25010.0, 25000.0, tolerance_points=15.0) is True
+    assert signals._is_near_day_open(24985.0, 25000.0, tolerance_points=15.0) is True
+    # Exactly at the boundary is still "near" (inclusive).
+    assert signals._is_near_day_open(25015.0, 25000.0, tolerance_points=15.0) is True
+    assert signals._is_near_day_open(25016.0, 25000.0, tolerance_points=15.0) is False
+    assert signals._is_near_day_open(25000.0, None, tolerance_points=15.0) is False
+    assert signals._is_near_day_open(0.0, 25000.0, tolerance_points=15.0) is False
+
+
 def test_pcr_bias_thresholds() -> None:
     assert signals._pcr_bias(1.2) == "bullish"
     assert signals._pcr_bias(1.5) == "bullish"
@@ -167,6 +177,8 @@ def test_build_tags_composes_readable_short_labels_with_absolute_point_distances
         oi_resistance_strike=None,
         vwap_value=None,
         vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
     )
 
     assert tags == [
@@ -199,6 +211,8 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         oi_resistance_strike=None,
         vwap_value=None,
         vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
     )
     below = signals._build_tags(
         ltp=24990.0,
@@ -220,6 +234,8 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         oi_resistance_strike=None,
         vwap_value=None,
         vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
     )
 
     assert above == ["Above opening range by 10.00"]
@@ -249,6 +265,8 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         oi_resistance_strike=None,
         vwap_value=None,
         vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
     )
     # LTP is 2 points *past* the target (overshot it) -> positive signed distance.
     past_target = signals._build_tags(
@@ -271,6 +289,8 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         oi_resistance_strike=None,
         vwap_value=None,
         vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
     )
     # LTP (24988.0) hasn't reached its downside target (24990.0) yet -> negative signed
     # distance, and "bounce" (not "pullback") is the reversal word on this side.
@@ -294,6 +314,8 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         oi_resistance_strike=None,
         vwap_value=None,
         vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
     )
 
     assert on_target == ["Above opening range by 10.00 (near OR Target 1 by +0.00, caution: possible pullback)"]
@@ -322,6 +344,8 @@ def test_build_tags_adds_pcr_and_max_pain_tags() -> None:
         oi_resistance_strike=None,
         vwap_value=None,
         vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
     )
 
     assert tags == [
@@ -351,6 +375,8 @@ def test_build_tags_omits_pcr_and_max_pain_when_unavailable() -> None:
         oi_resistance_strike=None,
         vwap_value=None,
         vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
     )
 
     assert tags == []
@@ -377,6 +403,8 @@ def test_build_tags_adds_oi_support_and_resistance_tags() -> None:
         oi_resistance_strike=25200.0,
         vwap_value=None,
         vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
     )
 
     assert tags == [
@@ -406,9 +434,70 @@ def test_build_tags_adds_vwap_tag() -> None:
         oi_resistance_strike=None,
         vwap_value=25000.0,
         vwap_position="above",
+        today_open=None,
+        no_trade_zone=False,
     )
 
     assert tags == ["Above VWAP by 50.00"]
+
+
+def test_build_tags_puts_no_trade_zone_caution_first_ahead_of_every_other_tag() -> None:
+    tags = signals._build_tags(
+        ltp=25010.0,
+        ema9_5m_value=25000.0,
+        ema9_5m_position="above",
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
+        today_open=25000.0,
+        no_trade_zone=True,
+    )
+
+    assert tags == [
+        "No-Trade Zone -- within 15 of Day Open (25000)",
+        "Above 5m EMA9 by 10.00",
+    ]
+
+
+def test_build_tags_omits_no_trade_zone_caution_when_not_flagged() -> None:
+    tags = signals._build_tags(
+        ltp=25010.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
+        today_open=25000.0,
+        no_trade_zone=False,
+    )
+
+    assert tags == []
 
 
 def test_oi_support_resistance_picks_highest_put_and_call_oi_strikes() -> None:
@@ -682,6 +771,37 @@ def test_get_signals_wires_everything_into_tags() -> None:
     # No underlying_symbol was passed -- futures resolution (and therefore VWAP) is skipped
     # entirely, not just empty.
     assert result["vwap"] is None
+    # Today's session open (the fake series' first candle) is 100.0, LTP is 200.0 -- nowhere near
+    # it, so no caution.
+    assert result["today_open"] == 100.0
+    assert result["no_trade_zone"] is False
+
+
+def test_get_signals_flags_no_trade_zone_when_ltp_is_near_todays_open() -> None:
+    """LTP sitting just 10 points above today's own session open (well within the fixed 15-point
+    tolerance) should flag the no-trade-zone caution and put it first in the tag list.
+    """
+    start = datetime(2026, 7, 18, 9, 15)
+    minute_candles = _rising_candles(20, start=start, step_minutes=5)
+    daily_candles = [
+        ["2026-07-17T00:00:00+05:30", 100.0, 110.0, 95.0, 105.0, 500000],
+    ]
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=minute_candles,
+            daily_candles=daily_candles,
+            strikes=[24800.0, 24850.0, 24900.0, 24950.0],
+            ltp=110.0,
+        ),
+    )
+
+    result = anyio.run(
+        lambda: service.get_signals("upstox-token", underlying_key="NSE_INDEX|Nifty 50"),
+    )
+
+    assert result["today_open"] == 100.0
+    assert result["no_trade_zone"] is True
+    assert result["tags"][0] == "No-Trade Zone -- within 15 of Day Open (100)"
 
 
 def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> None:

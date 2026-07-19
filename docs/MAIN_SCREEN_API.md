@@ -317,6 +317,8 @@ everything else is unaffected.
   "previous_day": {"high": 25100.0, "low": 24900.0, "close": 24980.0},
   "pivots": {"p": 24993.3, "r1": 25086.6, "r2": 25193.3, "s1": 24886.6, "s2": 24793.3},
   "round_step": 50.0,
+  "today_open": 24950.0,
+  "no_trade_zone": false,
   "nearest_level": {"label": "R1 Pivot", "value": 25086.6, "distance_percent": 0.15},
   "nearest_or_target": null,
   "pcr": {"value": 1.35, "bias": "bullish"},
@@ -370,6 +372,13 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
 - `round_step`: the underlying's own strike spacing (the most common gap between consecutive
   option-chain strikes for this underlying), used to find the two round psychological numbers
   bracketing LTP. `0.0` if there isn't enough strike data to derive a step.
+- `today_open`: today's session open (the first 5-minute candle's open). `null` before any candle
+  for today exists yet.
+- `no_trade_zone`: `true` when LTP is currently within a fixed **15 points** of `today_open` --
+  price whipsaws right around the open before it's picked a direction, so this is a caution not to
+  act on the rest of the bulletin yet. Always `false` (never a false caution) when `today_open`
+  isn't known yet. When `true`, a `"No-Trade Zone -- within 15 of Day Open (X)"` tag is inserted
+  **first** in `tags`, ahead of every other tag -- see the `tags` description below.
 - `nearest_level`: whichever of `previous_day`'s three values, the five pivot levels, or the two
   round numbers is closest to LTP, **only if** it's within 0.15% of LTP -- `null` if nothing is
   that close right now.
@@ -422,7 +431,10 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   to report. The PCR/max-pain tags say `"Bullish"`/`"Bearish"` explicitly (rather than starting
   with `"Above"`/`"Below"` like the others) since neither phrasing fits those two signals -- the
   app's tag-sentiment classifier checks for both. The OI support/resistance tags are informational
-  (no bullish/bearish framing) -- they render as neutral on the client.
+  (no bullish/bearish framing) -- they render as neutral on the client. When `no_trade_zone` is
+  `true`, its `"No-Trade Zone -- within 15 of Day Open (X)"` tag is always **first** in the list --
+  the client's tag-sentiment classifier renders it as a distinct warning (not bullish/bearish/
+  neutral) so it doesn't get lost among the rest.
 
 Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round step) are cached
 ~60 seconds -- they only meaningfully change when a new candle closes, not on every feed tick.

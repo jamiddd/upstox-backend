@@ -38,6 +38,13 @@ _PCR_BEARISH_THRESHOLD = 0.8
 # (a single huge far-OTM print skews the whole-chain PCR far more than it skews the actual trade).
 _NEAR_ATM_STRIKE_COUNT = 5
 
+# LTP within this many *absolute* points of today's session open is a "no-trade zone" -- the app's
+# user gets whipsawed trading right around the open before price has picked a direction. Fixed
+# points (not a percent of LTP like _NEAREST_LEVEL_TOLERANCE_PERCENT) per explicit product
+# decision -- this is a caution about a specific instant (the open print), not a proximity-to-a-
+# level read that should scale with the underlying's own price.
+_NO_TRADE_ZONE_POINTS = 15.0
+
 # SENSEX has no actively-traded futures contract on Upstox (unlike NIFTY/BANKNIFTY on NSE) -- per
 # explicit product decision, VWAP for SENSEX always uses Nifty's own futures contract instead.
 # Upstox's own key convention (matches every other *_INDEX entry already in this codebase, e.g.
@@ -128,9 +135,12 @@ class UnderlyingSignalsService:
         ema9_15m = _ema([c.close for c in candles_15m], period=9)
         atr14_5m = _atr(candles_5m, period=14)
 
+        todays_candles_5m = _todays_candles(candles_5m)
         opening_range_high, opening_range_low = _opening_range(
-            _todays_candles(candles_5m), window_candles=_OPENING_RANGE_CANDLES,
+            todays_candles_5m, window_candles=_OPENING_RANGE_CANDLES,
         )
+        today_open = todays_candles_5m[0].open if todays_candles_5m else None
+        no_trade_zone = _is_near_day_open(ltp, today_open, tolerance_points=_NO_TRADE_ZONE_POINTS)
 
         prev_day = daily_candles[-1] if daily_candles else None
         pivots = _pivots(prev_day.high, prev_day.low, prev_day.close) if prev_day else {}
@@ -195,6 +205,8 @@ class UnderlyingSignalsService:
             oi_resistance_strike=oi_summary.resistance_strike,
             vwap_value=vwap,
             vwap_position=vwap_position,
+            today_open=today_open,
+            no_trade_zone=no_trade_zone,
         )
 
         return {
@@ -215,6 +227,8 @@ class UnderlyingSignalsService:
             },
             "pivots": {key: round(value, 2) for key, value in pivots.items()},
             "round_step": round_step,
+            "today_open": _round_or_none(today_open),
+            "no_trade_zone": no_trade_zone,
             "nearest_level": nearest_level,
             "nearest_or_target": nearest_or_target,
             "pcr": {"value": _round_or_none(oi_summary.pcr), "bias": pcr_bias} if oi_summary.pcr is not None else None,
@@ -554,6 +568,17 @@ def _ema(values: list[float], *, period: int) -> Optional[float]:
     return ema
 
 
+def _is_near_day_open(ltp: float, today_open: Optional[float], *, tolerance_points: float) -> bool:
+    """Whether LTP is within [tolerance_points] *absolute* points of today's session open -- see
+    _NO_TRADE_ZONE_POINTS. `False` (not a no-trade zone) whenever today's open isn't known yet
+    (no candles for today) or LTP itself hasn't loaded -- same "missing data means no caution, not
+    a false one" posture as every other None-safe helper here.
+    """
+    if today_open is None or ltp <= 0:
+        return False
+    return abs(ltp - today_open) <= tolerance_points
+
+
 def _true_range(prev_close: float, high: float, low: float) -> float:
     return max(high - low, abs(high - prev_close), abs(low - prev_close))
 
@@ -824,6 +849,8 @@ def _build_tags(
     oi_resistance_strike: Optional[float],
     vwap_value: Optional[float],
     vwap_position: Optional[str],
+    today_open: Optional[float],
+    no_trade_zone: bool,
 ) -> list[str]:
     """Builds the ready-to-render tag strings -- every directional tag (EMA above/below, opening
     range above/below, a nearby level) spells out the absolute point distance from LTP, not just
@@ -842,8 +869,15 @@ def _build_tags(
     Android client's tag-sentiment classifier (`sentimentForSignalTag`) also recognizes a bare
     "bullish"/"bearish" word anywhere in the text, which is why both are spelled out explicitly
     below rather than reusing the "Above X"/"Below X" phrasing that wouldn't fit either signal.
+
+    The no-trade-zone caution ([no_trade_zone], see _is_near_day_open) is inserted first, ahead
+    of every other tag -- it's a warning not to act on the rest of the bulletin right now, so it
+    needs to be the first thing the user reads, not buried after several bullish/bearish-looking
+    reads that would otherwise seem to say "trade this".
     """
     tags: list[str] = []
+    if no_trade_zone and today_open is not None:
+        tags.append(f"No-Trade Zone -- within {_NO_TRADE_ZONE_POINTS:g} of Day Open ({today_open:g})")
     if ema9_5m_position and ema9_5m_value is not None:
         tags.append(f"{ema9_5m_position.capitalize()} 5m EMA9 by {abs(ltp - ema9_5m_value):.2f}")
     if ema9_15m_position and ema9_15m_value is not None:
