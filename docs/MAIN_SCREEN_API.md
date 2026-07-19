@@ -443,6 +443,27 @@ Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round 
 `ltp` and everything computed relative to it (`position` fields, `nearest_level`) are read fresh
 on every call.
 
+## USD/INR (non-Upstox)
+
+```http
+GET /api/market/usd-inr
+```
+
+Response:
+
+```json
+{
+  "ltp": 96.27,
+  "previous_close": 96.335
+}
+```
+
+Sourced from Yahoo Finance's unofficial chart endpoint, **not** Upstox -- Upstox's own quotes/LTP
+endpoints reject USD INR outright. This is a best-effort, roughly-current value, not an accurate or
+official rate: no error is ever returned, both fields are simply `null` if Yahoo is unreachable or
+its response shape changes. Cached server-side for 60 seconds regardless of how often this is
+called. No Upstox access token needed -- this route doesn't touch the user's Upstox account.
+
 ## Raw Funds and Margin
 
 ```http

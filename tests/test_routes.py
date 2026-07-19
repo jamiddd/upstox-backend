@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_token_store, get_upstox_service
+from app.api.dependencies import get_token_store, get_upstox_service, get_usd_inr_service
 from app.core.config import Settings, get_settings
 from app.main import app
 from app.services import instrument_rules_service
@@ -863,6 +863,43 @@ def test_market_route_uses_stored_token() -> None:
         "token": "stored-token",
         "key": "NSE_EQ|INE848E01016",
     }
+
+
+class _FakeUsdInrService:
+    def __init__(self, quote: dict[str, float] | None) -> None:
+        self._quote = quote
+
+    async def get_quote(self) -> dict[str, float] | None:
+        return self._quote
+
+
+def test_market_usd_inr_returns_quote_on_success() -> None:
+    """No Upstox token needed at all -- this route doesn't touch the user's Upstox account."""
+    client = _client()
+    app.dependency_overrides[get_usd_inr_service] = lambda: _FakeUsdInrService(
+        {"ltp": 96.27, "previous_close": 96.335},
+    )
+    try:
+        response = client.get("/api/market/usd-inr", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"ltp": 96.27, "previous_close": 96.335}
+
+
+def test_market_usd_inr_degrades_to_null_fields_when_source_unavailable() -> None:
+    """A failed/unparseable Yahoo fetch degrades to null fields, not an HTTP error -- this is a
+    "nice to have" ticker entry, not core trading data."""
+    client = _client()
+    app.dependency_overrides[get_usd_inr_service] = lambda: _FakeUsdInrService(None)
+    try:
+        response = client.get("/api/market/usd-inr", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"ltp": None, "previous_close": None}
 
 
 def test_upstox_backed_route_requires_token() -> None:

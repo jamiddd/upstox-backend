@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-from app.api.dependencies import get_token_store, get_upstox_service
+from app.api.dependencies import get_token_store, get_upstox_service, get_usd_inr_service
 from app.core.config import Settings, get_settings
 from app.core.exceptions import (
     AppConfigError,
@@ -33,6 +33,7 @@ from app.services.oi_analysis_service import OIAnalysisService
 from app.services.search_screen_service import SearchScreenService
 from app.services.smart_order_service import SmartOrderService
 from app.services.underlying_signals_service import UnderlyingSignalsService
+from app.services.usd_inr_service import UsdInrService
 
 public_router = APIRouter()
 protected_router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
@@ -229,6 +230,21 @@ async def get_quotes(
         return await service.get_quotes(access_token, instrument_key)
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/market/usd-inr")
+async def market_usd_inr(service: UsdInrService = Depends(get_usd_inr_service)) -> dict[str, Any]:
+    """Best-effort USD/INR quote from a free non-Upstox source (Yahoo Finance's unofficial chart
+    endpoint) -- Upstox's own quotes/LTP endpoints reject USD INR outright. Not accurate/official,
+    just roughly current; degrades to null fields (never an HTTP error) if Yahoo is unreachable or
+    its response shape changes, since this is a "nice to have" ticker entry, not core trading data.
+    No Upstox access token needed -- this route doesn't touch the user's Upstox account at all.
+    """
+    quote = await service.get_quote()
+    return {
+        "ltp": quote["ltp"] if quote else None,
+        "previous_close": quote["previous_close"] if quote else None,
+    }
 
 
 @protected_router.get("/market/oi-analysis")

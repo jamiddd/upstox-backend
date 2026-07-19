@@ -6,6 +6,7 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import TokenStoreError
 from app.services.token_store import EncryptedTokenStore
 from app.services.upstox_service import UpstoxService
+from app.services.usd_inr_service import UsdInrService
 
 
 def get_token_store(settings: Settings = Depends(get_settings)) -> EncryptedTokenStore:
@@ -22,3 +23,9 @@ def get_token_store(settings: Settings = Depends(get_settings)) -> EncryptedToke
 def get_upstox_service(settings: Settings = Depends(get_settings)) -> UpstoxService:
     """Create the Upstox REST service for the current request."""
     return UpstoxService(settings)
+
+
+def get_usd_inr_service() -> UsdInrService:
+    """Create the USD/INR quote service for the current request -- needs no Settings/token, since
+    its source (Yahoo Finance) needs neither."""
+    return UsdInrService()
