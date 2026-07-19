@@ -73,6 +73,14 @@ class ModifyGttOrderRequest(BaseModel):
     trailing_gap: Optional[float] = Field(default=None, gt=0)
 
 
+class ExitPositionsRequest(BaseModel):
+    """Optionally scopes /orders/exit-positions to a subset of open positions. None
+    (instrument_keys omitted or null) means every open position -- identical to /orders/exit-all.
+    """
+
+    instrument_keys: Optional[list[str]] = None
+
+
 class AttachGttExitsRequest(BaseModel):
     """Attaches a target and a stoploss to an already-open position with no existing GTT bracket,
     without re-entering. See SmartOrderService.attach_gtt_exits.
@@ -624,6 +632,25 @@ async def exit_all_positions(
     access_token = _load_access_token(token_store)
     try:
         return await SmartOrderService(service).exit_all_positions(access_token)
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.post("/orders/exit-positions")
+async def exit_positions(
+    request: ExitPositionsRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Flattens open positions with an immediate market order, optionally scoped to
+    [ExitPositionsRequest.instrument_keys] (e.g. "close only profitable positions", computed
+    client-side). See SmartOrderService.exit_positions.
+    """
+    access_token = _load_access_token(token_store)
+    try:
+        return await SmartOrderService(service).exit_positions(
+            access_token, instrument_keys=request.instrument_keys
+        )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

@@ -1907,6 +1907,51 @@ def test_exit_all_positions_flattens_every_open_position() -> None:
     assert results_by_key["NSE_FO|222"]["status"] == "error"
 
 
+def test_exit_positions_closes_every_open_position_when_unfiltered() -> None:
+    """Omitting instrument_keys behaves identically to /orders/exit-all."""
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/orders/exit-positions",
+            headers={"X-API-Key": "mobile-secret"},
+            json={},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["positions_found"] == 2
+    results_by_key = {item["instrument_key"]: item for item in payload["results"]}
+    assert set(results_by_key) == {"NSE_FO|111", "NSE_FO|222"}
+
+
+def test_exit_positions_closes_only_the_requested_subset() -> None:
+    """A given instrument_keys list scopes exit-positions to just those positions -- backs the
+    app's "close only positive/negative positions" menu, which computes the subset client-side."""
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/orders/exit-positions",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"instrument_keys": ["NSE_FO|111"]},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["positions_found"] == 1
+    assert payload["results"][0]["instrument_key"] == "NSE_FO|111"
+    assert payload["results"][0]["status"] == "success"
+
+
 def test_modify_orders_accepts_more_than_upstream_multi_order_limit() -> None:
     """Process every order without imposing a bulk request count limit."""
     client = _client(FakeTokenStore(token="stored-token"))

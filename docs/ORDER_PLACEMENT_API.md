@@ -265,6 +265,49 @@ trailing_gap optional, positive number
 
 Response: the raw Upstox GTT modify response.
 
+## Exit Positions
+
+```http
+POST /api/orders/exit-positions
+```
+
+Flattens open positions with an immediate market order each (opposite side of the position).
+Optionally scoped to a subset via `instrument_keys` -- e.g. the app's "close only positive/
+negative positions" menu computes the matching instrument keys client-side (it already has live
+P&L from the WebSocket feed) and sends just those.
+
+Request:
+
+```json
+{
+  "instrument_keys": ["NSE_FO|111"]
+}
+```
+
+`instrument_keys` is optional; omitting it (or sending `null`) closes every open position --
+identical to `POST /api/orders/exit-all` (unchanged, still used by the max-loss auto square-off).
+
+Response:
+
+```json
+{
+  "status": "success",
+  "positions_found": 1,
+  "results": [
+    {
+      "instrument_key": "NSE_FO|111",
+      "transaction_type": "SELL",
+      "quantity": 75,
+      "status": "success",
+      "upstox_response": {}
+    }
+  ]
+}
+```
+
+Each position is closed independently -- one failing doesn't stop the others; check each result's
+own `status`.
+
 ## Modify Orders
 
 ```http

@@ -196,12 +196,22 @@ class SmartOrderService:
         return await self.upstox.modify_gtt_order(access_token, upstox_order)
 
     async def exit_all_positions(self, access_token: str) -> dict[str, Any]:
-        """Flattens every currently open position (quantity != 0) with an immediate market order
-        in the opposite direction -- backs the app's max-loss auto square-off (see
-        MainViewModel.watchMaxLoss). Best-effort: one position failing to exit doesn't stop the
-        others, since leaving the rest open would defeat the whole point of a safety trigger --
-        every attempted position's own result (success or error) is returned so the caller/UI can
-        show exactly what happened to each one.
+        """Flattens every currently open position -- backs the app's max-loss auto square-off
+        (see MainViewModel.watchMaxLoss). Thin wrapper over exit_positions with no filter.
+        """
+        return await self.exit_positions(access_token)
+
+    async def exit_positions(
+        self, access_token: str, *, instrument_keys: Optional[list[str]] = None
+    ) -> dict[str, Any]:
+        """Flattens open positions (quantity != 0) with an immediate market order in the opposite
+        direction. [instrument_keys] is None means every open position (exit_all_positions above);
+        otherwise only positions whose instrument_token is in that set are closed -- e.g. "close
+        only profitable positions", where the app itself decides which instrument_keys qualify (it
+        already has live P&L from the WebSocket feed; the backend doesn't need to re-derive it
+        from its own snapshot). Best-effort: one position failing to exit doesn't stop the others
+        -- every attempted position's own result (success or error) is returned so the caller/UI
+        can show exactly what happened to each one.
         """
         positions_payload = await self.upstox.get_positions(access_token)
         data = positions_payload.get("data")
@@ -210,6 +220,13 @@ class SmartOrderService:
             if isinstance(data, list)
             else []
         )
+        if instrument_keys is not None:
+            wanted = set(instrument_keys)
+            open_positions = [
+                item
+                for item in open_positions
+                if _string_value(item, "instrument_token", "instrument_key") in wanted
+            ]
 
         results: list[dict[str, Any]] = []
         for position in open_positions:
