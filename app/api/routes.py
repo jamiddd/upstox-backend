@@ -374,16 +374,24 @@ async def main_summary(
 @protected_router.get("/main/underlying-signals")
 async def main_underlying_signals(
     underlying_key: str = DEFAULT_UNDERLYING_KEY,
+    expiry_date: Optional[str] = None,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Return 9 EMA (5m/15m)/ATR(14)/opening-range/crucial-level tags for the underlying -- shown
-    to the user just before they place a strike order. See UnderlyingSignalsService's doc comment
-    for why this is computed on the underlying itself, not the option contract being traded.
+    """Return 9 EMA (5m/15m)/ATR(14)/opening-range/crucial-level/PCR/max-pain tags for the
+    underlying -- shown to the user just before they place a strike order. See
+    UnderlyingSignalsService's doc comment for why this is computed on the underlying itself, not
+    the option contract being traded. `expiry_date` is optional -- omitting it just skips the
+    PCR/max-pain tags (which need an expiry to ask Upstox's OI endpoints about), everything else
+    still works.
     """
     access_token = _load_access_token(token_store)
     try:
-        return await UnderlyingSignalsService(service).get_signals(access_token, underlying_key=underlying_key)
+        return await UnderlyingSignalsService(service).get_signals(
+            access_token,
+            underlying_key=underlying_key,
+            expiry_date=expiry_date,
+        )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

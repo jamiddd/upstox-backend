@@ -1113,6 +1113,33 @@ def test_main_underlying_signals_returns_ema_atr_opening_range_and_nearest_level
     assert "ATR 10" in payload["tags"]
     assert "Above opening range by 143.00" in payload["tags"]
     assert "Near Prev Day Close by 0.00" in payload["tags"]
+    # No expiry_date was passed -- OI analysis (PCR/max pain) is skipped entirely.
+    assert payload["pcr"] is None
+    assert payload["max_pain"] is None
+
+
+def test_main_underlying_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> None:
+    """Passing expiry_date pulls in PCR/max-pain via the existing OI Analysis fakes
+    (get_oi/get_change_oi/get_max_pain/get_pcr, already on FakeUpstoxService from that route's own
+    tests: pcr=1.2755, max_pain=25000.0).
+    """
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/main/underlying-signals?underlying_key=NSE_INDEX|Nifty 50&expiry_date=2026-07-23",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["pcr"] == {"value": 1.28, "bias": "bullish"}
+    # LTP (25050.0) sits above max pain (25000.0) -> bearish pull, +50.00 away.
+    assert payload["max_pain"] == {"value": 25000.0, "pull": "bearish"}
+    assert any(tag.startswith("PCR 1.2") and "Bullish bias" in tag for tag in payload["tags"])
+    assert "Max Pain 25000 by +50.00 - Bearish pull" in payload["tags"]
 
 
 def test_main_summary_returns_balance_pnl_and_closing_balance() -> None:

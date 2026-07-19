@@ -6,6 +6,8 @@ from datetime import date, timedelta
 from time import monotonic
 from typing import Any, Optional
 
+from app.core.exceptions import UpstoxApiError
+from app.services.oi_analysis_service import OIAnalysisService
 from app.services.upstox_service import UpstoxService
 
 # How far apart LTP has to be from a candidate level for it to still count as "near" it -- see
@@ -23,6 +25,12 @@ _OPENING_RANGE_CANDLES = 3
 # but each of these is also a level price has historically tended to stall/reverse at -- see
 # _nearest_or_target's doc comment for why that matters to the tag shown.
 _OR_TARGET_MULTIPLIERS = (0.5, 1.0, 1.5, 2.0)
+
+# PCR bias thresholds -- see _pcr_bias. A PCR this high means far more puts are open than calls,
+# read as bullish (heavy put writing = traders selling downside protection, i.e. not expecting a
+# fall); this low means the opposite.
+_PCR_BULLISH_THRESHOLD = 1.2
+_PCR_BEARISH_THRESHOLD = 0.8
 
 
 @dataclass
@@ -46,9 +54,10 @@ _CACHE: dict[tuple[Any, ...], _CacheEntry] = {}
 
 class UnderlyingSignalsService:
     """Computes glanceable technical-analysis tags for the underlying -- 9 EMA (5m and 15m),
-    ATR(14), today's opening-range position, and proximity to a "crucial level" (previous-day
-    H/L/C, classic pivots, or a round psychological number) -- shown to the user just before they
-    place a strike order. See docs/MAIN_SCREEN_API.md's "Underlying Signals" section.
+    ATR(14), today's opening-range position, proximity to a "crucial level" (previous-day H/L/C,
+    classic pivots, or a round psychological number), and (when [expiry_date] is given) a
+    PCR-based bias and Max Pain pull direction from open-interest data -- shown to the user just
+    before they place a strike order. See docs/MAIN_SCREEN_API.md's "Underlying Signals" section.
 
     Deliberately computed on the *underlying's* own price action, not the option contract being
     traded: an option premium is dominated by theta decay and IV changes rather than the
@@ -59,7 +68,13 @@ class UnderlyingSignalsService:
     def __init__(self, upstox_service: UpstoxService) -> None:
         self.upstox = upstox_service
 
-    async def get_signals(self, access_token: str, *, underlying_key: str) -> dict[str, Any]:
+    async def get_signals(
+        self,
+        access_token: str,
+        *,
+        underlying_key: str,
+        expiry_date: Optional[str] = None,
+    ) -> dict[str, Any]:
         today = date.today()
         yesterday = today - timedelta(days=1)
 
@@ -115,6 +130,10 @@ class UnderlyingSignalsService:
             tolerance_percent=_NEAREST_LEVEL_TOLERANCE_PERCENT,
         )
 
+        pcr, max_pain = await self._oi_analysis(access_token, underlying_key, expiry_date, today)
+        pcr_bias = _pcr_bias(pcr)
+        max_pain_pull = _max_pain_pull(ltp, max_pain)
+
         tags = _build_tags(
             ltp=ltp,
             ema9_5m_value=ema9_5m,
@@ -127,6 +146,10 @@ class UnderlyingSignalsService:
             opening_range_position=opening_range_position,
             nearest_level=nearest_level,
             nearest_or_target=nearest_or_target,
+            pcr=pcr,
+            pcr_bias=pcr_bias,
+            max_pain=max_pain,
+            max_pain_pull=max_pain_pull,
         )
 
         return {
@@ -149,8 +172,43 @@ class UnderlyingSignalsService:
             "round_step": round_step,
             "nearest_level": nearest_level,
             "nearest_or_target": nearest_or_target,
+            "pcr": {"value": _round_or_none(pcr), "bias": pcr_bias} if pcr is not None else None,
+            "max_pain": {"value": _round_or_none(max_pain), "pull": max_pain_pull} if max_pain is not None else None,
             "tags": tags,
         }
+
+    async def _oi_analysis(
+        self,
+        access_token: str,
+        underlying_key: str,
+        expiry_date: Optional[str],
+        today: date,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """PCR and max pain for [expiry_date], reusing the existing OIAnalysisService (its own
+        60s cache applies, nothing duplicated here) -- `(None, None)` if no expiry was given (a
+        contract-free underlying, or a caller that doesn't have one yet) or Upstox's OI endpoints
+        fail, same "degrade this one piece, not the whole response" posture as
+        MainScreenService.summary's funds-unavailable handling.
+        """
+        if not expiry_date:
+            return None, None
+        try:
+            analysis = await OIAnalysisService(self.upstox).get_analysis(
+                access_token,
+                instrument_key=underlying_key,
+                expiry=expiry_date,
+                date=today.isoformat(),
+                change_interval=1,
+                bucket_interval=60,
+            )
+        except UpstoxApiError:
+            return None, None
+
+        pcr = analysis.get("pcr", {}).get("pcr")
+        max_pain = analysis.get("max_pain", {}).get("max_pain")
+        pcr = float(pcr) if isinstance(pcr, (int, float)) else None
+        max_pain = float(max_pain) if isinstance(max_pain, (int, float)) else None
+        return pcr, max_pain
 
     async def _minute_series(
         self,
@@ -473,6 +531,34 @@ def _nearest_or_target(
     return _nearest_level(ltp, targets, tolerance_percent=tolerance_percent)
 
 
+def _pcr_bias(pcr: Optional[float]) -> Optional[str]:
+    """Bullish if enough puts are open relative to calls (heavy put writing reads as traders not
+    expecting a fall), bearish the other way, neutral in between -- see _PCR_BULLISH_THRESHOLD/
+    _PCR_BEARISH_THRESHOLD. `None` (no tag) if PCR itself is unavailable.
+    """
+    if pcr is None:
+        return None
+    if pcr >= _PCR_BULLISH_THRESHOLD:
+        return "bullish"
+    if pcr <= _PCR_BEARISH_THRESHOLD:
+        return "bearish"
+    return "neutral"
+
+
+def _max_pain_pull(ltp: float, max_pain: Optional[float]) -> Optional[str]:
+    """Price tends to gravitate toward max pain (the strike where option writers collectively
+    lose the least) as expiry approaches -- bullish if LTP is currently below it (expected pull
+    up), bearish if above (expected pull down). `None` if max pain itself is unavailable.
+    """
+    if max_pain is None or ltp <= 0:
+        return None
+    if ltp < max_pain:
+        return "bullish"
+    if ltp > max_pain:
+        return "bearish"
+    return "neutral"
+
+
 def _build_tags(
     *,
     ltp: float,
@@ -486,6 +572,10 @@ def _build_tags(
     opening_range_position: Optional[str],
     nearest_level: Optional[dict[str, Any]],
     nearest_or_target: Optional[dict[str, Any]],
+    pcr: Optional[float],
+    pcr_bias: Optional[str],
+    max_pain: Optional[float],
+    max_pain_pull: Optional[str],
 ) -> list[str]:
     """Builds the ready-to-render tag strings -- every directional tag (EMA above/below, opening
     range above/below, a nearby level) spells out the absolute point distance from LTP, not just
@@ -499,6 +589,11 @@ def _build_tags(
     of the breakout itself. That caution's own distance is signed (LTP minus the target value,
     with an explicit +/-), not absolute -- the sign tells you which side of the exact target
     price currently sits on.
+
+    The PCR/max-pain tags don't start with "Above"/"Below" like every other tag here -- the
+    Android client's tag-sentiment classifier (`sentimentForSignalTag`) also recognizes a bare
+    "bullish"/"bearish" word anywhere in the text, which is why both are spelled out explicitly
+    below rather than reusing the "Above X"/"Below X" phrasing that wouldn't fit either signal.
     """
     tags: list[str] = []
     if ema9_5m_position and ema9_5m_value is not None:
@@ -516,6 +611,10 @@ def _build_tags(
     if nearest_level:
         distance = abs(ltp - nearest_level["value"])
         tags.append(f"Near {nearest_level['label']} by {distance:.2f}")
+    if pcr is not None and pcr_bias is not None:
+        tags.append(f"PCR {pcr:.2f} - {pcr_bias.capitalize()} bias")
+    if max_pain is not None and max_pain_pull is not None:
+        tags.append(f"Max Pain {max_pain:g} by {ltp - max_pain:+.2f} - {max_pain_pull.capitalize()} pull")
     return tags
 
 

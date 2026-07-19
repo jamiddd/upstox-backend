@@ -284,6 +284,7 @@ All six fields' source paths are confirmed against a real `GET /v3/user/get-fund
 ```http
 GET /api/main/underlying-signals
 GET /api/main/underlying-signals?underlying_key=NSE_INDEX%7CNifty%2050
+GET /api/main/underlying-signals?underlying_key=NSE_INDEX%7CNifty%2050&expiry_date=2026-07-23
 ```
 
 Glanceable technical-analysis tags for the underlying -- shown to the app's user just before they
@@ -292,6 +293,11 @@ trading screen. Deliberately computed on the **underlying's** own price action (
 not the option contract about to be traded -- an option premium is dominated by theta decay and
 IV changes rather than the underlying's own trend/momentum, so an EMA/ATR/opening-range reading
 on the premium itself would be meaningless here.
+
+`expiry_date` is optional -- when given, the response also includes PCR/max-pain tags (see `pcr`/
+`max_pain` below), reusing the existing OI Analysis endpoint's own service and 60s cache under the
+hood (see "OI Analysis" above). Omitting it just skips those two fields/tags; everything else is
+unaffected.
 
 ```json
 {
@@ -305,9 +311,22 @@ on the premium itself would be meaningless here.
   "round_step": 50.0,
   "nearest_level": {"label": "R1 Pivot", "value": 25086.6, "distance_percent": 0.15},
   "nearest_or_target": null,
-  "tags": ["Above 5m EMA9 by 39.50", "Above 15m EMA9 by 60.00", "Inside opening range", "Near R1 Pivot by 36.60"]
+  "pcr": {"value": 1.35, "bias": "bullish"},
+  "max_pain": {"value": 25000.0, "pull": "bearish"},
+  "tags": [
+    "Above 5m EMA9 by 39.50",
+    "Above 15m EMA9 by 60.00",
+    "Inside opening range",
+    "Near R1 Pivot by 36.60",
+    "PCR 1.35 - Bullish bias",
+    "Max Pain 25000 by +50.00 - Bearish pull"
+  ]
 }
 ```
+
+`pcr`/`max_pain` (and their two tags) are only present when `expiry_date` was given -- both `null`
+otherwise, or if Upstox's OI endpoints fail for that expiry (this degrades quietly, same as
+`main/summary`'s funds-unavailable handling -- the rest of the response is unaffected).
 
 A breakout that's also sitting on one of the opening range's own measured-move target levels
 looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Target 1"):
@@ -350,12 +369,21 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   folded straight into the *same* `"Above/Below opening range"` tag (not a separate one), with a
   signed (`+`/`-`) point distance to the target, e.g. `"Above opening range by 50.00 (near OR
   Target 1 by +0.30, caution: possible pullback)"`.
+- `pcr`: `null` unless `expiry_date` was given (and Upstox's OI endpoints succeeded for it).
+  `value` is the raw put-call ratio; `bias` is `"bullish"` (PCR >= 1.2 -- heavy put writing reads
+  as traders not expecting a fall), `"bearish"` (PCR <= 0.8), or `"neutral"` in between.
+- `max_pain`: same availability as `pcr`. `value` is the strike where option writers collectively
+  lose the least by expiry -- price tends to gravitate toward it as expiry approaches. `pull` is
+  `"bullish"` if LTP is currently below it (expected pull up), `"bearish"` if above (pull down),
+  `"neutral"` if exactly on it.
 - `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50"`,
-  `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`) built from the fields above -- the client can display
-  these directly without any string-building of its own. Every directional tag (EMA above/below,
-  opening-range above/below, a nearby level) spells out the absolute point distance from LTP, not
-  just the direction -- `ATR` and `"Inside opening range"` are the only two with no direction/
-  distance to report.
+  `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35 - Bullish bias"`) built from the fields
+  above -- the client can display these directly without any string-building of its own. Every
+  directional tag (EMA above/below, opening-range above/below, a nearby level, PCR bias, max-pain
+  pull) spells out its magnitude, not just the direction -- `ATR` and `"Inside opening range"` are
+  the only two with no direction/distance to report. The PCR/max-pain tags say `"Bullish"`/
+  `"Bearish"` explicitly (rather than starting with `"Above"`/`"Below"` like the others) since
+  neither phrasing fits those two signals -- the app's tag-sentiment classifier checks for both.
 
 Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round step) are cached
 ~60 seconds -- they only meaningfully change when a new candle closes, not on every feed tick.

@@ -129,6 +129,23 @@ def test_range_position_reports_above_below_and_inside() -> None:
     assert signals._range_position(100.0, high=110.0, low=90.0) == "inside"
 
 
+def test_pcr_bias_thresholds() -> None:
+    assert signals._pcr_bias(1.2) == "bullish"
+    assert signals._pcr_bias(1.5) == "bullish"
+    assert signals._pcr_bias(0.8) == "bearish"
+    assert signals._pcr_bias(0.5) == "bearish"
+    assert signals._pcr_bias(1.0) == "neutral"
+    assert signals._pcr_bias(None) is None
+
+
+def test_max_pain_pull_direction() -> None:
+    # LTP below max pain -> expected to be pulled up (bullish); above -> pulled down (bearish).
+    assert signals._max_pain_pull(24950.0, 25000.0) == "bullish"
+    assert signals._max_pain_pull(25050.0, 25000.0) == "bearish"
+    assert signals._max_pain_pull(25000.0, 25000.0) == "neutral"
+    assert signals._max_pain_pull(25050.0, None) is None
+
+
 def test_build_tags_composes_readable_short_labels_with_absolute_point_distances() -> None:
     tags = signals._build_tags(
         ltp=25100.0,
@@ -142,6 +159,10 @@ def test_build_tags_composes_readable_short_labels_with_absolute_point_distances
         opening_range_position="inside",
         nearest_level={"label": "R1 Pivot", "value": 25086.6, "distance_percent": 0.1},
         nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
     )
 
     assert tags == [
@@ -166,6 +187,10 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         opening_range_position="above",
         nearest_level=None,
         nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
     )
     below = signals._build_tags(
         ltp=24990.0,
@@ -179,6 +204,10 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         opening_range_position="below",
         nearest_level=None,
         nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
     )
 
     assert above == ["Above opening range by 10.00"]
@@ -200,6 +229,10 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         opening_range_position="above",
         nearest_level=None,
         nearest_or_target={"label": "OR Target 1", "value": 25110.0, "distance_percent": 0.0},
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
     )
     # LTP is 2 points *past* the target (overshot it) -> positive signed distance.
     past_target = signals._build_tags(
@@ -214,6 +247,10 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         opening_range_position="above",
         nearest_level=None,
         nearest_or_target={"label": "OR Target 1", "value": 25110.0, "distance_percent": 0.01},
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
     )
     # LTP (24988.0) hasn't reached its downside target (24990.0) yet -> negative signed
     # distance, and "bounce" (not "pullback") is the reversal word on this side.
@@ -229,11 +266,62 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         opening_range_position="below",
         nearest_level=None,
         nearest_or_target={"label": "OR Target 1", "value": 24990.0, "distance_percent": 0.01},
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
     )
 
     assert on_target == ["Above opening range by 10.00 (near OR Target 1 by +0.00, caution: possible pullback)"]
     assert past_target == ["Above opening range by 12.00 (near OR Target 1 by +2.00, caution: possible pullback)"]
     assert below_target == ["Below opening range by 12.00 (near OR Target 1 by -2.00, caution: possible bounce)"]
+
+
+def test_build_tags_adds_pcr_and_max_pain_tags() -> None:
+    tags = signals._build_tags(
+        ltp=25050.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=1.35,
+        pcr_bias="bullish",
+        max_pain=25000.0,
+        max_pain_pull="bearish",
+    )
+
+    assert tags == [
+        "PCR 1.35 - Bullish bias",
+        "Max Pain 25000 by +50.00 - Bearish pull",
+    ]
+
+
+def test_build_tags_omits_pcr_and_max_pain_when_unavailable() -> None:
+    tags = signals._build_tags(
+        ltp=25050.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
+    )
+
+    assert tags == []
 
 
 def test_or_targets_are_ordinal_multiples_of_the_or_size() -> None:
@@ -293,15 +381,28 @@ def test_nearest_or_target_returns_none_without_a_valid_opening_range() -> None:
 
 
 class _FakeUpstoxService:
-    """Duck-typed stand-in for UpstoxService -- UnderlyingSignalsService only calls these four
-    methods, so a full HTTP-mocked UpstoxService isn't needed to test the wiring.
+    """Duck-typed stand-in for UpstoxService -- UnderlyingSignalsService only calls these
+    methods, so a full HTTP-mocked UpstoxService isn't needed to test the wiring. The four OI
+    methods (get_oi/get_change_oi/get_max_pain/get_pcr) are only ever exercised when a test
+    passes expiry_date -- get_signals skips OIAnalysisService entirely otherwise.
     """
 
-    def __init__(self, *, minute_candles: list[list[object]], daily_candles: list[list[object]], strikes: list[float], ltp: float) -> None:
+    def __init__(
+        self,
+        *,
+        minute_candles: list[list[object]],
+        daily_candles: list[list[object]],
+        strikes: list[float],
+        ltp: float,
+        pcr: float = 1.0,
+        max_pain: float = 0.0,
+    ) -> None:
         self._minute_candles = minute_candles
         self._daily_candles = daily_candles
         self._strikes = strikes
         self._ltp = ltp
+        self._pcr = pcr
+        self._max_pain = max_pain
 
     async def get_historical_candle(self, access_token, instrument_key, *, unit, interval, to_date, from_date=None):
         candles = self._daily_candles if unit == "days" else self._minute_candles
@@ -315,6 +416,18 @@ class _FakeUpstoxService:
 
     async def get_quotes(self, access_token, instrument_key):
         return {"status": "success", "data": {instrument_key: {"last_price": self._ltp}}}
+
+    async def get_oi(self, access_token, instrument_key, *, expiry, date):
+        return {"status": "success", "data": {"total_puts": 0, "total_calls": 0, "call_put_oi_data_list": []}}
+
+    async def get_change_oi(self, access_token, instrument_key, *, expiry, date, interval):
+        return {"status": "success", "data": {"call_put_oi_data_list": []}}
+
+    async def get_max_pain(self, access_token, instrument_key, *, expiry, date, bucket_interval):
+        return {"status": "success", "data": {"max_pain": self._max_pain, "insights": []}}
+
+    async def get_pcr(self, access_token, instrument_key, *, expiry, date, bucket_interval):
+        return {"status": "success", "data": {"pcr": self._pcr, "insights": []}}
 
 
 def _rising_candles(count: int, *, start: datetime, step_minutes: int) -> list[list[object]]:
@@ -365,3 +478,36 @@ def test_get_signals_wires_everything_into_tags() -> None:
     assert any(tag.startswith("Above 5m EMA9 by ") for tag in result["tags"])
     assert any(tag.startswith("Above 15m EMA9 by ") for tag in result["tags"])
     assert any(tag.startswith("Above opening range by ") for tag in result["tags"])
+    # No expiry_date was passed -- OI analysis is skipped entirely, not just empty.
+    assert result["pcr"] is None
+    assert result["max_pain"] is None
+
+
+def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> None:
+    start = datetime(2026, 7, 18, 9, 15)
+    minute_candles = _rising_candles(20, start=start, step_minutes=5)
+    daily_candles = [
+        ["2026-07-17T00:00:00+05:30", 100.0, 110.0, 95.0, 105.0, 500000],
+    ]
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=minute_candles,
+            daily_candles=daily_candles,
+            strikes=[24800.0, 24850.0, 24900.0, 24950.0],
+            ltp=200.0,
+            pcr=1.35,
+            max_pain=190.0,
+        ),
+    )
+
+    result = anyio.run(
+        lambda: service.get_signals(
+            "upstox-token", underlying_key="NSE_INDEX|Nifty 50", expiry_date="2026-07-23",
+        ),
+    )
+
+    assert result["pcr"] == {"value": 1.35, "bias": "bullish"}
+    # LTP (200.0) is above max pain (190.0) -> bearish pull.
+    assert result["max_pain"] == {"value": 190.0, "pull": "bearish"}
+    assert any(tag.startswith("PCR 1.35 - Bullish bias") for tag in result["tags"])
+    assert any(tag.startswith("Max Pain 190 by +10.00 - Bearish pull") for tag in result["tags"])
