@@ -47,7 +47,8 @@ Response:
       "exchange": "NSE",
       "lot_size": 65.0,
       "freeze_quantity": 1755.0,
-      "tick_size": 0.05
+      "tick_size": 0.05,
+      "is_optionable": true
     },
     {
       "instrument_key": "NSE_EQ|INE002A01018",
@@ -57,7 +58,8 @@ Response:
       "exchange": "NSE",
       "lot_size": 500.0,
       "freeze_quantity": 10000.0,
-      "tick_size": 0.05
+      "tick_size": 0.05,
+      "is_optionable": true
     }
   ],
   "page": {
@@ -69,7 +71,19 @@ Response:
 }
 ```
 
-When the user selects a result, pass `instrument_key` back to the main screen as its `underlying_key`.
+When the user selects a result, pass `instrument_key` back to the main screen as its `underlying_key` -- **only when `is_optionable` is `true`**. A small number of results are `is_optionable: false`:
+
+```text
+India VIX (NSE_INDEX|India VIX) -- a real, quotable NSE index with no listed options/futures
+  market at all, included for reference (volatility context) since it can otherwise never
+  surface through the normal CE/PE-backed search below. Always excluded when query is empty
+  unless it matches the typed query by name/symbol.
+FUTURES entries (only returned when include_futures=true) -- the contract itself IS the
+  instrument, not an underlying with its own option chain.
+```
+
+The client should show these but disable selecting them -- handing a non-optionable
+`instrument_key` to the main screen's bootstrap call has no option chain to load.
 
 Use `lot_size`, `freeze_quantity`, and `tick_size` to guide the order UI:
 

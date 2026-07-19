@@ -25,6 +25,7 @@ DEFAULT_OPTION_INDICES = [
         "lot_size": 65.0,
         "freeze_quantity": 1755.0,
         "tick_size": 0.05,
+        "is_optionable": True,
     },
     {
         "instrument_key": "NSE_INDEX|Nifty Bank",
@@ -35,6 +36,7 @@ DEFAULT_OPTION_INDICES = [
         "lot_size": 30.0,
         "freeze_quantity": 600.0,
         "tick_size": 0.05,
+        "is_optionable": True,
     },
     {
         "instrument_key": "NSE_INDEX|Nifty Fin Service",
@@ -45,6 +47,7 @@ DEFAULT_OPTION_INDICES = [
         "lot_size": 65.0,
         "freeze_quantity": 1755.0,
         "tick_size": 0.05,
+        "is_optionable": True,
     },
     {
         # FIX: this was "NSE_INDEX|Nifty Midcap Select" -- not a real Upstox instrument key (the
@@ -62,6 +65,7 @@ DEFAULT_OPTION_INDICES = [
         "lot_size": 120.0,
         "freeze_quantity": 2800.0,
         "tick_size": 0.05,
+        "is_optionable": True,
     },
 ]
 
@@ -75,6 +79,8 @@ DEFAULT_OPTION_INDICES = [
 # search_underlyings() below, confirmed against Upstox's own instrument master directly (not
 # guessed) -- same reasoning/precedent as GlobalInstruments.ALL on the Android app side for
 # instruments that exist but aren't reachable through the normal option-search path.
+# `is_optionable: False` is what lets the app show these as reference-only, non-selectable
+# entries instead of handing a non-optionable instrument key to the Main screen's bootstrap call.
 NON_OPTIONABLE_INDICES = [
     {
         "instrument_key": "NSE_INDEX|India VIX",
@@ -85,6 +91,7 @@ NON_OPTIONABLE_INDICES = [
         "lot_size": 0.0,
         "freeze_quantity": 0.0,
         "tick_size": 0.0,
+        "is_optionable": False,
     },
 ]
 
@@ -223,6 +230,10 @@ def _shape_underlyings(payload: dict[str, Any], *, limit: int) -> list[dict[str,
                 "lot_size": _number_value(item, "lot_size"),
                 "freeze_quantity": _number_value(item, "freeze_quantity"),
                 "tick_size": _tick_size(item),
+                # These only ever come from a live CE/PE search result (see this function's own
+                # segments="FO" scoping), so the underlying they point to is optionable by
+                # construction.
+                "is_optionable": True,
             }
         )
         if len(results) >= limit:
@@ -268,6 +279,10 @@ def _shape_futures(payload: dict[str, Any], *, limit: int) -> list[dict[str, Any
                 "lot_size": _number_value(item, "lot_size"),
                 "freeze_quantity": _number_value(item, "freeze_quantity"),
                 "tick_size": _tick_size(item),
+                # A futures contract IS the instrument, not an underlying with its own separate
+                # option chain -- same "meaningless to hand to the Main screen's bootstrap call"
+                # reasoning as NON_OPTIONABLE_INDICES above.
+                "is_optionable": False,
             }
         )
         if len(results) >= limit:

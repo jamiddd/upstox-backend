@@ -1359,6 +1359,7 @@ def test_search_underlyings_returns_only_option_capable_indices_and_stocks() -> 
                 "lot_size": 75.0,
                 "freeze_quantity": 1800.0,
                 "tick_size": 0.05,
+                "is_optionable": True,
             },
             {
                 "instrument_key": "NSE_EQ|INE002A01018",
@@ -1369,6 +1370,7 @@ def test_search_underlyings_returns_only_option_capable_indices_and_stocks() -> 
                 "lot_size": 500.0,
                 "freeze_quantity": 10000.0,
                 "tick_size": 0.05,
+                "is_optionable": True,
             },
         ],
         "page": {
@@ -1404,6 +1406,7 @@ def test_search_underlyings_include_futures_merges_futures_contract() -> None:
         "lot_size": 75.0,
         "freeze_quantity": 1800.0,
         "tick_size": 0.05,
+        "is_optionable": False,
     } in body["results"]
 
 
@@ -1431,6 +1434,7 @@ def test_search_underlyings_empty_query_returns_default_option_indices() -> None
                 "lot_size": 65.0,
                 "freeze_quantity": 1755.0,
                 "tick_size": 0.05,
+                "is_optionable": True,
             },
             {
                 "instrument_key": "NSE_INDEX|Nifty Bank",
@@ -1441,6 +1445,7 @@ def test_search_underlyings_empty_query_returns_default_option_indices() -> None
                 "lot_size": 30.0,
                 "freeze_quantity": 600.0,
                 "tick_size": 0.05,
+                "is_optionable": True,
             },
         ],
         "page": {
@@ -1475,6 +1480,7 @@ def test_search_underlyings_query_matches_non_optionable_index() -> None:
         "exchange": "NSE",
         "lot_size": 0.0,
         "freeze_quantity": 0.0,
+        "is_optionable": False,
         "tick_size": 0.0,
     } in body["results"]
 
