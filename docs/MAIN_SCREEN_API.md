@@ -285,6 +285,7 @@ All six fields' source paths are confirmed against a real `GET /v3/user/get-fund
 GET /api/main/underlying-signals
 GET /api/main/underlying-signals?underlying_key=NSE_INDEX%7CNifty%2050
 GET /api/main/underlying-signals?underlying_key=NSE_INDEX%7CNifty%2050&expiry_date=2026-07-23
+GET /api/main/underlying-signals?underlying_key=NSE_INDEX%7CNifty%2050&underlying_symbol=NIFTY
 ```
 
 Glanceable technical-analysis tags for the underlying -- shown to the app's user just before they
@@ -298,6 +299,13 @@ on the premium itself would be meaningless here.
 OI-resistance tags (see `pcr`/`max_pain`/`oi_support`/`oi_resistance` below), reusing the existing
 OI Analysis endpoint's own service and 60s cache under the hood (see "OI Analysis" above).
 Omitting it just skips those four fields/tags; everything else is unaffected.
+
+`underlying_symbol` is likewise optional -- when given, the response also includes a VWAP tag/
+field (see `vwap` below), computed from the underlying's own current-month futures contract
+(resolved via a symbol-text instrument search, since Upstox has no search-by-instrument_key mode
+and this backend has no reliable way to derive a search-safe symbol from an arbitrary
+`instrument_key` -- ISIN-keyed equities in particular). Omitting it just skips the VWAP field/tag;
+everything else is unaffected.
 
 ```json
 {
@@ -315,6 +323,7 @@ Omitting it just skips those four fields/tags; everything else is unaffected.
   "max_pain": {"value": 25000.0, "pull": "bearish"},
   "oi_support": {"value": 24900.0, "oi": 1200000.0},
   "oi_resistance": {"value": 25200.0, "oi": 1500000.0},
+  "vwap": {"value": 25040.25, "position": "above"},
   "tags": [
     "Above 5m EMA9 by 39.50",
     "Above 15m EMA9 by 60.00",
@@ -323,7 +332,8 @@ Omitting it just skips those four fields/tags; everything else is unaffected.
     "PCR 1.35 - Bullish bias",
     "Max Pain 25000 by +50.00 - Bearish pull",
     "OI Support 24900 by +150.00",
-    "OI Resistance 25200 by -150.00"
+    "OI Resistance 25200 by -150.00",
+    "Above VWAP by 9.75"
   ]
 }
 ```
@@ -394,6 +404,15 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   writing there reads as a level put writers will defend, i.e. support); `oi_resistance` is the
   strike with the highest **call** OI in the same window (the mirror image). `oi` on each is that
   strike's own OI count. `null` if there's no usable per-strike data within the window.
+- `vwap`: `null` unless `underlying_symbol` was given **and** a current-month futures contract is
+  listed for this underlying (true for NIFTY/BANKNIFTY-style indices and most F&O-enabled stocks,
+  false for most individual equities and any Upstox resolution failure -- degrades quietly, same
+  posture as `pcr`/`max_pain`). **SENSEX is a special case**: it has no futures market on Upstox at
+  all, so its VWAP always resolves against **Nifty's own futures contract** instead. `value` is the
+  session VWAP (cumulative typical-price-times-volume / cumulative volume, today's candles only) of
+  the resolved futures contract; `position` is `"above"`/`"below"`/`"at"` the *futures* contract's
+  own LTP relative to it (not the underlying's LTP, since VWAP itself is a futures-contract-only
+  concept here -- the index has no traded volume of its own to compute VWAP from).
 - `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50"`,
   `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35 - Bullish bias"`, `"OI Support 24900 by
   +150.00"`) built from the fields above -- the client can display these directly without any

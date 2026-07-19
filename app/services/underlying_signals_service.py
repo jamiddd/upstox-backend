@@ -38,6 +38,14 @@ _PCR_BEARISH_THRESHOLD = 0.8
 # (a single huge far-OTM print skews the whole-chain PCR far more than it skews the actual trade).
 _NEAR_ATM_STRIKE_COUNT = 5
 
+# SENSEX has no actively-traded futures contract on Upstox (unlike NIFTY/BANKNIFTY on NSE) -- per
+# explicit product decision, VWAP for SENSEX always uses Nifty's own futures contract instead.
+# Upstox's own key convention (matches every other *_INDEX entry already in this codebase, e.g.
+# "NSE_INDEX|Nifty 50") -- not independently verified against a live instrument master, so
+# _is_sensex also falls back to a symbol-text match in case this guess is wrong.
+_SENSEX_UNDERLYING_KEY = "BSE_INDEX|SENSEX"
+_NIFTY_UNDERLYING_KEY = "NSE_INDEX|Nifty 50"
+
 
 @dataclass
 class Candle:
@@ -101,6 +109,7 @@ class UnderlyingSignalsService:
         *,
         underlying_key: str,
         expiry_date: Optional[str] = None,
+        underlying_symbol: Optional[str] = None,
     ) -> dict[str, Any]:
         today = date.today()
         yesterday = today - timedelta(days=1)
@@ -161,6 +170,11 @@ class UnderlyingSignalsService:
         pcr_bias = _pcr_bias(oi_summary.pcr)
         max_pain_pull = _max_pain_pull(ltp, oi_summary.max_pain)
 
+        vwap, vwap_position = await self._vwap_signal(
+            access_token, underlying_key=underlying_key, underlying_symbol=underlying_symbol,
+            today=today, yesterday=yesterday,
+        )
+
         tags = _build_tags(
             ltp=ltp,
             ema9_5m_value=ema9_5m,
@@ -179,6 +193,8 @@ class UnderlyingSignalsService:
             max_pain_pull=max_pain_pull,
             oi_support_strike=oi_summary.support_strike,
             oi_resistance_strike=oi_summary.resistance_strike,
+            vwap_value=vwap,
+            vwap_position=vwap_position,
         )
 
         return {
@@ -217,6 +233,7 @@ class UnderlyingSignalsService:
                 if oi_summary.resistance_strike is not None
                 else None
             ),
+            "vwap": {"value": _round_or_none(vwap), "position": vwap_position} if vwap is not None else None,
             "tags": tags,
         }
 
@@ -372,6 +389,76 @@ class UnderlyingSignalsService:
                 return float(value)
         return 0.0
 
+    async def _vwap_signal(
+        self,
+        access_token: str,
+        *,
+        underlying_key: str,
+        underlying_symbol: Optional[str],
+        today: date,
+        yesterday: date,
+    ) -> tuple[Optional[float], Optional[str]]:
+        """Session VWAP computed from the underlying's own futures contract (the index itself has
+        no traded volume). Degrades quietly to `(None, None)` -- never raises into get_signals --
+        whenever a futures contract can't be resolved or its candle/LTP fetch fails, e.g. no
+        `underlying_symbol` given, no futures market for this underlying at all (true for most
+        individual equities), or an Upstox API failure.
+        """
+        futures_key = await self._futures_instrument_key(
+            access_token, underlying_key=underlying_key, underlying_symbol=underlying_symbol,
+        )
+        if not futures_key:
+            return None, None
+        try:
+            futures_candles = await self._minute_series(
+                access_token, futures_key, interval="5", lookback_days=2, today=today, yesterday=yesterday,
+            )
+            futures_ltp = await self._ltp(access_token, futures_key)
+        except UpstoxApiError:
+            return None, None
+        vwap = _vwap(futures_candles)
+        return vwap, _position(futures_ltp, vwap)
+
+    async def _futures_instrument_key(
+        self, access_token: str, *, underlying_key: str, underlying_symbol: Optional[str],
+    ) -> Optional[str]:
+        """Resolves the current-month futures contract to use for this underlying's VWAP --
+        matched by underlying_key (not just symbol text, which could ambiguously match a related
+        index's own future, e.g. "NIFTY" also matching FINNIFTY/MIDCPNIFTY), EXCEPT SENSEX (see
+        _is_sensex), which always resolves Nifty's own future instead since SENSEX has no futures
+        market on Upstox. Returns None -- gracefully, never raises -- whenever a future can't be
+        resolved for any reason: no underlying_symbol given (older client), no current-month
+        future listed for this underlying at all (true for most individual equities), or the
+        resolution API call itself fails.
+        """
+        if _is_sensex(underlying_key, underlying_symbol):
+            search_query, match_key = "NIFTY", _NIFTY_UNDERLYING_KEY
+        elif underlying_symbol:
+            search_query, match_key = underlying_symbol, underlying_key
+        else:
+            return None
+
+        cache_key = ("futures_key", underlying_key, date.today().isoformat())
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached.get("key")
+        try:
+            payload = await self.upstox.search_instruments(
+                access_token, query=search_query, segments="FO",
+                instrument_types="FUT", expiry="current_month", records=10,
+            )
+        except UpstoxApiError:
+            return None
+        rows = payload.get("data")
+        matches = [
+            row for row in (rows if isinstance(rows, list) else [])
+            if isinstance(row, dict) and row.get("underlying_key") == match_key
+            and isinstance(row.get("instrument_key"), str)
+        ]
+        resolved = matches[0]["instrument_key"] if matches else None
+        _cache_set(cache_key, {"key": resolved}, ttl_seconds=3600.0)
+        return resolved
+
 
 def _cache_get(key: tuple[Any, ...]) -> Optional[Any]:
     entry = _CACHE.get(key)
@@ -436,6 +523,25 @@ def _todays_candles(candles: list[Candle]) -> list[Candle]:
         return []
     latest_date = candles[-1].timestamp[:10]
     return [candle for candle in candles if candle.timestamp[:10] == latest_date]
+
+
+def _is_sensex(underlying_key: str, underlying_symbol: Optional[str]) -> bool:
+    if underlying_key == _SENSEX_UNDERLYING_KEY:
+        return True
+    return bool(underlying_symbol) and underlying_symbol.strip().upper() == "SENSEX"
+
+
+def _vwap(candles: list[Candle]) -> Optional[float]:
+    """Session VWAP = cumulative(typical price * volume) / cumulative(volume), today's candles
+    only. Typical price = (high+low+close)/3 -- volume traded across a candle's whole range, not
+    just its closing tick, same reasoning as ATR using the full high/low, not just closes.
+    """
+    todays = _todays_candles(candles)
+    total_volume = sum(c.volume for c in todays)
+    if total_volume <= 0:
+        return None
+    weighted_sum = sum(((c.high + c.low + c.close) / 3.0) * c.volume for c in todays)
+    return weighted_sum / total_volume
 
 
 def _ema(values: list[float], *, period: int) -> Optional[float]:
@@ -716,6 +822,8 @@ def _build_tags(
     max_pain_pull: Optional[str],
     oi_support_strike: Optional[float],
     oi_resistance_strike: Optional[float],
+    vwap_value: Optional[float],
+    vwap_position: Optional[str],
 ) -> list[str]:
     """Builds the ready-to-render tag strings -- every directional tag (EMA above/below, opening
     range above/below, a nearby level) spells out the absolute point distance from LTP, not just
@@ -759,6 +867,8 @@ def _build_tags(
         tags.append(f"OI Support {oi_support_strike:g} by {ltp - oi_support_strike:+.2f}")
     if oi_resistance_strike is not None:
         tags.append(f"OI Resistance {oi_resistance_strike:g} by {ltp - oi_resistance_strike:+.2f}")
+    if vwap_position and vwap_value is not None:
+        tags.append(f"{vwap_position.capitalize()} VWAP by {abs(ltp - vwap_value):.2f}")
     return tags
 
 

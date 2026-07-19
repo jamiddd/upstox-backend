@@ -416,15 +416,18 @@ async def main_summary(
 async def main_underlying_signals(
     underlying_key: str = DEFAULT_UNDERLYING_KEY,
     expiry_date: Optional[str] = None,
+    underlying_symbol: Optional[str] = None,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Return 9 EMA (5m/15m)/ATR(14)/opening-range/crucial-level/PCR/max-pain tags for the
+    """Return 9 EMA (5m/15m)/ATR(14)/opening-range/crucial-level/PCR/max-pain/VWAP tags for the
     underlying -- shown to the user just before they place a strike order. See
     UnderlyingSignalsService's doc comment for why this is computed on the underlying itself, not
     the option contract being traded. `expiry_date` is optional -- omitting it just skips the
     PCR/max-pain tags (which need an expiry to ask Upstox's OI endpoints about), everything else
-    still works.
+    still works. `underlying_symbol` is likewise optional -- omitting it just skips the VWAP tag
+    (computed from the underlying's own futures contract, resolved by a symbol-text search since
+    Upstox has no search-by-instrument_key mode), everything else still works.
     """
     access_token = _load_access_token(token_store)
     try:
@@ -432,6 +435,7 @@ async def main_underlying_signals(
             access_token,
             underlying_key=underlying_key,
             expiry_date=expiry_date,
+            underlying_symbol=underlying_symbol,
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc

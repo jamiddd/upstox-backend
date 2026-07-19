@@ -102,6 +102,14 @@ class FakeUpstoxService:
                 "ohlc": {"open": 5500.0, "high": 5560.0, "low": 5495.0, "close": 5555.5},
                 "net_change": 15.5,
             },
+            # Nifty's own futures contract (see search_instruments' fixture below) -- used for the
+            # underlying-signals VWAP tests. LTP set above the flat 24902ish typical price of the
+            # rising candle series get_historical_candle/get_intraday_candle return for any
+            # instrument_key, so VWAP resolves to a well-defined "above" position.
+            "NSE_FO|53216": {
+                "instrument_token": "NSE_FO|53216",
+                "last_price": 25050.0,
+            },
         }
         return {
             "status": "success",
@@ -1181,6 +1189,71 @@ def test_main_underlying_signals_returns_ema_atr_opening_range_and_nearest_level
     # No expiry_date was passed -- OI analysis (PCR/max pain) is skipped entirely.
     assert payload["pcr"] is None
     assert payload["max_pain"] is None
+    # No underlying_symbol was passed either -- VWAP futures resolution is skipped entirely
+    # (backward-compat: an older client that doesn't send it still gets a valid response).
+    assert payload["vwap"] is None
+
+
+def test_main_underlying_signals_includes_vwap_when_underlying_symbol_is_given() -> None:
+    """Passing underlying_symbol resolves the underlying's own futures contract (see
+    FakeUpstoxService.search_instruments' "Nifty Future" fixture row, matched by underlying_key)
+    and computes VWAP from its candles -- LTP for that instrument_key is faked at 25050.0, above
+    the flat ~24900s typical price of the shared rising candle series, so it reads "above".
+    """
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/main/underlying-signals?underlying_key=NSE_INDEX|Nifty 50&underlying_symbol=NIFTY",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["vwap"] is not None
+    assert payload["vwap"]["position"] == "above"
+    assert any(tag.startswith("Above VWAP by ") for tag in payload["tags"])
+
+
+def test_main_underlying_signals_resolves_sensex_vwap_from_niftys_own_future() -> None:
+    """SENSEX has no futures market on Upstox -- per explicit product decision, its VWAP always
+    resolves against Nifty's own futures contract instead (see UnderlyingSignalsService._is_sensex).
+    """
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/main/underlying-signals?underlying_key=BSE_INDEX|SENSEX&underlying_symbol=SENSEX",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["vwap"] is not None
+
+
+def test_main_underlying_signals_omits_vwap_when_underlying_has_no_futures_market() -> None:
+    """RELIANCE (already in FakeUpstoxService.search_instruments' fixture) has no FUT row of its
+    own -- VWAP gracefully stays null, everything else in the response is unaffected.
+    """
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/main/underlying-signals?underlying_key=NSE_EQ|INE002A01018&underlying_symbol=RELIANCE",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["vwap"] is None
+    assert payload["ltp"] is not None
 
 
 def test_main_underlying_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> None:

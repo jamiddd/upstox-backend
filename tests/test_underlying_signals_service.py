@@ -165,6 +165,8 @@ def test_build_tags_composes_readable_short_labels_with_absolute_point_distances
         max_pain_pull=None,
         oi_support_strike=None,
         oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
     )
 
     assert tags == [
@@ -195,6 +197,8 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         max_pain_pull=None,
         oi_support_strike=None,
         oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
     )
     below = signals._build_tags(
         ltp=24990.0,
@@ -214,6 +218,8 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         max_pain_pull=None,
         oi_support_strike=None,
         oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
     )
 
     assert above == ["Above opening range by 10.00"]
@@ -241,6 +247,8 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         max_pain_pull=None,
         oi_support_strike=None,
         oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
     )
     # LTP is 2 points *past* the target (overshot it) -> positive signed distance.
     past_target = signals._build_tags(
@@ -261,6 +269,8 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         max_pain_pull=None,
         oi_support_strike=None,
         oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
     )
     # LTP (24988.0) hasn't reached its downside target (24990.0) yet -> negative signed
     # distance, and "bounce" (not "pullback") is the reversal word on this side.
@@ -282,6 +292,8 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         max_pain_pull=None,
         oi_support_strike=None,
         oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
     )
 
     assert on_target == ["Above opening range by 10.00 (near OR Target 1 by +0.00, caution: possible pullback)"]
@@ -308,6 +320,8 @@ def test_build_tags_adds_pcr_and_max_pain_tags() -> None:
         max_pain_pull="bearish",
         oi_support_strike=None,
         oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
     )
 
     assert tags == [
@@ -335,6 +349,8 @@ def test_build_tags_omits_pcr_and_max_pain_when_unavailable() -> None:
         max_pain_pull=None,
         oi_support_strike=None,
         oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
     )
 
     assert tags == []
@@ -359,12 +375,40 @@ def test_build_tags_adds_oi_support_and_resistance_tags() -> None:
         max_pain_pull=None,
         oi_support_strike=24900.0,
         oi_resistance_strike=25200.0,
+        vwap_value=None,
+        vwap_position=None,
     )
 
     assert tags == [
         "OI Support 24900 by +150.00",
         "OI Resistance 25200 by -150.00",
     ]
+
+
+def test_build_tags_adds_vwap_tag() -> None:
+    tags = signals._build_tags(
+        ltp=25050.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=None,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
+        vwap_value=25000.0,
+        vwap_position="above",
+    )
+
+    assert tags == ["Above VWAP by 50.00"]
 
 
 def test_oi_support_resistance_picks_highest_put_and_call_oi_strikes() -> None:
@@ -426,6 +470,36 @@ def test_local_pcr_sums_put_and_call_oi_across_the_given_rows() -> None:
 def test_local_pcr_returns_none_when_there_is_no_call_oi_to_divide_by() -> None:
     assert signals._local_pcr([]) is None
     assert signals._local_pcr([{"strike_price": 200.0, "call_oi": 0, "put_oi": 500}]) is None
+
+
+def test_vwap_is_typical_price_weighted_by_volume_for_todays_candles_only() -> None:
+    candles = [
+        Candle(timestamp="2026-07-17T09:15:00+05:30", open=0.0, high=100.0, low=100.0, close=100.0, volume=99999.0),
+        Candle(timestamp="2026-07-18T09:15:00+05:30", open=99.0, high=102.0, low=98.0, close=100.0, volume=100.0),
+        Candle(timestamp="2026-07-18T09:20:00+05:30", open=100.0, high=104.0, low=100.0, close=102.0, volume=300.0),
+    ]
+
+    vwap = signals._vwap(candles)
+
+    # typical prices: (102+98+100)/3=100.0, (104+100+102)/3=102.0 -- weighted by 100/300 volume.
+    assert vwap == pytest.approx((100.0 * 100.0 + 102.0 * 300.0) / 400.0)
+
+
+def test_vwap_returns_none_on_zero_volume() -> None:
+    candles = [
+        Candle(timestamp="2026-07-18T09:15:00+05:30", open=100.0, high=101.0, low=99.0, close=100.0, volume=0.0),
+    ]
+
+    assert signals._vwap(candles) is None
+    assert signals._vwap([]) is None
+
+
+def test_is_sensex_matches_the_expected_key_or_a_symbol_text_fallback() -> None:
+    assert signals._is_sensex("BSE_INDEX|SENSEX", None) is True
+    assert signals._is_sensex("BSE_INDEX|Some Other Key", "sensex") is True
+    assert signals._is_sensex("BSE_INDEX|Some Other Key", "  Sensex  ") is True
+    assert signals._is_sensex("NSE_INDEX|Nifty 50", "NIFTY") is False
+    assert signals._is_sensex("NSE_INDEX|Nifty 50", None) is False
 
 
 def test_or_targets_are_ordinal_multiples_of_the_or_size() -> None:
@@ -501,6 +575,9 @@ class _FakeUpstoxService:
         pcr: float = 1.0,
         max_pain: float = 0.0,
         oi_strike_rows: list[dict[str, object]] | None = None,
+        futures_search_rows: list[dict[str, object]] | None = None,
+        futures_candles: list[list[object]] | None = None,
+        futures_ltp: float = 0.0,
     ) -> None:
         self._minute_candles = minute_candles
         self._daily_candles = daily_candles
@@ -509,9 +586,15 @@ class _FakeUpstoxService:
         self._pcr = pcr
         self._max_pain = max_pain
         self._oi_strike_rows = oi_strike_rows or []
+        self._futures_search_rows = futures_search_rows or []
+        self._futures_candles = futures_candles or []
+        self._futures_ltp = futures_ltp
 
     async def get_historical_candle(self, access_token, instrument_key, *, unit, interval, to_date, from_date=None):
-        candles = self._daily_candles if unit == "days" else self._minute_candles
+        if instrument_key == "NSE_FO|53216":
+            candles = self._futures_candles if unit != "days" else []
+        else:
+            candles = self._daily_candles if unit == "days" else self._minute_candles
         return {"status": "success", "data": {"candles": candles}}
 
     async def get_intraday_candle(self, access_token, instrument_key, *, unit, interval):
@@ -521,7 +604,11 @@ class _FakeUpstoxService:
         return {"status": "success", "data": [{"strike_price": strike} for strike in self._strikes]}
 
     async def get_quotes(self, access_token, instrument_key):
-        return {"status": "success", "data": {instrument_key: {"last_price": self._ltp}}}
+        ltp = self._futures_ltp if instrument_key == "NSE_FO|53216" else self._ltp
+        return {"status": "success", "data": {instrument_key: {"last_price": ltp}}}
+
+    async def search_instruments(self, access_token, *, query, segments, instrument_types, expiry, records):
+        return {"status": "success", "data": self._futures_search_rows}
 
     async def get_oi(self, access_token, instrument_key, *, expiry, date):
         return {
@@ -592,6 +679,9 @@ def test_get_signals_wires_everything_into_tags() -> None:
     assert result["max_pain"] is None
     assert result["oi_support"] is None
     assert result["oi_resistance"] is None
+    # No underlying_symbol was passed -- futures resolution (and therefore VWAP) is skipped
+    # entirely, not just empty.
+    assert result["vwap"] is None
 
 
 def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> None:
@@ -649,3 +739,150 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
     assert any(tag.startswith("Max Pain 190 by +10.00 - Bearish pull") for tag in result["tags"])
     assert any(tag.startswith("OI Support 190 by +10.00") for tag in result["tags"])
     assert any(tag.startswith("OI Resistance 210 by -10.00") for tag in result["tags"])
+
+
+# --- futures resolution + VWAP wiring --------------------------------------------------------
+
+
+_NIFTY_FUT_ROW = {
+    "name": "Nifty Future",
+    "exchange": "NSE",
+    "instrument_type": "FUT",
+    "instrument_key": "NSE_FO|53216",
+    "trading_symbol": "NIFTY FUT 31 JUL 26",
+    "underlying_key": "NSE_INDEX|Nifty 50",
+    "underlying_type": "INDEX",
+    "underlying_symbol": "NIFTY",
+    "lot_size": 75,
+    "freeze_quantity": 1800.0,
+    "tick_size": 5.0,
+}
+
+
+def test_futures_instrument_key_matches_exact_underlying_key() -> None:
+    # A same-symbol-text row for a *different* underlying_key (e.g. FINNIFTY's own future also
+    # matching a "NIFTY" text search) must lose to the exact underlying_key match.
+    decoy_row = {**_NIFTY_FUT_ROW, "instrument_key": "NSE_FO|99999", "underlying_key": "NSE_INDEX|Fin Nifty"}
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=[], daily_candles=[], strikes=[], ltp=0.0,
+            futures_search_rows=[decoy_row, _NIFTY_FUT_ROW],
+        ),
+    )
+
+    resolved = anyio.run(
+        lambda: service._futures_instrument_key(
+            "upstox-token", underlying_key="NSE_INDEX|Nifty 50", underlying_symbol="NIFTY",
+        ),
+    )
+
+    assert resolved == "NSE_FO|53216"
+
+
+def test_futures_instrument_key_returns_none_without_underlying_symbol() -> None:
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=[], daily_candles=[], strikes=[], ltp=0.0,
+            futures_search_rows=[_NIFTY_FUT_ROW],
+        ),
+    )
+
+    resolved = anyio.run(
+        lambda: service._futures_instrument_key(
+            "upstox-token", underlying_key="NSE_INDEX|Nifty 50", underlying_symbol=None,
+        ),
+    )
+
+    assert resolved is None
+
+
+def test_futures_instrument_key_returns_none_when_no_future_is_listed() -> None:
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=[], daily_candles=[], strikes=[], ltp=0.0,
+            futures_search_rows=[],
+        ),
+    )
+
+    resolved = anyio.run(
+        lambda: service._futures_instrument_key(
+            "upstox-token", underlying_key="NSE_EQ|INE002A01018", underlying_symbol="RELIANCE",
+        ),
+    )
+
+    assert resolved is None
+
+
+def test_futures_instrument_key_resolves_sensex_to_niftys_own_future() -> None:
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=[], daily_candles=[], strikes=[], ltp=0.0,
+            futures_search_rows=[_NIFTY_FUT_ROW],
+        ),
+    )
+
+    resolved = anyio.run(
+        lambda: service._futures_instrument_key(
+            "upstox-token", underlying_key="BSE_INDEX|SENSEX", underlying_symbol="SENSEX",
+        ),
+    )
+
+    assert resolved == "NSE_FO|53216"
+
+
+def test_get_signals_includes_vwap_when_underlying_symbol_is_given() -> None:
+    start = datetime(2026, 7, 18, 9, 15)
+    minute_candles = _rising_candles(20, start=start, step_minutes=5)
+    daily_candles = [
+        ["2026-07-17T00:00:00+05:30", 100.0, 110.0, 95.0, 105.0, 500000],
+    ]
+    futures_candles = [
+        ["2026-07-18T09:15:00+05:30", 25000.0, 25020.0, 24980.0, 25010.0, 1000],
+        ["2026-07-18T09:20:00+05:30", 25010.0, 25050.0, 25000.0, 25040.0, 2000],
+    ]
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=minute_candles,
+            daily_candles=daily_candles,
+            strikes=[24800.0, 24850.0, 24900.0, 24950.0],
+            ltp=200.0,
+            futures_search_rows=[_NIFTY_FUT_ROW],
+            futures_candles=futures_candles,
+            futures_ltp=25060.0,
+        ),
+    )
+
+    result = anyio.run(
+        lambda: service.get_signals(
+            "upstox-token", underlying_key="NSE_INDEX|Nifty 50", underlying_symbol="NIFTY",
+        ),
+    )
+
+    assert result["vwap"] is not None
+    assert result["vwap"]["position"] == "above"
+    assert any(tag.startswith("Above VWAP by ") for tag in result["tags"])
+
+
+def test_get_signals_omits_vwap_when_underlying_has_no_futures_market() -> None:
+    start = datetime(2026, 7, 18, 9, 15)
+    minute_candles = _rising_candles(20, start=start, step_minutes=5)
+    daily_candles = [
+        ["2026-07-17T00:00:00+05:30", 100.0, 110.0, 95.0, 105.0, 500000],
+    ]
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=minute_candles,
+            daily_candles=daily_candles,
+            strikes=[24800.0, 24850.0, 24900.0, 24950.0],
+            ltp=200.0,
+            futures_search_rows=[],
+        ),
+    )
+
+    result = anyio.run(
+        lambda: service.get_signals(
+            "upstox-token", underlying_key="NSE_EQ|INE002A01018", underlying_symbol="RELIANCE",
+        ),
+    )
+
+    assert result["vwap"] is None
