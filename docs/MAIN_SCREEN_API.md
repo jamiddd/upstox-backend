@@ -375,17 +375,25 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   signed (`+`/`-`) point distance to the target, e.g. `"Above opening range by 50.00 (near OR
   Target 1 by +0.30, caution: possible pullback)"`.
 - `pcr`: `null` unless `expiry_date` was given (and Upstox's OI endpoints succeeded for it).
-  `value` is the raw put-call ratio; `bias` is `"bullish"` (PCR >= 1.2 -- heavy put writing reads
-  as traders not expecting a fall), `"bearish"` (PCR <= 0.8), or `"neutral"` in between.
-- `max_pain`: same availability as `pcr`. `value` is the strike where option writers collectively
-  lose the least by expiry -- price tends to gravitate toward it as expiry approaches. `pull` is
-  `"bullish"` if LTP is currently below it (expected pull up), `"bearish"` if above (pull down),
-  `"neutral"` if exactly on it.
-- `oi_support` / `oi_resistance`: same availability as `pcr`, computed from the per-strike
-  `call_put_oi_data_list` the same OI Analysis call already returns. `oi_support` is the strike
-  with the single highest **put** OI (heavy put writing there reads as a level put writers will
-  defend, i.e. support); `oi_resistance` is the strike with the highest **call** OI (the mirror
-  image). `oi` on each is that strike's own OI count. `null` if there's no usable per-strike data.
+  `value` is put-call ratio computed **locally** from the per-strike `call_put_oi_data_list`
+  (sum of put OI / sum of call OI), **restricted to the 5 listed strikes on each side of ATM**
+  (11 strikes total, including ATM) -- not Upstox's own whole-chain `/market/pcr` value. This app
+  is a scalping tool, so OI parked far from the money would otherwise dominate the ratio without
+  being relevant to the trade actually being considered. `bias` is `"bullish"` (PCR >= 1.2 --
+  heavy near-the-money put writing reads as traders not expecting a fall), `"bearish"`
+  (PCR <= 0.8), or `"neutral"` in between.
+- `max_pain`: same availability as `pcr`, but **not** restricted to near-ATM strikes -- `value` is
+  Upstox's own whole-chain max pain (the strike where option writers collectively lose the least
+  by expiry, across every strike), since narrowing its inputs would just make it a different,
+  wrong number rather than a more scalping-relevant one. Price tends to gravitate toward it as
+  expiry approaches. `pull` is `"bullish"` if LTP is currently below it (expected pull up),
+  `"bearish"` if above (pull down), `"neutral"` if exactly on it.
+- `oi_support` / `oi_resistance`: same availability as `pcr`, and same near-ATM restriction (the 5
+  strikes on each side of ATM) computed from the same per-strike `call_put_oi_data_list`.
+  `oi_support` is the strike with the single highest **put** OI *within that window* (heavy put
+  writing there reads as a level put writers will defend, i.e. support); `oi_resistance` is the
+  strike with the highest **call** OI in the same window (the mirror image). `oi` on each is that
+  strike's own OI count. `null` if there's no usable per-strike data within the window.
 - `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50"`,
   `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35 - Bullish bias"`, `"OI Support 24900 by
   +150.00"`) built from the fields above -- the client can display these directly without any

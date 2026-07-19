@@ -1119,9 +1119,12 @@ def test_main_underlying_signals_returns_ema_atr_opening_range_and_nearest_level
 
 
 def test_main_underlying_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> None:
-    """Passing expiry_date pulls in PCR/max-pain via the existing OI Analysis fakes
-    (get_oi/get_change_oi/get_max_pain/get_pcr, already on FakeUpstoxService from that route's own
-    tests: pcr=1.2755, max_pain=25000.0).
+    """Passing expiry_date pulls in max-pain via the existing OI Analysis fakes (get_max_pain,
+    already on FakeUpstoxService from that route's own tests: max_pain=25000.0). PCR is no longer
+    Upstox's own whole-chain value (get_pcr's pcr=1.2755 fake is unused here) -- it's computed
+    locally from get_oi's per-strike call_put_oi_data_list, restricted to the 5 strikes on each
+    side of ATM (see UnderlyingSignalsService._oi_analysis); that fake list is empty, so pcr comes
+    out None here, same as oi_support/oi_resistance below.
     """
     client = _client(FakeTokenStore(token="stored-token"))
     try:
@@ -1135,14 +1138,13 @@ def test_main_underlying_signals_includes_pcr_and_max_pain_when_expiry_date_is_g
     assert response.status_code == 200
     payload = response.json()
 
-    assert payload["pcr"] == {"value": 1.28, "bias": "bullish"}
     # LTP (25050.0) sits above max pain (25000.0) -> bearish pull, +50.00 away.
     assert payload["max_pain"] == {"value": 25000.0, "pull": "bearish"}
-    assert any(tag.startswith("PCR 1.2") and "Bullish bias" in tag for tag in payload["tags"])
     assert "Max Pain 25000 by +50.00 - Bearish pull" in payload["tags"]
     # FakeUpstoxService.get_oi's call_put_oi_data_list is empty (shared with the OI Analysis
-    # route's own exact-match test, so not changed here) -- no per-strike data means no OI
+    # route's own exact-match test, so not changed here) -- no per-strike data means no PCR/OI
     # support/resistance to compute, not an error.
+    assert payload["pcr"] is None
     assert payload["oi_support"] is None
     assert payload["oi_resistance"] is None
 

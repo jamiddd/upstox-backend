@@ -32,6 +32,12 @@ _OR_TARGET_MULTIPLIERS = (0.5, 1.0, 1.5, 2.0)
 _PCR_BULLISH_THRESHOLD = 1.2
 _PCR_BEARISH_THRESHOLD = 0.8
 
+# How many listed strikes on *each side* of ATM count as "near" for PCR/OI support/resistance --
+# see _near_atm_strikes. This app is a scalping tool; OI concentrated 15 strikes away is noise for
+# that time frame, and would otherwise dominate both the support/resistance pick and the PCR ratio
+# (a single huge far-OTM print skews the whole-chain PCR far more than it skews the actual trade).
+_NEAR_ATM_STRIKE_COUNT = 5
+
 
 @dataclass
 class Candle:
@@ -75,8 +81,10 @@ class UnderlyingSignalsService:
     ATR(14), today's opening-range position, proximity to a "crucial level" (previous-day H/L/C,
     classic pivots, or a round psychological number), and (when [expiry_date] is given) PCR-based
     bias, Max Pain pull direction, and OI support/resistance strikes from open-interest data --
-    shown to the user just before they place a strike order. See docs/MAIN_SCREEN_API.md's
-    "Underlying Signals" section.
+    shown to the user just before they place a strike order. PCR and OI support/resistance are
+    computed only from strikes near the money (see _near_atm_strikes), since this app is a
+    scalping tool and OI parked far from the money is noise, not signal, for that time frame. See
+    docs/MAIN_SCREEN_API.md's "Underlying Signals" section.
 
     Deliberately computed on the *underlying's* own price action, not the option contract being
     traded: an option premium is dominated by theta decay and IV changes rather than the
@@ -149,7 +157,7 @@ class UnderlyingSignalsService:
             tolerance_percent=_NEAREST_LEVEL_TOLERANCE_PERCENT,
         )
 
-        oi_summary = await self._oi_analysis(access_token, underlying_key, expiry_date, today)
+        oi_summary = await self._oi_analysis(access_token, underlying_key, expiry_date, today, ltp)
         pcr_bias = _pcr_bias(oi_summary.pcr)
         max_pain_pull = _max_pain_pull(ltp, oi_summary.max_pain)
 
@@ -218,12 +226,21 @@ class UnderlyingSignalsService:
         underlying_key: str,
         expiry_date: Optional[str],
         today: date,
+        ltp: float,
     ) -> "_OiSummary":
         """PCR/max pain/OI support-resistance for [expiry_date], reusing the existing
         OIAnalysisService (its own 60s cache applies, nothing duplicated here) -- an all-`None`
         [_OiSummary] if no expiry was given (a contract-free underlying, or a caller that doesn't
         have one yet) or Upstox's OI endpoints fail, same "degrade this one piece, not the whole
         response" posture as MainScreenService.summary's funds-unavailable handling.
+
+        `pcr` and the support/resistance strikes are all computed **only** from the
+        [_NEAR_ATM_STRIKE_COUNT] strikes on each side of ATM (see _near_atm_strikes) -- this app is
+        a scalping tool, so OI concentrated far from the money is noise, not signal, for either
+        purpose. `max_pain` is left as Upstox's own whole-chain value, deliberately unrestricted --
+        "max pain" is inherently a whole-chain concept (the strike that minimizes aggregate option
+        writer payout across every strike), so narrowing its inputs would just make it a different,
+        wrong number rather than a more scalping-relevant one.
         """
         if not expiry_date:
             return _OiSummary()
@@ -239,15 +256,17 @@ class UnderlyingSignalsService:
         except UpstoxApiError:
             return _OiSummary()
 
-        pcr = analysis.get("pcr", {}).get("pcr")
         max_pain = analysis.get("max_pain", {}).get("max_pain")
-        pcr = float(pcr) if isinstance(pcr, (int, float)) else None
         max_pain = float(max_pain) if isinstance(max_pain, (int, float)) else None
 
         strike_rows = analysis.get("oi", {}).get("call_put_oi_data_list")
-        support_strike, support_oi, resistance_strike, resistance_oi = _oi_support_resistance(
+        near_atm_rows = _near_atm_strikes(
             strike_rows if isinstance(strike_rows, list) else [],
+            ltp,
+            count=_NEAR_ATM_STRIKE_COUNT,
         )
+        pcr = _local_pcr(near_atm_rows)
+        support_strike, support_oi, resistance_strike, resistance_oi = _oi_support_resistance(near_atm_rows)
 
         return _OiSummary(
             pcr=pcr,
@@ -605,6 +624,44 @@ def _max_pain_pull(ltp: float, max_pain: Optional[float]) -> Optional[str]:
     if ltp > max_pain:
         return "bearish"
     return "neutral"
+
+
+def _near_atm_strikes(strike_rows: list[dict[str, Any]], ltp: float, *, count: int) -> list[dict[str, Any]]:
+    """The `count` listed strikes on *each side* of ATM (whichever strike in [strike_rows] is
+    nearest to `ltp`), plus ATM itself -- sorted by strike_price first so "each side" means what
+    it says. Everything derived from OI (PCR, support/resistance) only ever looks at this
+    subset -- see _oi_analysis's doc comment for why the far strikes are excluded entirely rather
+    than just down-weighted.
+    """
+    usable = sorted(
+        (row for row in strike_rows if isinstance(row, dict) and isinstance(row.get("strike_price"), (int, float))),
+        key=lambda row: row["strike_price"],
+    )
+    if not usable:
+        return []
+    atm_index = min(range(len(usable)), key=lambda i: abs(usable[i]["strike_price"] - ltp))
+    start = max(0, atm_index - count)
+    end = min(len(usable), atm_index + count + 1)
+    return usable[start:end]
+
+
+def _local_pcr(near_atm_rows: list[dict[str, Any]]) -> Optional[float]:
+    """Put-call ratio computed from just [near_atm_rows] (see _near_atm_strikes) -- sum of put OI
+    over sum of call OI across that subset. `None` if there's no call OI to divide by (empty
+    subset, or every row's call_oi missing/zero).
+    """
+    total_put_oi = 0.0
+    total_call_oi = 0.0
+    for row in near_atm_rows:
+        put_oi = row.get("put_oi")
+        if isinstance(put_oi, (int, float)):
+            total_put_oi += put_oi
+        call_oi = row.get("call_oi")
+        if isinstance(call_oi, (int, float)):
+            total_call_oi += call_oi
+    if total_call_oi <= 0:
+        return None
+    return total_put_oi / total_call_oi
 
 
 def _oi_support_resistance(

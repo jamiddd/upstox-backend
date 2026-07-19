@@ -387,6 +387,47 @@ def test_oi_support_resistance_returns_none_for_empty_or_unusable_rows() -> None
     )
 
 
+def test_near_atm_strikes_excludes_rows_beyond_count_on_either_side() -> None:
+    # Strikes 170..230 step 5 (13 rows), ATM (nearest to ltp=200.0) at index 6 -> with count=5
+    # the window is indices [1:12], i.e. strikes 175..225 -- excludes 170 and 230.
+    rows = [{"strike_price": float(s)} for s in range(170, 231, 5)]
+
+    near = signals._near_atm_strikes(rows, 200.0, count=5)
+
+    assert [row["strike_price"] for row in near] == [float(s) for s in range(175, 226, 5)]
+
+
+def test_near_atm_strikes_clamps_at_the_edges_of_the_chain() -> None:
+    # ATM sits right at the first listed strike -- there's nothing below it to include, so the
+    # window just clamps to what's actually there instead of erroring.
+    rows = [{"strike_price": float(s)} for s in range(200, 231, 5)]
+
+    near = signals._near_atm_strikes(rows, 200.0, count=5)
+
+    assert [row["strike_price"] for row in near] == [float(s) for s in range(200, 226, 5)]
+
+
+def test_near_atm_strikes_returns_empty_for_no_usable_rows() -> None:
+    assert signals._near_atm_strikes([], 200.0, count=5) == []
+    assert signals._near_atm_strikes([{"strike_price": None}], 200.0, count=5) == []
+
+
+def test_local_pcr_sums_put_and_call_oi_across_the_given_rows() -> None:
+    rows = [
+        {"strike_price": 190.0, "call_oi": 500000, "put_oi": 1200000},
+        {"strike_price": 210.0, "call_oi": 1500000, "put_oi": 400000},
+    ]
+
+    pcr = signals._local_pcr(rows)
+
+    assert pcr == pytest.approx(1600000 / 2000000)
+
+
+def test_local_pcr_returns_none_when_there_is_no_call_oi_to_divide_by() -> None:
+    assert signals._local_pcr([]) is None
+    assert signals._local_pcr([{"strike_price": 200.0, "call_oi": 0, "put_oi": 500}]) is None
+
+
 def test_or_targets_are_ordinal_multiples_of_the_or_size() -> None:
     up_targets = signals._or_targets(25100.0, 100.0, sign=1)
     down_targets = signals._or_targets(25000.0, 100.0, sign=-1)
@@ -559,18 +600,33 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
     daily_candles = [
         ["2026-07-17T00:00:00+05:30", 100.0, 110.0, 95.0, 105.0, 500000],
     ]
+    # 13 strikes, 170..230 step 5, ATM (nearest to ltp=200.0) at index 6 -- with
+    # _NEAR_ATM_STRIKE_COUNT=5, the near-ATM window is indices [1:12], i.e. 175..225, excluding
+    # the two extremes (170 and 230). Both extremes carry a deliberately huge, otherwise-winning
+    # OI print to prove they get excluded rather than dominating PCR/support/resistance.
+    oi_strike_rows = [
+        {"strike_price": 170.0, "call_oi": 100, "put_oi": 99999999},  # excluded
+        {"strike_price": 175.0, "call_oi": 0, "put_oi": 0},
+        {"strike_price": 180.0, "call_oi": 0, "put_oi": 0},
+        {"strike_price": 185.0, "call_oi": 0, "put_oi": 0},
+        {"strike_price": 190.0, "call_oi": 0, "put_oi": 1200000},  # support winner (in window)
+        {"strike_price": 195.0, "call_oi": 0, "put_oi": 0},
+        {"strike_price": 200.0, "call_oi": 0, "put_oi": 0},
+        {"strike_price": 205.0, "call_oi": 0, "put_oi": 0},
+        {"strike_price": 210.0, "call_oi": 1500000, "put_oi": 0},  # resistance winner (in window)
+        {"strike_price": 215.0, "call_oi": 0, "put_oi": 0},
+        {"strike_price": 220.0, "call_oi": 0, "put_oi": 0},
+        {"strike_price": 225.0, "call_oi": 0, "put_oi": 0},
+        {"strike_price": 230.0, "call_oi": 99999999, "put_oi": 100},  # excluded
+    ]
     service = UnderlyingSignalsService(
         _FakeUpstoxService(
             minute_candles=minute_candles,
             daily_candles=daily_candles,
             strikes=[24800.0, 24850.0, 24900.0, 24950.0],
             ltp=200.0,
-            pcr=1.35,
             max_pain=190.0,
-            oi_strike_rows=[
-                {"strike_price": 190.0, "call_oi": 500000, "put_oi": 1200000},
-                {"strike_price": 210.0, "call_oi": 1500000, "put_oi": 400000},
-            ],
+            oi_strike_rows=oi_strike_rows,
         ),
     )
 
@@ -580,12 +636,16 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
         ),
     )
 
-    assert result["pcr"] == {"value": 1.35, "bias": "bullish"}
-    # LTP (200.0) is above max pain (190.0) -> bearish pull.
+    # Local PCR over just the near-ATM window: 1200000 put / 1500000 call = 0.8 -> bearish. If the
+    # excluded strikes had leaked in, this would instead be ~1.0 (huge put and huge call roughly
+    # cancel out) or skewed the other way -- either way, not 0.8.
+    assert result["pcr"] == {"value": 0.8, "bias": "bearish"}
+    # LTP (200.0) is above max pain (190.0) -> bearish pull. max_pain itself is intentionally
+    # NOT restricted to the near-ATM window (see _oi_analysis's doc comment).
     assert result["max_pain"] == {"value": 190.0, "pull": "bearish"}
     assert result["oi_support"] == {"value": 190.0, "oi": 1200000.0}
     assert result["oi_resistance"] == {"value": 210.0, "oi": 1500000.0}
-    assert any(tag.startswith("PCR 1.35 - Bullish bias") for tag in result["tags"])
+    assert any(tag.startswith("PCR 0.80 - Bearish bias") for tag in result["tags"])
     assert any(tag.startswith("Max Pain 190 by +10.00 - Bearish pull") for tag in result["tags"])
     assert any(tag.startswith("OI Support 190 by +10.00") for tag in result["tags"])
     assert any(tag.startswith("OI Resistance 210 by -10.00") for tag in result["tags"])
