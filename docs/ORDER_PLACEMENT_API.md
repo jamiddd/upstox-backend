@@ -134,6 +134,76 @@ TARGET and STOPLOSS trigger_type are always IMMEDIATE as required by Upstox.
 Normal Upstox v3 place-order supports slice=true, but GTT place order does not document slice=true, so the backend handles slicing for smart bracket orders.
 ```
 
+## List GTT Orders
+
+```http
+GET /api/orders/gtt?instrument_key=NSE_FO|111
+```
+
+Returns the active (not `CANCELLED`/`REJECTED`/`COMPLETED`) GTT orders for one instrument --
+lets the client find the bracket order behind an open position so its target/stoploss can be
+shown and edited. `instrument_key` is required.
+
+Response (raw passthrough of the matching Upstox GTT order entries):
+
+```json
+[
+  {
+    "gtt_order_id": "GTT-111",
+    "instrument_token": "NSE_FO|111",
+    "quantity": 75,
+    "product": "I",
+    "status": "ACTIVE",
+    "rules": [
+      { "strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": 125.5 },
+      { "strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 140.0 },
+      { "strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 118.0 }
+    ]
+  }
+]
+```
+
+## Modify GTT Order
+
+```http
+PUT /api/orders/gtt/modify
+```
+
+Re-points an existing GTT bracket's target/stoploss trigger prices (e.g. after the client fetched
+its current rules from `GET /api/orders/gtt` above). The entry fields must be resent unchanged --
+Upstox's GTT modify contract expects the full rule set, not a partial patch.
+
+Request:
+
+```json
+{
+  "gtt_order_id": "GTT-111",
+  "instrument_key": "NSE_FO|111",
+  "quantity": 75,
+  "product": "I",
+  "entry_trigger_type": "IMMEDIATE",
+  "entry_trigger_price": 125.5,
+  "target_trigger_price": 145.0,
+  "stoploss_trigger_price": 115.0
+}
+```
+
+Fields:
+
+```text
+gtt_order_id required
+instrument_key required -- used to validate target_trigger_price/stoploss_trigger_price against the instrument's tick_size, same as Smart Bracket Order above
+quantity required, positive integer
+product optional, I|D|MTF, default I
+entry_trigger_type optional, ABOVE|BELOW|IMMEDIATE, default IMMEDIATE
+entry_trigger_price required, positive number
+target_trigger_price required, positive number
+stoploss_trigger_price required, positive number
+trailing_gap optional, positive number
+```
+
+Response: the raw Upstox GTT modify response.
+
 ## Modify Orders
 
 ```http

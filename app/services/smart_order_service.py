@@ -79,6 +79,58 @@ class SmartOrderService:
             "slices": placed_slices,
         }
 
+    async def get_gtt_orders_for_instrument(
+        self, access_token: str, *, instrument_key: str
+    ) -> list[dict[str, Any]]:
+        """Active GTT orders for one instrument -- lets the app find the bracket order behind an
+        open position so its target/stoploss can be edited (see modify_gtt_bracket). "Active"
+        excludes terminal statuses (cancelled/rejected/completed); anything else is treated as
+        still-live so an unfamiliar status fails open rather than silently hiding a real order.
+        """
+        payload = await self.upstox.get_gtt_orders(access_token)
+        data = payload.get("data")
+        orders = data if isinstance(data, list) else []
+        return [
+            order
+            for order in orders
+            if isinstance(order, dict)
+            and order.get("instrument_token") == instrument_key
+            and str(order.get("status", "")).upper() not in _INACTIVE_GTT_STATUSES
+        ]
+
+    async def modify_gtt_bracket(
+        self,
+        access_token: str,
+        *,
+        gtt_order_id: str,
+        quantity: int,
+        product: str,
+        entry_trigger_type: str,
+        entry_trigger_price: float,
+        target_trigger_price: float,
+        stoploss_trigger_price: float,
+        trailing_gap: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Re-points an existing GTT bracket's target/stoploss. The entry rule is resent
+        unchanged (already triggered, since this only ever runs against an open position) --
+        Upstox's GTT modify contract expects the full rule set, not a partial patch.
+        """
+        rules = _build_gtt_rules(
+            entry_trigger_type=entry_trigger_type,
+            entry_trigger_price=entry_trigger_price,
+            target_trigger_price=target_trigger_price,
+            stoploss_trigger_price=stoploss_trigger_price,
+            trailing_gap=trailing_gap,
+        )
+        upstox_order = {
+            "gtt_order_id": gtt_order_id,
+            "type": "MULTIPLE",
+            "quantity": quantity,
+            "product": product,
+            "rules": rules,
+        }
+        return await self.upstox.modify_gtt_order(access_token, upstox_order)
+
     async def exit_all_positions(self, access_token: str) -> dict[str, Any]:
         """Flattens every currently open position (quantity != 0) with an immediate market order
         in the opposite direction -- backs the app's max-loss auto square-off (see
@@ -139,19 +191,20 @@ class SmartOrderService:
         }
 
 
-def _build_gtt_order(
+# Terminal GTT statuses -- anything else (e.g. a still-pending/triggered rule) is treated as
+# active. See SmartOrderService.get_gtt_orders_for_instrument.
+_INACTIVE_GTT_STATUSES = {"CANCELLED", "REJECTED", "COMPLETED"}
+
+
+def _build_gtt_rules(
     *,
-    instrument_key: str,
-    transaction_type: str,
-    quantity: int,
-    product: str,
     entry_trigger_type: str,
     entry_trigger_price: float,
     target_trigger_price: float,
     stoploss_trigger_price: float,
     trailing_gap: Optional[float],
-    market_protection: Optional[int],
-) -> dict[str, Any]:
+    market_protection: Optional[int] = None,
+) -> list[dict[str, Any]]:
     rules: list[dict[str, Any]] = [
         {
             "strategy": "ENTRY",
@@ -174,7 +227,30 @@ def _build_gtt_order(
     if market_protection is not None:
         for rule in rules:
             rule["market_protection"] = market_protection
+    return rules
 
+
+def _build_gtt_order(
+    *,
+    instrument_key: str,
+    transaction_type: str,
+    quantity: int,
+    product: str,
+    entry_trigger_type: str,
+    entry_trigger_price: float,
+    target_trigger_price: float,
+    stoploss_trigger_price: float,
+    trailing_gap: Optional[float],
+    market_protection: Optional[int],
+) -> dict[str, Any]:
+    rules = _build_gtt_rules(
+        entry_trigger_type=entry_trigger_type,
+        entry_trigger_price=entry_trigger_price,
+        target_trigger_price=target_trigger_price,
+        stoploss_trigger_price=stoploss_trigger_price,
+        trailing_gap=trailing_gap,
+        market_protection=market_protection,
+    )
     upstox_order = {
         "type": "MULTIPLE",
         "quantity": quantity,

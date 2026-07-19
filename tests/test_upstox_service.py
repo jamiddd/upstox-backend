@@ -190,6 +190,78 @@ def test_place_gtt_order_posts_to_v3_gtt_endpoint() -> None:
     assert payload == {"status": "success", "data": {"gtt_order_ids": ["GTT-123"]}}
 
 
+def test_get_gtt_orders_gets_v3_gtt_endpoint() -> None:
+    """List GTT orders through the V3 endpoint."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v3/order/gtt"
+        assert request.headers["Accept"] == "application/json"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(
+            200,
+            json={"status": "success", "data": [{"gtt_order_id": "GTT-123"}]},
+        )
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_gtt_orders("upstox-token")
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": [{"gtt_order_id": "GTT-123"}]}
+
+
+def test_get_gtt_orders_rejects_non_dict_response() -> None:
+    """A malformed (non-dict) response should raise rather than silently pass through."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["not", "a", "dict"])
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_gtt_orders("upstox-token")
+
+    with pytest.raises(UpstoxApiError):
+        anyio.run(run)
+
+
+def test_modify_gtt_order_puts_to_v3_gtt_modify_endpoint() -> None:
+    """Modify a GTT order through the V3 endpoint."""
+    order = {
+        "gtt_order_id": "GTT-123",
+        "type": "MULTIPLE",
+        "quantity": 75,
+        "product": "I",
+        "rules": [
+            {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": 125.5},
+            {"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 145.0},
+            {"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 115.0},
+        ],
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        assert request.url.path == "/v3/order/gtt/modify"
+        assert request.headers["Accept"] == "application/json"
+        assert request.headers["Content-Type"] == "application/json"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        assert json.loads((await request.aread()).decode("utf-8")) == order
+        return httpx.Response(
+            200,
+            json={"status": "success", "data": {"gtt_order_id": "GTT-123"}},
+        )
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.modify_gtt_order("upstox-token", order)
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": {"gtt_order_id": "GTT-123"}}
+
+
 def test_modify_order_puts_to_v3_modify_endpoint() -> None:
     """Modify an open order through the current V3 endpoint."""
     order = {

@@ -56,6 +56,23 @@ class SmartBracketOrderRequest(BaseModel):
     slice_quantity: Optional[int] = Field(default=None, gt=0)
 
 
+class ModifyGttOrderRequest(BaseModel):
+    """Re-points an existing GTT bracket's target/stoploss trigger prices. The entry fields are
+    resent unchanged by the client (it already has them from GET /orders/gtt) -- Upstox's GTT
+    modify contract expects the full rule set, not a partial patch.
+    """
+
+    gtt_order_id: str = Field(min_length=1)
+    instrument_key: str = Field(min_length=1)
+    quantity: int = Field(gt=0)
+    product: Literal["I", "D", "MTF"] = "I"
+    entry_trigger_type: Literal["ABOVE", "BELOW", "IMMEDIATE"] = "IMMEDIATE"
+    entry_trigger_price: float = Field(gt=0)
+    target_trigger_price: float = Field(gt=0)
+    stoploss_trigger_price: float = Field(gt=0)
+    trailing_gap: Optional[float] = Field(default=None, gt=0)
+
+
 class ModifyOrderRequest(BaseModel):
     """Fields accepted by the Upstox V3 modify-order endpoint."""
 
@@ -496,6 +513,55 @@ async def place_smart_bracket_order(
             trailing_gap=order.trailing_gap,
             market_protection=order.market_protection,
             slice_quantity=slice_quantity,
+        )
+    except AppConfigError as exc:
+        raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/orders/gtt")
+async def get_gtt_orders(
+    instrument_key: str = Query(..., min_length=1),
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> list[dict[str, Any]]:
+    """Active GTT orders for one instrument -- lets the app find the bracket order behind an open
+    position so its target/stoploss can be shown and edited. See
+    SmartOrderService.get_gtt_orders_for_instrument.
+    """
+    access_token = _load_access_token(token_store)
+    try:
+        return await SmartOrderService(service).get_gtt_orders_for_instrument(
+            access_token, instrument_key=instrument_key
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.put("/orders/gtt/modify")
+async def modify_gtt_order(
+    order: ModifyGttOrderRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Re-points an existing GTT bracket's target/stoploss. See SmartOrderService.modify_gtt_bracket."""
+    access_token = _load_access_token(token_store)
+    try:
+        rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
+        validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
+        validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
+        return await SmartOrderService(service).modify_gtt_bracket(
+            access_token,
+            gtt_order_id=order.gtt_order_id,
+            quantity=order.quantity,
+            product=order.product,
+            entry_trigger_type=order.entry_trigger_type,
+            entry_trigger_price=order.entry_trigger_price,
+            target_trigger_price=order.target_trigger_price,
+            stoploss_trigger_price=order.stoploss_trigger_price,
+            trailing_gap=order.trailing_gap,
         )
     except AppConfigError as exc:
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc

@@ -283,6 +283,60 @@ class FakeUpstoxService:
             "echo": order,
         }
 
+    async def get_gtt_orders(self, access_token: str) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "gtt_order_id": "GTT-111",
+                    "instrument_token": "NSE_FO|111",
+                    "quantity": 75,
+                    "product": "I",
+                    "status": "ACTIVE",
+                    "rules": [
+                        {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": 125.5},
+                        {"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 140.0},
+                        {"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 118.0},
+                    ],
+                },
+                {
+                    "gtt_order_id": "GTT-old",
+                    "instrument_token": "NSE_FO|111",
+                    "quantity": 75,
+                    "product": "I",
+                    "status": "CANCELLED",
+                    "rules": [],
+                },
+                {
+                    "gtt_order_id": "GTT-other",
+                    "instrument_token": "NSE_FO|222",
+                    "quantity": 75,
+                    "product": "I",
+                    "status": "ACTIVE",
+                    "rules": [],
+                },
+            ],
+        }
+
+    async def modify_gtt_order(
+        self,
+        access_token: str,
+        order: dict[str, Any],
+    ) -> dict[str, Any]:
+        if order["gtt_order_id"] == "GTT-fail":
+            from app.core.exceptions import UpstoxApiError
+
+            raise UpstoxApiError(
+                "GTT order cannot be modified",
+                status_code=400,
+                upstox_code="UDAPI100041",
+            )
+        return {
+            "status": "success",
+            "data": {"gtt_order_id": order["gtt_order_id"]},
+            "echo": order,
+        }
+
     async def place_market_order(
         self,
         access_token: str,
@@ -1532,6 +1586,111 @@ def test_place_smart_bracket_order_submits_multi_leg_gtt() -> None:
         "transaction_type": "BUY",
     }
     assert payload["slices"][0]["upstox_response"]["data"] == {"gtt_order_ids": ["GTT-123"]}
+
+
+def test_get_gtt_orders_filters_by_instrument_and_active_status() -> None:
+    """Only ACTIVE orders for the requested instrument come back -- CANCELLED and other
+    instruments' orders are excluded (see FakeUpstoxService.get_gtt_orders's fixture)."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/orders/gtt",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [order["gtt_order_id"] for order in payload] == ["GTT-111"]
+
+
+def test_modify_gtt_order_resends_full_rule_set() -> None:
+    """Modifying a GTT bracket rebuilds ENTRY/TARGET/STOPLOSS together, not a partial patch."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.put(
+            "/api/orders/gtt/modify",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "gtt_order_id": "GTT-111",
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 145.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["data"] == {"gtt_order_id": "GTT-111"}
+    assert payload["echo"] == {
+        "gtt_order_id": "GTT-111",
+        "type": "MULTIPLE",
+        "quantity": 75,
+        "product": "I",
+        "rules": [
+            {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": 125.5},
+            {"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 145.0},
+            {"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 115.0},
+        ],
+    }
+
+
+def test_modify_gtt_order_rejects_invalid_tick_size() -> None:
+    """Target/stoploss prices are validated against the instrument's tick size, same as
+    placing a new smart-bracket order."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.put(
+            "/api/orders/gtt/modify",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "gtt_order_id": "GTT-111",
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 145.03,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+
+
+def test_modify_gtt_order_surfaces_upstox_failure() -> None:
+    """Upstox rejecting the modify (e.g. GTT already triggered/cancelled) surfaces as an error,
+    not a silent success."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.put(
+            "/api/orders/gtt/modify",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "gtt_order_id": "GTT-fail",
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 145.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
 
 
 def test_place_smart_bracket_order_slices_large_quantity() -> None:
