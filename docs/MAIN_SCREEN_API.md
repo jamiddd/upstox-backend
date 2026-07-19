@@ -167,6 +167,67 @@ before (15s, not 600s) since this data is live-changing throughout the day, not 
 A strike missing a listed CE or PE contract simply omits that key (e.g. deep ITM/OTM strikes
 sometimes only have one side listed).
 
+## OI Analysis
+
+```http
+GET /api/market/oi-analysis?instrument_key=NSE_INDEX%7CNifty%2050&expiry=current_week&date=2026-07-17&change_interval=1&bucket_interval=60
+```
+
+Returns Upstox's four complementary open-interest analyses in one client request. The backend
+calls `/market/oi`, `/market/change-oi`, `/market/max-pain`, and `/market/pcr` concurrently and
+caches the combined response for 60 seconds. The request fails atomically if any upstream call
+fails or returns a malformed data object, so the client never mistakes partial analysis for a
+complete result.
+
+Query parameters:
+
+- `instrument_key`: underlying asset key; defaults to `NSE_INDEX|Nifty 50`.
+- `expiry`: required expiry date (`YYYY-MM-DD`) or Upstox relative keyword such as
+  `current_week`, `next_week`, or `current_month`.
+- `date`: required analysis date in `YYYY-MM-DD` format.
+- `change_interval`: positive number of days used for Change in OI; defaults to `1`.
+- `bucket_interval`: positive intraday bucket size in minutes used by Max Pain and PCR;
+  defaults to `60`.
+
+```json
+{
+  "instrument_key": "NSE_INDEX|Nifty 50",
+  "expiry": "2026-07-23",
+  "date": "2026-07-17",
+  "change_interval": 1,
+  "bucket_interval": 60,
+  "oi": {
+    "total_puts": 12500000,
+    "total_calls": 9800000,
+    "spot_closing_price": 25050.0,
+    "expiry": "2026-07-23",
+    "call_put_oi_data_list": [
+      {"strike_price": 25000.0, "call_oi": 1250000, "put_oi": 980000}
+    ]
+  },
+  "change_oi": {
+    "total_put_change_oi": 2500000,
+    "total_call_change_oi": -1800000,
+    "call_put_oi_data_list": [
+      {"strike_price": 25000.0, "call_change_oi": -120000, "put_change_oi": 350000}
+    ]
+  },
+  "max_pain": {
+    "max_pain": 25000.0,
+    "insights": [{"max_pain": 25000.0, "spot_price": 25040.0, "time": "15:15"}]
+  },
+  "pcr": {
+    "pcr": 1.2755,
+    "insights": [{"pcr": 1.27, "spot_price": 25040.0, "time": "15:15"}]
+  }
+}
+```
+
+PCR's headline value can be derived from total put/call OI, and current max pain can be
+calculated from the strike series. Their dedicated Upstox APIs are still used because they also
+provide intraday insight history; Change in OI likewise requires a comparison snapshot that is
+not present in a single OI response.
+
 ## Position Quotes
 
 ```http
@@ -319,6 +380,7 @@ selected/position quote data: ~0.75 seconds
 positions: ~1 second
 summary: ~5 seconds
 option contracts/expiries: ~10 minutes
+OI analysis: ~60 seconds
 underlying-signals candle-derived values (EMAs/ATR/opening range/pivots): ~60 seconds
 ```
 

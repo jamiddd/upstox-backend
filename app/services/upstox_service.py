@@ -261,6 +261,84 @@ class UpstoxService:
             params={"instrument_key": instrument_key, "expiry_date": expiry_date},
         )
 
+    async def get_oi(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        expiry: str,
+        date: str,
+    ) -> dict[str, Any]:
+        """Fetch aggregate and per-strike call/put open interest for a dated expiry."""
+        return await self._get_json(
+            "/market/oi",
+            access_token,
+            params={"instrument_key": instrument_key, "expiry": expiry, "date": date},
+        )
+
+    async def get_change_oi(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        expiry: str,
+        date: str,
+        interval: int,
+    ) -> dict[str, Any]:
+        """Fetch per-strike OI changes over the requested number of days."""
+        return await self._get_json(
+            "/market/change-oi",
+            access_token,
+            params={
+                "instrument_key": instrument_key,
+                "expiry": expiry,
+                "date": date,
+                "interval": str(interval),
+            },
+        )
+
+    async def get_max_pain(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        expiry: str,
+        date: str,
+        bucket_interval: int,
+    ) -> dict[str, Any]:
+        """Fetch max pain plus its intraday history at the requested minute interval."""
+        return await self._get_json(
+            "/market/max-pain",
+            access_token,
+            params={
+                "instrument_key": instrument_key,
+                "expiry": expiry,
+                "date": date,
+                "bucket_interval": str(bucket_interval),
+            },
+        )
+
+    async def get_pcr(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        expiry: str,
+        date: str,
+        bucket_interval: int,
+    ) -> dict[str, Any]:
+        """Fetch put-call ratio plus its intraday history at the requested minute interval."""
+        return await self._get_json(
+            "/market/pcr",
+            access_token,
+            params={
+                "instrument_key": instrument_key,
+                "expiry": expiry,
+                "date": date,
+                "bucket_interval": str(bucket_interval),
+            },
+        )
+
     async def get_historical_candle(
         self,
         access_token: str,

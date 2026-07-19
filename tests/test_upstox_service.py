@@ -470,3 +470,67 @@ def test_get_intraday_candle_uses_v3_intraday_path() -> None:
 
     payload = anyio.run(run)
     assert payload == {"status": "success", "data": {"candles": []}}
+
+
+def test_oi_analysis_methods_build_v2_paths_and_query_parameters() -> None:
+    """All four OI-analysis wrappers preserve Upstox's distinct parameter contracts."""
+    expected_params = {
+        "/v2/market/oi": {
+            "instrument_key": "NSE_INDEX|Nifty 50",
+            "expiry": "current_week",
+            "date": "2026-07-17",
+        },
+        "/v2/market/change-oi": {
+            "instrument_key": "NSE_INDEX|Nifty 50",
+            "expiry": "current_week",
+            "date": "2026-07-17",
+            "interval": "2",
+        },
+        "/v2/market/max-pain": {
+            "instrument_key": "NSE_INDEX|Nifty 50",
+            "expiry": "current_week",
+            "date": "2026-07-17",
+            "bucket_interval": "30",
+        },
+        "/v2/market/pcr": {
+            "instrument_key": "NSE_INDEX|Nifty 50",
+            "expiry": "current_week",
+            "date": "2026-07-17",
+            "bucket_interval": "30",
+        },
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert dict(request.url.params) == expected_params[request.url.path]
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(200, json={"status": "success", "data": {}})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            common = {
+                "expiry": "current_week",
+                "date": "2026-07-17",
+            }
+            await service.get_oi("upstox-token", "NSE_INDEX|Nifty 50", **common)
+            await service.get_change_oi(
+                "upstox-token",
+                "NSE_INDEX|Nifty 50",
+                interval=2,
+                **common,
+            )
+            await service.get_max_pain(
+                "upstox-token",
+                "NSE_INDEX|Nifty 50",
+                bucket_interval=30,
+                **common,
+            )
+            await service.get_pcr(
+                "upstox-token",
+                "NSE_INDEX|Nifty 50",
+                bucket_interval=30,
+                **common,
+            )
+
+    anyio.run(run)

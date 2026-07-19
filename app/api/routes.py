@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import logging
 from typing import Any, Literal, Optional
 
@@ -26,6 +27,7 @@ from app.services.instrument_rules_service import (
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 from app.services.order_history_service import OrderHistoryService
 from app.services.order_modification_service import OrderModificationService
+from app.services.oi_analysis_service import OIAnalysisService
 from app.services.search_screen_service import SearchScreenService
 from app.services.smart_order_service import SmartOrderService
 from app.services.underlying_signals_service import UnderlyingSignalsService
@@ -170,6 +172,31 @@ async def get_quotes(
     access_token = _load_access_token(token_store)
     try:
         return await service.get_quotes(access_token, instrument_key)
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/market/oi-analysis")
+async def get_oi_analysis(
+    expiry: str = Query(min_length=1),
+    analysis_date: date = Query(alias="date"),
+    instrument_key: str = DEFAULT_UNDERLYING_KEY,
+    change_interval: int = Query(default=1, gt=0),
+    bucket_interval: int = Query(default=60, gt=0),
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return OI, change in OI, max pain, and PCR analysis in one response."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await OIAnalysisService(service).get_analysis(
+            access_token,
+            instrument_key=instrument_key,
+            expiry=expiry,
+            date=analysis_date.isoformat(),
+            change_interval=change_interval,
+            bucket_interval=bucket_interval,
+        )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

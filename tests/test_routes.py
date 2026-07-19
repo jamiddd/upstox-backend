@@ -12,6 +12,7 @@ from app.main import app
 from app.services import instrument_rules_service
 from app.services.instrument_rules_service import _MasterCache
 from app.services.main_screen_service import _CACHE
+from app.services import oi_analysis_service
 from app.services.search_screen_service import _SEARCH_CACHE
 from app.services import underlying_signals_service
 
@@ -447,6 +448,26 @@ class FakeUpstoxService:
             ],
         }
 
+    async def get_oi(self, access_token, instrument_key, *, expiry, date):
+        return {
+            "status": "success",
+            "data": {
+                "expiry": "2026-07-23",
+                "total_puts": 12500000,
+                "total_calls": 9800000,
+                "call_put_oi_data_list": [],
+            },
+        }
+
+    async def get_change_oi(self, access_token, instrument_key, *, expiry, date, interval):
+        return {"status": "success", "data": {"total_put_change_oi": 2500000}}
+
+    async def get_max_pain(self, access_token, instrument_key, *, expiry, date, bucket_interval):
+        return {"status": "success", "data": {"max_pain": 25000.0, "insights": []}}
+
+    async def get_pcr(self, access_token, instrument_key, *, expiry, date, bucket_interval):
+        return {"status": "success", "data": {"pcr": 1.2755, "insights": []}}
+
     async def get_historical_candle(
         self,
         access_token: str,
@@ -653,6 +674,7 @@ def _settings() -> Settings:
 def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     _CACHE.clear()
     _SEARCH_CACHE.clear()
+    oi_analysis_service._CACHE = {}
     underlying_signals_service._CACHE = {}
     instrument_rules_service._CACHE = _MasterCache(
         expires_at=9999999999,
@@ -968,6 +990,38 @@ def test_main_option_chain_returns_live_market_data_and_greeks_per_strike() -> N
                 "pe": None,
             },
         ],
+    }
+
+
+def test_market_oi_analysis_returns_all_four_analysis_sections() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/market/oi-analysis"
+            "?expiry=current_week&date=2026-07-17"
+            "&instrument_key=NSE_INDEX%7CNifty%2050"
+            "&change_interval=2&bucket_interval=30",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "instrument_key": "NSE_INDEX|Nifty 50",
+        "expiry": "2026-07-23",
+        "date": "2026-07-17",
+        "change_interval": 2,
+        "bucket_interval": 30,
+        "oi": {
+            "expiry": "2026-07-23",
+            "total_puts": 12500000,
+            "total_calls": 9800000,
+            "call_put_oi_data_list": [],
+        },
+        "change_oi": {"total_put_change_oi": 2500000},
+        "max_pain": {"max_pain": 25000.0, "insights": []},
+        "pcr": {"pcr": 1.2755, "insights": []},
     }
 
 
