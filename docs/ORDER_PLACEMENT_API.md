@@ -163,6 +163,67 @@ Response (raw passthrough of the matching Upstox GTT order entries):
 ]
 ```
 
+## Attach GTT Exits
+
+```http
+POST /api/orders/gtt/attach-exits
+```
+
+Attaches a target and a stoploss to an already-open position that has **no existing GTT
+bracket** (`GET /api/orders/gtt` above returned nothing usable). Unlike Smart Bracket Order,
+this never submits a new entry: it places two independent Upstox GTT `type=SINGLE` orders
+(one rule each -- `TARGET` and `STOPLOSS`), so it cannot accidentally re-enter and double the
+position the way reusing the `MULTIPLE`+`IMMEDIATE`-entry shape would.
+
+`exit_transaction_type` is the *exit* side, i.e. the opposite of how the position was opened
+(`"SELL"` to attach exits to a long position, `"BUY"` for a short) -- required because a
+`SINGLE`-type order has no `ENTRY` leg to infer direction from.
+
+Request:
+
+```json
+{
+  "instrument_key": "NSE_FO|111",
+  "quantity": 75,
+  "product": "I",
+  "exit_transaction_type": "SELL",
+  "target_trigger_price": 140.0,
+  "stoploss_trigger_price": 115.0
+}
+```
+
+Fields:
+
+```text
+instrument_key required
+quantity required, positive integer, validated against the instrument's lot_size
+product optional, I|D|MTF, default I
+exit_transaction_type required, BUY|SELL
+target_trigger_price required, positive number, validated against tick_size
+stoploss_trigger_price required, positive number, validated against tick_size
+```
+
+The two legs are placed independently, so one failing doesn't stop the other. Response:
+
+```json
+{
+  "status": "partial_success",
+  "target": {
+    "status": "success",
+    "submitted_order": {},
+    "upstox_response": {}
+  },
+  "stoploss": {
+    "status": "error",
+    "submitted_order": {},
+    "error": "GTT order cannot be placed"
+  }
+}
+```
+
+Top-level `status` is `success` (both legs placed), `partial_success` (one placed), or `error`
+(neither placed).
+
 ## Modify GTT Order
 
 ```http

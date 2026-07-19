@@ -275,6 +275,17 @@ class FakeUpstoxService:
         access_token: str,
         order: dict[str, Any],
     ) -> dict[str, Any]:
+        # Sentinel trigger price used by attach-exits tests to simulate one leg's placement
+        # failing (the STOPLOSS rule specifically) without disturbing every other
+        # place_gtt_order caller.
+        if order["rules"][0]["strategy"] == "STOPLOSS" and order["rules"][0]["trigger_price"] == 105.0:
+            from app.core.exceptions import UpstoxApiError
+
+            raise UpstoxApiError(
+                "GTT order cannot be placed",
+                status_code=400,
+                upstox_code="UDAPI100041",
+            )
         return {
             "status": "success",
             "data": {
@@ -1684,6 +1695,95 @@ def test_modify_gtt_order_surfaces_upstox_failure() -> None:
                 "entry_trigger_type": "IMMEDIATE",
                 "entry_trigger_price": 125.5,
                 "target_trigger_price": 145.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+
+
+def test_attach_gtt_exits_places_two_single_leg_orders() -> None:
+    """Attaching exits to a position with no existing bracket places independent SINGLE-type
+    target and stoploss orders -- neither includes an ENTRY rule, so nothing re-enters."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/gtt/attach-exits",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "exit_transaction_type": "SELL",
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["target"]["submitted_order"] == {
+        "type": "SINGLE",
+        "quantity": 75,
+        "product": "I",
+        "rules": [{"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 140.0}],
+        "instrument_token": "NSE_FO|111",
+        "transaction_type": "SELL",
+    }
+    assert payload["stoploss"]["submitted_order"] == {
+        "type": "SINGLE",
+        "quantity": 75,
+        "product": "I",
+        "rules": [{"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 115.0}],
+        "instrument_token": "NSE_FO|111",
+        "transaction_type": "SELL",
+    }
+
+
+def test_attach_gtt_exits_reports_partial_success_when_one_leg_fails() -> None:
+    """One leg failing doesn't stop the other -- see FakeUpstoxService.place_gtt_order's
+    STOPLOSS-at-105.0 sentinel."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/gtt/attach-exits",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "exit_transaction_type": "SELL",
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 105.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "partial_success"
+    assert payload["target"]["status"] == "success"
+    assert payload["stoploss"]["status"] == "error"
+
+
+def test_attach_gtt_exits_rejects_invalid_tick_size() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/gtt/attach-exits",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "exit_transaction_type": "SELL",
+                "target_trigger_price": 140.03,
                 "stoploss_trigger_price": 115.0,
             },
         )

@@ -73,6 +73,19 @@ class ModifyGttOrderRequest(BaseModel):
     trailing_gap: Optional[float] = Field(default=None, gt=0)
 
 
+class AttachGttExitsRequest(BaseModel):
+    """Attaches a target and a stoploss to an already-open position with no existing GTT bracket,
+    without re-entering. See SmartOrderService.attach_gtt_exits.
+    """
+
+    instrument_key: str = Field(min_length=1)
+    quantity: int = Field(gt=0)
+    product: Literal["I", "D", "MTF"] = "I"
+    exit_transaction_type: Literal["BUY", "SELL"]
+    target_trigger_price: float = Field(gt=0)
+    stoploss_trigger_price: float = Field(gt=0)
+
+
 class ModifyOrderRequest(BaseModel):
     """Fields accepted by the Upstox V3 modify-order endpoint."""
 
@@ -562,6 +575,37 @@ async def modify_gtt_order(
             target_trigger_price=order.target_trigger_price,
             stoploss_trigger_price=order.stoploss_trigger_price,
             trailing_gap=order.trailing_gap,
+        )
+    except AppConfigError as exc:
+        raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.post("/orders/gtt/attach-exits")
+async def attach_gtt_exits(
+    order: AttachGttExitsRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Attaches a target/stoploss to a position with no existing GTT bracket. See
+    SmartOrderService.attach_gtt_exits.
+    """
+    access_token = _load_access_token(token_store)
+    try:
+        rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
+        validate_quantity(order.quantity, rules)
+        validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
+        validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
+        return await SmartOrderService(service).attach_gtt_exits(
+            access_token,
+            instrument_key=order.instrument_key,
+            quantity=order.quantity,
+            product=order.product,
+            exit_transaction_type=order.exit_transaction_type,
+            target_trigger_price=order.target_trigger_price,
+            stoploss_trigger_price=order.stoploss_trigger_price,
         )
     except AppConfigError as exc:
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc

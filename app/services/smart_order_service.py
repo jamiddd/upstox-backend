@@ -79,6 +79,70 @@ class SmartOrderService:
             "slices": placed_slices,
         }
 
+    async def attach_gtt_exits(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        quantity: int,
+        product: str,
+        exit_transaction_type: str,
+        target_trigger_price: float,
+        stoploss_trigger_price: float,
+    ) -> dict[str, Any]:
+        """Attaches a target and a stoploss to an already-open position that has no existing GTT
+        bracket, without touching the entry. Places two independent Upstox GTT type=SINGLE orders
+        (one rule each) rather than reusing place_bracket_order's type=MULTIPLE shape -- MULTIPLE
+        always includes its own ENTRY rule (entry_trigger_type IMMEDIATE fires right away), which
+        would submit a second live entry and double the position. [exit_transaction_type] is the
+        *exit* side (opposite of how the position was opened -- e.g. "SELL" to exit a long), since
+        a SINGLE-type order has no ENTRY leg to infer direction from.
+
+        Best-effort like exit_all_positions: the two legs are independent orders, so one failing
+        doesn't stop the other. Returns "success" (both placed), "partial_success" (one placed),
+        or "error" (neither placed).
+        """
+        results: dict[str, dict[str, Any]] = {}
+        for key, strategy, trigger_price in (
+            ("target", "TARGET", target_trigger_price),
+            ("stoploss", "STOPLOSS", stoploss_trigger_price),
+        ):
+            order = {
+                "type": "SINGLE",
+                "quantity": quantity,
+                "product": product,
+                "rules": [
+                    {
+                        "strategy": strategy,
+                        "trigger_type": "IMMEDIATE",
+                        "trigger_price": trigger_price,
+                    }
+                ],
+                "instrument_token": instrument_key,
+                "transaction_type": exit_transaction_type,
+            }
+            try:
+                response = await self.upstox.place_gtt_order(access_token, order)
+                results[key] = {
+                    "status": "success",
+                    "submitted_order": order,
+                    "upstox_response": response,
+                }
+            except UpstoxApiError as exc:
+                results[key] = {
+                    "status": "error",
+                    "submitted_order": order,
+                    "error": str(exc),
+                }
+
+        successes = sum(1 for result in results.values() if result["status"] == "success")
+        overall_status = "success" if successes == 2 else "partial_success" if successes == 1 else "error"
+        return {
+            "status": overall_status,
+            "target": results["target"],
+            "stoploss": results["stoploss"],
+        }
+
     async def get_gtt_orders_for_instrument(
         self, access_token: str, *, instrument_key: str
     ) -> list[dict[str, Any]]:
