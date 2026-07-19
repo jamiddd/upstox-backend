@@ -22,6 +22,9 @@ https://api.scalp8.xyz/api/auth/callback
   - `MOBILE_API_KEY`
   - `TOKEN_ENCRYPTION_KEY`
   - `TOKEN_STORE_PATH=/data/upstox_token.enc`
+  - `MOBILE_APP_REDIRECT_URL` -- only needs setting if the Android app's intent-filter scheme
+    ever changes; defaults to `personalscalper://auth/callback`, which must match `MainActivity`'s
+    intent-filter in the app repo exactly.
 
 Generate keys:
 

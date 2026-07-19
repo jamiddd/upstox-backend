@@ -33,6 +33,13 @@ class Settings:
     upstox_instrument_master_url: str = (
         "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
     )
+    # Where /auth/callback sends the in-app browser after a successful Upstox login, so it closes
+    # and hands control straight back to the app instead of leaving the user staring at a raw
+    # JSON response -- see MainActivity's matching intent-filter (scheme "personalscalper", host
+    # "auth", path "/callback") in the Android app repo. A custom URI scheme, not a real https
+    # URL -- Android resolves it straight to the app via Chrome Custom Tabs' normal redirect
+    # handling, no App Links/asset-links.json verification needed.
+    mobile_app_redirect_url: str = "personalscalper://auth/callback"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -65,6 +72,10 @@ class Settings:
             upstox_instrument_master_url=os.getenv(
                 "UPSTOX_INSTRUMENT_MASTER_URL",
                 "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz",
+            ),
+            mobile_app_redirect_url=os.getenv(
+                "MOBILE_APP_REDIRECT_URL",
+                "personalscalper://auth/callback",
             ),
         )
 

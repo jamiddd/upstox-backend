@@ -740,19 +740,24 @@ def test_auth_status_reports_no_token_as_unauthenticated() -> None:
     assert response.json() == {"authenticated": False}
 
 
-def test_auth_callback_saves_token() -> None:
-    """Exchange the auth code and save the token payload."""
+def test_auth_callback_saves_token_and_redirects_to_the_mobile_app() -> None:
+    """Exchange the auth code, save the token payload, and hand the in-app browser back to the
+    app via its own custom-scheme URL -- see auth_callback's doc comment for why this replaced a
+    bare JSON response (nothing used to tell the Chrome Custom Tab to close).
+
+    follow_redirects=False is required here -- httpx's TestClient (which normally follows
+    redirects automatically) doesn't recognize the "personalscalper://" scheme and raises trying
+    to, since it's not a real network scheme it knows how to route.
+    """
     token_store = FakeTokenStore(token=None)
     client = _client(token_store)
     try:
-        response = client.get(
-            "/api/auth/callback?code=abc",
-        )
+        response = client.get("/api/auth/callback?code=abc", follow_redirects=False)
     finally:
         app.dependency_overrides.clear()
 
-    assert response.status_code == 200
-    assert response.json() == {"status": "authenticated"}
+    assert response.status_code == 307
+    assert response.headers["location"] == "personalscalper://auth/callback?status=success"
     assert token_store.saved == {"access_token": "token-for-abc"}
 
 
@@ -761,11 +766,11 @@ def test_auth_callback_does_not_require_mobile_api_key() -> None:
     token_store = FakeTokenStore(token=None)
     client = _client(token_store)
     try:
-        response = client.get("/api/auth/callback?code=redirect-code")
+        response = client.get("/api/auth/callback?code=redirect-code", follow_redirects=False)
     finally:
         app.dependency_overrides.clear()
 
-    assert response.status_code == 200
+    assert response.status_code == 307
     assert token_store.saved == {"access_token": "token-for-redirect-code"}
 
 

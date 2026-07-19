@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import date
 import logging
 from typing import Any, Literal, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_token_store, get_upstox_service
@@ -96,16 +98,28 @@ async def auth_callback(
     code: str,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
-) -> dict[str, str]:
-    """Exchange the Upstox OAuth code and persist the encrypted token."""
+    settings: Settings = Depends(get_settings),
+) -> RedirectResponse:
+    """Exchange the Upstox OAuth code, persist the encrypted token, then redirect the in-app
+    browser to the mobile app's own custom-scheme URL (settings.mobile_app_redirect_url).
+
+    FIX: this used to return a bare `{"status": "authenticated"}` JSON body, which just sat there
+    rendered as raw text in the Chrome Custom Tab the app opened for login -- nothing ever told
+    that tab to close, so the user was stuck manually swiping it away and then had to remember to
+    tap "check connection" themselves. Redirecting to a URL in the app's own registered scheme
+    makes Android hand the tab off to the app directly (closing the tab as part of that handoff,
+    same mechanism every other app's in-browser OAuth flow relies on) -- see
+    `ConnectViewModel`/`MainActivity`'s matching intent-filter in the Android app repo, which
+    reacts to this by re-checking connection status automatically.
+    """
     try:
         token_payload = await service.exchange_code_for_token(code)
         token_store.save(token_payload)
     except (AppConfigError, TokenStoreError) as exc:
-        raise _http_error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
+        return RedirectResponse(f"{settings.mobile_app_redirect_url}?status=error&message={quote(str(exc))}")
     except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
-    return {"status": "authenticated"}
+        return RedirectResponse(f"{settings.mobile_app_redirect_url}?status=error&message={quote(exc.message)}")
+    return RedirectResponse(f"{settings.mobile_app_redirect_url}?status=success")
 
 
 @protected_router.get("/auth/status")
