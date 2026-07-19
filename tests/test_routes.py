@@ -1727,7 +1727,11 @@ def test_attach_gtt_exits_places_two_single_leg_orders() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "success"
-    assert payload["target"]["submitted_order"] == {
+    assert payload["total_quantity"] == 75
+    assert payload["slice_count"] == 1
+    slice_0 = payload["slices"][0]
+    assert slice_0["quantity"] == 75
+    assert slice_0["target"]["submitted_order"] == {
         "type": "SINGLE",
         "quantity": 75,
         "product": "I",
@@ -1735,7 +1739,7 @@ def test_attach_gtt_exits_places_two_single_leg_orders() -> None:
         "instrument_token": "NSE_FO|111",
         "transaction_type": "SELL",
     }
-    assert payload["stoploss"]["submitted_order"] == {
+    assert slice_0["stoploss"]["submitted_order"] == {
         "type": "SINGLE",
         "quantity": 75,
         "product": "I",
@@ -1768,8 +1772,41 @@ def test_attach_gtt_exits_reports_partial_success_when_one_leg_fails() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "partial_success"
-    assert payload["target"]["status"] == "success"
-    assert payload["stoploss"]["status"] == "error"
+    slice_0 = payload["slices"][0]
+    assert slice_0["target"]["status"] == "success"
+    assert slice_0["stoploss"]["status"] == "error"
+
+
+def test_attach_gtt_exits_slices_large_quantity() -> None:
+    """A quantity over the instrument's freeze quantity (1800 for NSE_FO|111) is sliced into
+    multiple target/stoploss order pairs, same as smart-bracket's own entry slicing."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/gtt/attach-exits",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "quantity": 3750,
+                "product": "I",
+                "exit_transaction_type": "SELL",
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["total_quantity"] == 3750
+    assert payload["slice_quantity"] == 1800
+    assert payload["slice_count"] == 3
+    assert [item["quantity"] for item in payload["slices"]] == [1800, 1800, 150]
+    for item in payload["slices"]:
+        assert item["target"]["status"] == "success"
+        assert item["stoploss"]["status"] == "success"
 
 
 def test_attach_gtt_exits_rejects_invalid_tick_size() -> None:
@@ -1826,6 +1863,34 @@ def test_place_smart_bracket_order_slices_large_quantity() -> None:
         1800,
         150,
     ]
+
+
+def _set_exit_positions_instrument_rules_cache() -> None:
+    """exit_positions/exit_all_positions now look up freeze quantity per position -- these tests
+    build their own TestClient manually (not via _client()) so they need their own instrument
+    rules cache seeded, covering both instruments _ExitAllFakeUpstoxService's fixture returns.
+    NSE_FO|222's freeze quantity (5000) is well above its 150-quantity position so it never slices,
+    keeping these tests' existing single-order assertions valid.
+    """
+    instrument_rules_service._CACHE = _MasterCache(
+        expires_at=9999999999,
+        by_key={
+            "NSE_FO|111": {
+                "instrument_key": "NSE_FO|111",
+                "lot_size": 75,
+                "freeze_quantity": 1800,
+                "tick_size": 5.0,
+                "trading_symbol": "NIFTY26JUL25000CE",
+            },
+            "NSE_FO|222": {
+                "instrument_key": "NSE_FO|222",
+                "lot_size": 150,
+                "freeze_quantity": 5000,
+                "tick_size": 5.0,
+                "trading_symbol": "NIFTY26JUL25000PE",
+            },
+        },
+    )
 
 
 class _ExitAllFakeUpstoxService(FakeUpstoxService):
@@ -1886,6 +1951,7 @@ class _ExitAllFakeUpstoxService(FakeUpstoxService):
 def test_exit_all_positions_flattens_every_open_position() -> None:
     """SELLs a long, BUYs a short (opposite-signed exit), skips the already-closed position, and
     keeps going after one instrument's exit order fails."""
+    _set_exit_positions_instrument_rules_cache()
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
@@ -1909,6 +1975,7 @@ def test_exit_all_positions_flattens_every_open_position() -> None:
 
 def test_exit_positions_closes_every_open_position_when_unfiltered() -> None:
     """Omitting instrument_keys behaves identically to /orders/exit-all."""
+    _set_exit_positions_instrument_rules_cache()
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
@@ -1932,6 +1999,7 @@ def test_exit_positions_closes_every_open_position_when_unfiltered() -> None:
 def test_exit_positions_closes_only_the_requested_subset() -> None:
     """A given instrument_keys list scopes exit-positions to just those positions -- backs the
     app's "close only positive/negative positions" menu, which computes the subset client-side."""
+    _set_exit_positions_instrument_rules_cache()
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
@@ -1950,6 +2018,90 @@ def test_exit_positions_closes_only_the_requested_subset() -> None:
     assert payload["positions_found"] == 1
     assert payload["results"][0]["instrument_key"] == "NSE_FO|111"
     assert payload["results"][0]["status"] == "success"
+
+
+class _LargePositionFakeUpstoxService(FakeUpstoxService):
+    """One position sized over NSE_FO|111's freeze quantity (1800) -- to verify exit_positions
+    slices its flattening order instead of submitting a single oversized one."""
+
+    def __init__(self) -> None:
+        self.place_market_order_calls: list[dict[str, Any]] = []
+        self.fail_on_call_number: Optional[int] = None
+
+    async def get_positions(self, access_token: str) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "instrument_token": "NSE_FO|111",
+                    "trading_symbol": "NIFTY26JUL25000CE",
+                    "quantity": 3750,
+                    "product": "I",
+                    "average_price": 120.0,
+                    "last_price": 125.0,
+                    "pnl": 375.0,
+                },
+            ],
+        }
+
+    async def place_market_order(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        transaction_type: str,
+        quantity: int,
+        product: str,
+    ) -> dict[str, Any]:
+        self.place_market_order_calls.append({"instrument_key": instrument_key, "quantity": quantity})
+        if self.fail_on_call_number == len(self.place_market_order_calls):
+            from app.core.exceptions import UpstoxApiError
+
+            raise UpstoxApiError("Order rejected", status_code=400, upstox_code="UDAPI100041")
+        return {"status": "success", "data": {"order_ids": [f"MKT-{instrument_key}"]}}
+
+
+def test_exit_positions_slices_a_position_over_freeze_quantity() -> None:
+    """A 3750-quantity position on NSE_FO|111 (freeze quantity 1800) is flattened via three
+    separate market orders (1800/1800/150), not one oversized one Upstox would reject."""
+    _set_exit_positions_instrument_rules_cache()
+    fake_service = _LargePositionFakeUpstoxService()
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = lambda: fake_service
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["results"][0]["status"] == "success"
+    assert payload["results"][0]["quantity"] == 3750
+    assert [call["quantity"] for call in fake_service.place_market_order_calls] == [1800, 1800, 150]
+
+
+def test_exit_positions_reports_error_when_a_slice_fails_partway() -> None:
+    """A slice failing partway through a position's flatten is reported as that position's own
+    error -- a half-flattened position isn't actually safe, so it must not read as "success"."""
+    _set_exit_positions_instrument_rules_cache()
+    fake_service = _LargePositionFakeUpstoxService()
+    fake_service.fail_on_call_number = 2
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = lambda: fake_service
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["results"][0]["status"] == "error"
+    # The first slice was already submitted before the second one failed.
+    assert len(fake_service.place_market_order_calls) == 2
 
 
 def test_modify_orders_accepts_more_than_upstream_multi_order_limit() -> None:

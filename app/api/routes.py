@@ -92,6 +92,9 @@ class AttachGttExitsRequest(BaseModel):
     exit_transaction_type: Literal["BUY", "SELL"]
     target_trigger_price: float = Field(gt=0)
     stoploss_trigger_price: float = Field(gt=0)
+    # Overrides the instrument's freeze-quantity-based auto-slicing when set -- same convention
+    # as SmartBracketOrderRequest.slice_quantity.
+    slice_quantity: Optional[int] = Field(default=None, gt=0)
 
 
 class ModifyOrderRequest(BaseModel):
@@ -606,6 +609,7 @@ async def attach_gtt_exits(
         validate_quantity(order.quantity, rules)
         validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
         validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
+        slice_quantity = order.slice_quantity or slice_quantity_for_freeze(order.quantity, rules)
         return await SmartOrderService(service).attach_gtt_exits(
             access_token,
             instrument_key=order.instrument_key,
@@ -614,6 +618,7 @@ async def attach_gtt_exits(
             exit_transaction_type=order.exit_transaction_type,
             target_trigger_price=order.target_trigger_price,
             stoploss_trigger_price=order.stoploss_trigger_price,
+            slice_quantity=slice_quantity,
         )
     except AppConfigError as exc:
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -625,13 +630,16 @@ async def attach_gtt_exits(
 async def exit_all_positions(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
     """Flattens every currently open position with an immediate market order -- backs the app's
     max-loss auto square-off. See SmartOrderService.exit_all_positions.
     """
     access_token = _load_access_token(token_store)
     try:
-        return await SmartOrderService(service).exit_all_positions(access_token)
+        return await SmartOrderService(service).exit_all_positions(
+            access_token, instrument_rules_service=InstrumentRulesService(settings)
+        )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 
@@ -641,6 +649,7 @@ async def exit_positions(
     request: ExitPositionsRequest,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
     """Flattens open positions with an immediate market order, optionally scoped to
     [ExitPositionsRequest.instrument_keys] (e.g. "close only profitable positions", computed
@@ -649,7 +658,9 @@ async def exit_positions(
     access_token = _load_access_token(token_store)
     try:
         return await SmartOrderService(service).exit_positions(
-            access_token, instrument_keys=request.instrument_keys
+            access_token,
+            instrument_keys=request.instrument_keys,
+            instrument_rules_service=InstrumentRulesService(settings),
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from app.core.exceptions import UpstoxApiError
+from app.core.exceptions import AppConfigError, UpstoxApiError
+from app.services.instrument_rules_service import InstrumentRulesService, slice_quantity_for_freeze
 from app.services.upstox_service import UpstoxService
 
 
@@ -89,58 +90,81 @@ class SmartOrderService:
         exit_transaction_type: str,
         target_trigger_price: float,
         stoploss_trigger_price: float,
+        slice_quantity: int,
     ) -> dict[str, Any]:
         """Attaches a target and a stoploss to an already-open position that has no existing GTT
         bracket, without touching the entry. Places two independent Upstox GTT type=SINGLE orders
-        (one rule each) rather than reusing place_bracket_order's type=MULTIPLE shape -- MULTIPLE
-        always includes its own ENTRY rule (entry_trigger_type IMMEDIATE fires right away), which
-        would submit a second live entry and double the position. [exit_transaction_type] is the
-        *exit* side (opposite of how the position was opened -- e.g. "SELL" to exit a long), since
-        a SINGLE-type order has no ENTRY leg to infer direction from.
+        per slice (one rule each) rather than reusing place_bracket_order's type=MULTIPLE shape --
+        MULTIPLE always includes its own ENTRY rule (entry_trigger_type IMMEDIATE fires right
+        away), which would submit a second live entry and double the position.
+        [exit_transaction_type] is the *exit* side (opposite of how the position was opened --
+        e.g. "SELL" to exit a long), since a SINGLE-type order has no ENTRY leg to infer direction
+        from. [quantity] is sliced by [slice_quantity] the same way place_bracket_order slices its
+        own entry -- a position sized over the instrument's freeze quantity would otherwise have
+        both legs rejected outright by Upstox.
 
-        Best-effort like exit_all_positions: the two legs are independent orders, so one failing
-        doesn't stop the other. Returns "success" (both placed), "partial_success" (one placed),
-        or "error" (neither placed).
+        Best-effort per leg per slice, same as exit_positions: one leg/slice failing doesn't stop
+        the rest. Returns "success" (every leg of every slice placed), "partial_success" (some
+        placed), or "error" (none placed).
         """
-        results: dict[str, dict[str, Any]] = {}
-        for key, strategy, trigger_price in (
-            ("target", "TARGET", target_trigger_price),
-            ("stoploss", "STOPLOSS", stoploss_trigger_price),
-        ):
-            order = {
-                "type": "SINGLE",
-                "quantity": quantity,
-                "product": product,
-                "rules": [
-                    {
-                        "strategy": strategy,
-                        "trigger_type": "IMMEDIATE",
-                        "trigger_price": trigger_price,
+        slices = _split_quantity(quantity, slice_quantity)
+        placed_slices: list[dict[str, Any]] = []
+        for index, slice_qty in enumerate(slices, start=1):
+            leg_results: dict[str, dict[str, Any]] = {}
+            for key, strategy, trigger_price in (
+                ("target", "TARGET", target_trigger_price),
+                ("stoploss", "STOPLOSS", stoploss_trigger_price),
+            ):
+                order = {
+                    "type": "SINGLE",
+                    "quantity": slice_qty,
+                    "product": product,
+                    "rules": [
+                        {
+                            "strategy": strategy,
+                            "trigger_type": "IMMEDIATE",
+                            "trigger_price": trigger_price,
+                        }
+                    ],
+                    "instrument_token": instrument_key,
+                    "transaction_type": exit_transaction_type,
+                }
+                try:
+                    response = await self.upstox.place_gtt_order(access_token, order)
+                    leg_results[key] = {
+                        "status": "success",
+                        "submitted_order": order,
+                        "upstox_response": response,
                     }
-                ],
-                "instrument_token": instrument_key,
-                "transaction_type": exit_transaction_type,
-            }
-            try:
-                response = await self.upstox.place_gtt_order(access_token, order)
-                results[key] = {
-                    "status": "success",
-                    "submitted_order": order,
-                    "upstox_response": response,
+                except UpstoxApiError as exc:
+                    leg_results[key] = {
+                        "status": "error",
+                        "submitted_order": order,
+                        "error": str(exc),
+                    }
+            placed_slices.append(
+                {
+                    "slice_number": index,
+                    "quantity": slice_qty,
+                    "target": leg_results["target"],
+                    "stoploss": leg_results["stoploss"],
                 }
-            except UpstoxApiError as exc:
-                results[key] = {
-                    "status": "error",
-                    "submitted_order": order,
-                    "error": str(exc),
-                }
+            )
 
-        successes = sum(1 for result in results.values() if result["status"] == "success")
-        overall_status = "success" if successes == 2 else "partial_success" if successes == 1 else "error"
+        successes = sum(
+            1
+            for slice_result in placed_slices
+            for leg in ("target", "stoploss")
+            if slice_result[leg]["status"] == "success"
+        )
+        total_legs = len(placed_slices) * 2
+        overall_status = "success" if successes == total_legs else "partial_success" if successes else "error"
         return {
             "status": overall_status,
-            "target": results["target"],
-            "stoploss": results["stoploss"],
+            "total_quantity": quantity,
+            "slice_quantity": slice_quantity,
+            "slice_count": len(slices),
+            "slices": placed_slices,
         }
 
     async def get_gtt_orders_for_instrument(
@@ -195,14 +219,20 @@ class SmartOrderService:
         }
         return await self.upstox.modify_gtt_order(access_token, upstox_order)
 
-    async def exit_all_positions(self, access_token: str) -> dict[str, Any]:
+    async def exit_all_positions(
+        self, access_token: str, *, instrument_rules_service: InstrumentRulesService
+    ) -> dict[str, Any]:
         """Flattens every currently open position -- backs the app's max-loss auto square-off
         (see MainViewModel.watchMaxLoss). Thin wrapper over exit_positions with no filter.
         """
-        return await self.exit_positions(access_token)
+        return await self.exit_positions(access_token, instrument_rules_service=instrument_rules_service)
 
     async def exit_positions(
-        self, access_token: str, *, instrument_keys: Optional[list[str]] = None
+        self,
+        access_token: str,
+        *,
+        instrument_keys: Optional[list[str]] = None,
+        instrument_rules_service: InstrumentRulesService,
     ) -> dict[str, Any]:
         """Flattens open positions (quantity != 0) with an immediate market order in the opposite
         direction. [instrument_keys] is None means every open position (exit_all_positions above);
@@ -212,6 +242,11 @@ class SmartOrderService:
         from its own snapshot). Best-effort: one position failing to exit doesn't stop the others
         -- every attempted position's own result (success or error) is returned so the caller/UI
         can show exactly what happened to each one.
+
+        Each position's own flattening order is sliced by its instrument's freeze quantity (same
+        `_split_quantity`/`slice_quantity_for_freeze` machinery place_bracket_order uses) -- this
+        backs the max-loss safety trigger, so a position sized over freeze quantity must not
+        silently fail to flatten just because it was submitted as one oversized order.
         """
         positions_payload = await self.upstox.get_positions(access_token)
         data = positions_payload.get("data")
@@ -237,29 +272,44 @@ class SmartOrderService:
             # rest of this app relies on (see MainViewModel.handleTick's PnL formula) -- so
             # flattening a long is a SELL and flattening a short is a BUY.
             transaction_type = "SELL" if quantity > 0 else "BUY"
+            abs_quantity = int(abs(quantity))
             try:
-                response = await self.upstox.place_market_order(
-                    access_token,
-                    instrument_key=instrument_key,
-                    transaction_type=transaction_type,
-                    quantity=int(abs(quantity)),
-                    product=product,
-                )
+                rules = await instrument_rules_service.get_rules(instrument_key)
+                slice_qty = slice_quantity_for_freeze(abs_quantity, rules)
+            except AppConfigError:
+                # Best-effort: an instrument-rules lookup hiccup shouldn't block flattening a
+                # position outright -- fall back to a single order (correct for the overwhelming
+                # majority of positions, which are already under freeze quantity anyway).
+                slice_qty = abs_quantity
+            try:
+                upstox_response: Any = None
+                for chunk_quantity in _split_quantity(abs_quantity, slice_qty):
+                    upstox_response = await self.upstox.place_market_order(
+                        access_token,
+                        instrument_key=instrument_key,
+                        transaction_type=transaction_type,
+                        quantity=chunk_quantity,
+                        product=product,
+                    )
                 results.append(
                     {
                         "instrument_key": instrument_key,
                         "transaction_type": transaction_type,
-                        "quantity": int(abs(quantity)),
+                        "quantity": abs_quantity,
                         "status": "success",
-                        "upstox_response": response,
+                        "upstox_response": upstox_response,
                     }
                 )
             except UpstoxApiError as exc:
+                # A slice failing partway through is reported as this position's own "error", not
+                # a partial-success this response shape has no room for -- a half-flattened
+                # position isn't actually safe, so it should surface exactly like a total failure
+                # (the app's own "close manually" messaging), not read as done.
                 results.append(
                     {
                         "instrument_key": instrument_key,
                         "transaction_type": transaction_type,
-                        "quantity": int(abs(quantity)),
+                        "quantity": abs_quantity,
                         "status": "error",
                         "error": str(exc),
                     }

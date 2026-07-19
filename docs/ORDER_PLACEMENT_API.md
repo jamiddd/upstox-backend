@@ -179,6 +179,11 @@ position the way reusing the `MULTIPLE`+`IMMEDIATE`-entry shape would.
 (`"SELL"` to attach exits to a long position, `"BUY"` for a short) -- required because a
 `SINGLE`-type order has no `ENTRY` leg to infer direction from.
 
+Like Smart Bracket Order, `quantity` is sliced into multiple order pairs when it exceeds the
+instrument's `freeze_quantity` -- a position sized over freeze quantity would otherwise have both
+legs rejected outright by Upstox. If `slice_quantity` is provided, it overrides the instrument
+freeze quantity.
+
 Request:
 
 ```json
@@ -201,28 +206,47 @@ product optional, I|D|MTF, default I
 exit_transaction_type required, BUY|SELL
 target_trigger_price required, positive number, validated against tick_size
 stoploss_trigger_price required, positive number, validated against tick_size
+slice_quantity optional, positive integer
 ```
 
-The two legs are placed independently, so one failing doesn't stop the other. Response:
+Each slice's target/stoploss legs are placed independently, so one failing doesn't stop the
+rest. Response:
 
 ```json
 {
   "status": "partial_success",
-  "target": {
-    "status": "success",
-    "submitted_order": {},
-    "upstox_response": {}
-  },
-  "stoploss": {
-    "status": "error",
-    "submitted_order": {},
-    "error": "GTT order cannot be placed"
-  }
+  "total_quantity": 3750,
+  "slice_quantity": 1800,
+  "slice_count": 3,
+  "slices": [
+    {
+      "slice_number": 1,
+      "quantity": 1800,
+      "target": { "status": "success", "submitted_order": {}, "upstox_response": {} },
+      "stoploss": { "status": "success", "submitted_order": {}, "upstox_response": {} }
+    },
+    {
+      "slice_number": 2,
+      "quantity": 1800,
+      "target": { "status": "success", "submitted_order": {}, "upstox_response": {} },
+      "stoploss": {
+        "status": "error",
+        "submitted_order": {},
+        "error": "GTT order cannot be placed"
+      }
+    },
+    {
+      "slice_number": 3,
+      "quantity": 150,
+      "target": { "status": "success", "submitted_order": {}, "upstox_response": {} },
+      "stoploss": { "status": "success", "submitted_order": {}, "upstox_response": {} }
+    }
+  ]
 }
 ```
 
-Top-level `status` is `success` (both legs placed), `partial_success` (one placed), or `error`
-(neither placed).
+Top-level `status` is `success` (every leg of every slice placed), `partial_success` (some
+placed), or `error` (none placed).
 
 ## Modify GTT Order
 
@@ -306,7 +330,11 @@ Response:
 ```
 
 Each position is closed independently -- one failing doesn't stop the others; check each result's
-own `status`.
+own `status`. A position's own flattening order is internally sliced against its instrument's
+`freeze_quantity` (same mechanism as Smart Bracket Order/Attach GTT Exits) -- transparent to this
+response shape (`quantity` is still the position's full amount), but if a slice fails partway
+through, that position's own `status` is `"error"` even if an earlier slice already went
+through, since a half-flattened position isn't actually safe.
 
 ## Modify Orders
 
