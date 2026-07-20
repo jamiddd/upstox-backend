@@ -504,6 +504,60 @@ Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round 
 `ltp` and everything computed relative to it (`position` fields, `nearest_level`) are read fresh
 on every call.
 
+### Tracked Instruments (background-warmed 5-minute-change history)
+
+```http
+GET /api/user/tracked-instruments
+PUT /api/user/tracked-instruments
+```
+
+The 5-minute-change suffixes above only ever appear once *something* has been polling the same
+underlying/expiry for 5 continuous minutes -- normally that "something" is the app itself, which
+means opening the app fresh (or reopening it after a while) always starts from zero, with no
+delta on the very first poll. This pair of routes lets the Android Settings screen opt specific
+underlyings into a **server-side background poller** (started from `app.main`'s lifespan, see
+`app.services.tracked_instruments_poller`) that keeps their history warm independently of whether
+the app is open at all -- so reopening the app on a tracked underlying shows a delta immediately.
+
+`GET` returns the current selection:
+
+```json
+{"underlying_keys": ["NSE_INDEX|Nifty 50", "NSE_INDEX|Nifty Bank"]}
+```
+
+`PUT` replaces the whole selection (not an incremental add/remove -- the client always sends its
+full current Settings selection):
+
+```http
+PUT /api/user/tracked-instruments
+{"underlying_keys": ["NSE_INDEX|Nifty 50"]}
+```
+
+Persisted to a small flat JSON file (`TRACKED_INSTRUMENTS_PATH`, default
+`/data/tracked_instruments.json`) -- not a database, consistent with this backend's "database-free"
+posture (see `TrackedInstrumentsStore`) -- so the selection survives a server/container restart.
+
+**What the poller actually does**, roughly once every 5 minutes per tracked underlying, only
+during NSE market hours (09:15-15:30 IST, Mon-Fri -- see `app.core.market_hours.is_market_open`,
+a server-side port of the Android client's own `MarketHours.kt`) and only once an Upstox token is
+stored: for each tracked `underlying_key`, it resolves the underlying's symbol text and nearest
+listed expiry (`MainScreenService.resolve_underlying_symbol_and_expiry` -- the same "nearest
+expiry" convention `bootstrap` uses), then calls `UnderlyingSignalsService.get_signals` exactly
+as a real client request would. The response itself is discarded -- the only thing that matters
+is the `_record_and_diff` side effect, i.e. one more snapshot in that underlying's history. A
+failure on one tracked underlying (Upstox error, no listed contracts) is logged and skipped;
+it never stops the others or crashes the loop.
+
+**Call-budget note**: each tick isn't one Upstox call -- `get_signals` fans out into roughly 7-8
+(candles at three intervals, round-step, LTP, OI analysis, VWAP's futures resolution, the ATM
+option chain), most of which have too short a cache (15-60s) to be reused across a 5-minute gap.
+Budget for roughly 500-600 raw Upstox calls/day *per tracked underlying*, not 72 -- worth being
+deliberate about how many instruments are tracked at once.
+
+Untracked underlyings are entirely unaffected -- polling them from the app still works exactly as
+before (no delta on the first poll, needs 5 live minutes), this feature only removes that
+cold-start wait for whichever instruments are explicitly opted in.
+
 ## USD/INR (non-Upstox)
 
 ```http

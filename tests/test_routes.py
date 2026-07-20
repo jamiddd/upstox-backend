@@ -4,14 +4,20 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
+import anyio
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_token_store, get_upstox_service, get_usd_inr_service
+from app.api.dependencies import (
+    get_token_store,
+    get_tracked_instruments_store,
+    get_upstox_service,
+    get_usd_inr_service,
+)
 from app.core.config import Settings, get_settings
 from app.main import app
 from app.services import instrument_rules_service
 from app.services.instrument_rules_service import _MasterCache
-from app.services.main_screen_service import _CACHE
+from app.services.main_screen_service import MainScreenService, _CACHE
 from app.services import oi_analysis_service
 from app.services.search_screen_service import _SEARCH_CACHE
 from app.services import underlying_signals_service
@@ -2441,3 +2447,101 @@ def test_place_smart_bracket_order_rejects_invalid_tick_size() -> None:
         "status": "error",
         "message": "entry_trigger_price 125.53 must be a multiple of tick size 0.05",
     }
+
+
+def test_resolve_underlying_symbol_and_expiry_picks_the_nearest_listed_expiry() -> None:
+    """Used by the tracked-instruments background poller (see
+    app.services.tracked_instruments_poller) to resolve what bootstrap would otherwise resolve
+    from a live client request -- same underlying_symbol ("NIFTY", from FakeUpstoxService's own
+    get_option_contracts fixture) and same nearest-expiry convention (expiries[0] once sorted --
+    the fixture has 2026-07-16 and 2026-07-23, so the earlier one wins).
+    """
+    _CACHE.clear()
+    service = MainScreenService(FakeUpstoxService())
+
+    symbol, expiry = anyio.run(
+        lambda: service.resolve_underlying_symbol_and_expiry("upstox-token", "NSE_INDEX|Nifty 50"),
+    )
+
+    assert symbol == "NIFTY"
+    assert expiry == "2026-07-16"
+
+
+def test_get_tracked_instruments_returns_an_empty_list_when_nothing_saved(tmp_path: Path) -> None:
+    from app.services.tracked_instruments_store import TrackedInstrumentsStore
+
+    store = TrackedInstrumentsStore(_settings())
+    store.path = tmp_path / "tracked.json"
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_tracked_instruments_store] = lambda: store
+    client = TestClient(app)
+    try:
+        response = client.get(
+            "/api/user/tracked-instruments",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"underlying_keys": []}
+
+
+def test_put_tracked_instruments_persists_and_echoes_the_new_set(tmp_path: Path) -> None:
+    from app.services.tracked_instruments_store import TrackedInstrumentsStore
+
+    store = TrackedInstrumentsStore(_settings())
+    store.path = tmp_path / "tracked.json"
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_tracked_instruments_store] = lambda: store
+    client = TestClient(app)
+    try:
+        response = client.put(
+            "/api/user/tracked-instruments",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"underlying_keys": ["NSE_INDEX|Nifty 50", "NSE_INDEX|Nifty Bank"]},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"underlying_keys": ["NSE_INDEX|Nifty 50", "NSE_INDEX|Nifty Bank"]}
+    assert store.load() == ["NSE_INDEX|Nifty 50", "NSE_INDEX|Nifty Bank"]
+
+
+def test_put_tracked_instruments_replaces_the_previous_set(tmp_path: Path) -> None:
+    from app.services.tracked_instruments_store import TrackedInstrumentsStore
+
+    store = TrackedInstrumentsStore(_settings())
+    store.path = tmp_path / "tracked.json"
+    store.save(["NSE_INDEX|Nifty 50"])
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_tracked_instruments_store] = lambda: store
+    client = TestClient(app)
+    try:
+        response = client.put(
+            "/api/user/tracked-instruments",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"underlying_keys": ["BSE_INDEX|SENSEX"]},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"underlying_keys": ["BSE_INDEX|SENSEX"]}
+
+
+def test_tracked_instruments_endpoints_require_the_mobile_api_key(tmp_path: Path) -> None:
+    from app.services.tracked_instruments_store import TrackedInstrumentsStore
+
+    store = TrackedInstrumentsStore(_settings())
+    store.path = tmp_path / "tracked.json"
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_tracked_instruments_store] = lambda: store
+    client = TestClient(app)
+    try:
+        response = client.get("/api/user/tracked-instruments")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401

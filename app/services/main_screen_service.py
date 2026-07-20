@@ -64,6 +64,25 @@ class MainScreenService:
             "open_positions": [_shape_position(position) for position in positions],
         }
 
+    async def resolve_underlying_symbol_and_expiry(
+        self,
+        access_token: str,
+        underlying_key: str,
+    ) -> tuple[str, Optional[str]]:
+        """Returns `(underlying_symbol, nearest_expiry)` for [underlying_key] -- the same symbol
+        text and "nearest listed expiry" (`expiries[0]`) [bootstrap] resolves for a fresh Main
+        screen load, exposed standalone for the tracked-instruments background poller (see
+        `app.services.tracked_instruments_poller`), which needs both to call
+        `UnderlyingSignalsService.get_signals` for a Settings-picked underlying_key without a
+        live client request ever having supplied them. `nearest_expiry` is `None` if this
+        underlying has no listed option contracts at all (mirrors `bootstrap`'s own fallback).
+        Reuses [_option_contracts]'s own 600s cache -- cheap even if `bootstrap` was already
+        called for the same underlying recently.
+        """
+        contracts = await self._option_contracts(access_token, underlying_key)
+        expiries = _extract_expiries(contracts)
+        return _underlying_symbol(underlying_key, contracts), (expiries[0] if expiries else None)
+
     async def selected_quote(
         self,
         access_token: str,

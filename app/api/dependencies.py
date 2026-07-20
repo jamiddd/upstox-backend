@@ -5,6 +5,7 @@ from fastapi import Depends, HTTPException, status
 from app.core.config import Settings, get_settings
 from app.core.exceptions import TokenStoreError
 from app.services.token_store import EncryptedTokenStore
+from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_service import UpstoxService
 from app.services.usd_inr_service import UsdInrService
 
@@ -18,6 +19,11 @@ def get_token_store(settings: Settings = Depends(get_settings)) -> EncryptedToke
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"status": "error", "message": str(exc)},
         ) from exc
+
+
+def get_tracked_instruments_store(settings: Settings = Depends(get_settings)) -> TrackedInstrumentsStore:
+    """Create the tracked-instruments store for the current request."""
+    return TrackedInstrumentsStore(settings)
 
 
 def get_upstox_service(settings: Settings = Depends(get_settings)) -> UpstoxService:

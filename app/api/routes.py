@@ -9,15 +9,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-from app.api.dependencies import get_token_store, get_upstox_service, get_usd_inr_service
+from app.api.dependencies import (
+    get_token_store,
+    get_tracked_instruments_store,
+    get_upstox_service,
+    get_usd_inr_service,
+)
 from app.core.config import Settings, get_settings
 from app.core.exceptions import (
     AppConfigError,
     TokenStoreError,
+    TrackedInstrumentsStoreError,
     UpstoxApiError,
     UpstoxAuthRequiredError,
 )
 from app.services.token_store import EncryptedTokenStore
+from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_service import UpstoxService
 from app.core.security import require_mobile_api_key
 from app.services.instrument_rules_service import (
@@ -72,6 +79,15 @@ class ModifyGttOrderRequest(BaseModel):
     target_trigger_price: float = Field(gt=0)
     stoploss_trigger_price: float = Field(gt=0)
     trailing_gap: Optional[float] = Field(default=None, gt=0)
+
+
+class TrackedInstrumentsRequest(BaseModel):
+    """Replaces the whole persisted set of underlying_keys the background poller keeps
+    5-minute-change history warm for -- see TrackedInstrumentsStore. Always the client's full
+    current Settings selection, not an incremental add/remove.
+    """
+
+    underlying_keys: list[str] = Field(default_factory=list)
 
 
 class ExitPositionsRequest(BaseModel):
@@ -455,6 +471,36 @@ async def main_underlying_signals(
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/user/tracked-instruments")
+async def get_tracked_instruments(
+    store: TrackedInstrumentsStore = Depends(get_tracked_instruments_store),
+) -> dict[str, Any]:
+    """Return the persisted list of underlying_keys the background poller keeps 5-minute-change
+    history warm for -- lets the Settings screen show the current selection on load."""
+    return {"underlying_keys": store.load()}
+
+
+@protected_router.put("/user/tracked-instruments")
+async def set_tracked_instruments(
+    body: TrackedInstrumentsRequest,
+    store: TrackedInstrumentsStore = Depends(get_tracked_instruments_store),
+) -> dict[str, Any]:
+    """Replace the whole persisted set -- see TrackedInstrumentsRequest. Picking instruments here
+    (in the app's Settings screen) means the background poller (see app.main's lifespan) keeps
+    that underlying's PCR/OI/ATM-straddle/VWAP/ATR 5-minute history warm even while the app is
+    closed, so opening the app later shows a delta on the very first poll instead of needing 5
+    live minutes first -- see UnderlyingSignalsService._record_and_diff.
+    """
+    try:
+        store.save(body.underlying_keys)
+    except TrackedInstrumentsStoreError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"status": "error", "message": str(exc)},
+        ) from exc
+    return {"underlying_keys": store.load()}
 
 
 @protected_router.get("/market/feed/authorize")

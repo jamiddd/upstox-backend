@@ -11,6 +11,10 @@ class TokenStoreError(RuntimeError):
     """Raised when the encrypted Upstox token store cannot be used."""
 
 
+class TrackedInstrumentsStoreError(RuntimeError):
+    """Raised when the tracked-instruments store cannot be used."""
+
+
 class UpstoxAuthRequiredError(RuntimeError):
     """Raised when an Upstox-backed route is called before login."""
 
