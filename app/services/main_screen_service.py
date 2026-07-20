@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import date, timedelta
 from time import monotonic
 from typing import Any, Optional
 
@@ -52,11 +53,10 @@ class MainScreenService:
                 "name": _underlying_name(underlying_key, contracts),
                 "spot_price": _last_price(_find_quote(quote, underlying_key)),
                 # Previous trading day's close -- lets the app show a "(+0.40%)" change badge
-                # next to the spot price without a separate OHLC/history call. Comes from the
-                # same full-quote call already made for spot_price above (Upstox's quote payload
-                # includes an `ohlc` block per instrument; `ohlc.close` is the prior session's
-                # close, not "today's close so far").
-                "previous_close": _previous_close(_find_quote(quote, underlying_key)),
+                # next to the spot price. Fetched directly from the daily candle endpoint (the
+                # previous *completed* session's own close), not derived from a live quote's
+                # `net_change` field -- see _fetch_previous_close's doc comment for why.
+                "previous_close": await self._fetch_previous_close(access_token, underlying_key, date.today()),
             },
             "expiries": expiries,
             "selected_expiry": selected_expiry,
@@ -194,6 +194,7 @@ class MainScreenService:
                     continue
                 quotes["data"].update(single.get("data") or {})
 
+        today = date.today()
         positions = []
         for key in keys:
             quote = _find_quote(quotes, key)
@@ -212,7 +213,7 @@ class MainScreenService:
                 {
                     "instrument_key": key,
                     "ltp": _last_price(quote),
-                    "previous_close": _previous_close(quote),
+                    "previous_close": await self._fetch_previous_close(access_token, key, today),
                 }
             )
         return {"positions": positions}
@@ -375,6 +376,44 @@ class MainScreenService:
         payload = await self.upstox.get_positions(access_token)
         _cache_set(cache_key, payload, ttl_seconds=1.0)
         return _positions_data(payload)
+
+    async def _fetch_previous_close(self, access_token: str, instrument_key: str, today: date) -> float:
+        """The previous *completed* trading session's actual closing price for [instrument_key].
+
+        FIX: this used to be derived from a live quote's `net_change` field (`last_price -
+        net_change`), on the assumption that `net_change` is always the signed change from
+        yesterday's close. That's fragile -- it silently produces a wrong-but-plausible previous
+        close whenever a quote's `net_change` doesn't behave exactly that way (e.g. right around
+        a gap-open), which showed up as a change badge reading the wrong *direction* entirely
+        (e.g. "+0.5%" on a day that gapped down). The only way to get the real previous close
+        without trusting a derived field is to ask for it directly -- the daily candle endpoint's
+        most recent completed session (`to_date` = yesterday) *is* that close, full stop.
+
+        Cached per (instrument_key, day) since this value is fixed for the entire trading day --
+        avoids re-fetching it on every position-quotes/bootstrap poll.
+        """
+        cache_key = ("previous_close", instrument_key, today.isoformat())
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached["close"]
+
+        yesterday = today - timedelta(days=1)
+        from_date = (today - timedelta(days=10)).isoformat()
+        try:
+            payload = await self.upstox.get_historical_candle(
+                access_token,
+                instrument_key,
+                unit="days",
+                interval="1",
+                to_date=yesterday.isoformat(),
+                from_date=from_date,
+            )
+        except UpstoxApiError:
+            return 0.0
+
+        close = _latest_daily_close(payload)
+        _cache_set(cache_key, {"close": close}, ttl_seconds=3600.0)
+        return close
 
 
 def _cache_get(key: tuple[Any, ...]) -> Optional[dict[str, Any]]:
@@ -591,24 +630,24 @@ def _last_price(quote: dict[str, Any]) -> float:
     return _number_value(quote, "last_price", "ltp")
 
 
-def _previous_close(quote: dict[str, Any]) -> float:
-    """The last trading session's closing price, for computing "change since previous close".
-
-    FIX: this used to read `ohlc.close`, but Upstox documents that field as "the most recent
-    closing price of the symbol" -- in practice it tracks the *current, still-forming* session's
-    close and converges to `last_price` while that session is live/open, rather than staying
-    pinned to the prior session's actual close. That made every ticker's "(+x.xx%)" badge read
-    ~0% for anything trading right now, only becoming meaningful once a symbol's session had
-    fully ended for the day.
-
-    Upstox separately documents `net_change` as "the absolute change from yesterday's close to
-    last traded price" -- i.e. `last_price - net_change` gives the real previous close directly,
-    independent of whether today's session has closed yet.
+def _latest_daily_close(payload: dict[str, Any]) -> float:
+    """The most recent completed session's closing price from a `get_historical_candle(unit=
+    "days", ...)` response -- `[timestamp, open, high, low, close, volume, oi]` rows, picked by
+    max timestamp rather than trusting Upstox's own row ordering (not documented as guaranteed).
+    `0.0` if the response has no usable rows (e.g. a brand-new instrument with no prior session).
     """
-    net_change = quote.get("net_change")
-    if isinstance(net_change, (int, float)):
-        return _last_price(quote) - float(net_change)
-    return 0.0
+    data = payload.get("data")
+    rows = data.get("candles") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return 0.0
+    usable = [row for row in rows if isinstance(row, list) and len(row) >= 5]
+    if not usable:
+        return 0.0
+    latest = max(usable, key=lambda row: str(row[0]))
+    try:
+        return float(latest[4])
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _best_depth_price(quote: dict[str, Any], side: str) -> float:

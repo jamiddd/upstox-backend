@@ -74,10 +74,10 @@ class FakeUpstoxService:
                     "low": 24850.0,
                     "close": 25050.0,
                 },
-                # previous_close is derived from net_change (last_price - net_change), not
-                # ohlc.close -- see _previous_close's doc comment for why. ohlc.close above is
-                # deliberately set equal to last_price, matching what Upstox actually sends for a
-                # live/open session, to prove the fix doesn't fall back to reading it.
+                # Neither this nor net_change drive previous_close any more -- that's fetched
+                # directly via get_historical_candle's daily-candle close instead (see
+                # MainScreenService._fetch_previous_close's doc comment for why). Left here as
+                # otherwise-realistic quote data, unused by that calculation specifically.
                 "net_change": 100.0,
             },
             "NSE_FO|111": {
@@ -935,7 +935,9 @@ def test_main_bootstrap_returns_screen_ready_payload() -> None:
         "symbol": "NIFTY",
         "name": "NIFTY",
         "spot_price": 25050.0,
-        "previous_close": 24950.0,
+        # From FakeUpstoxService.get_historical_candle's daily-candle fixture (its "close" field,
+        # not a live quote's net_change -- see MainScreenService._fetch_previous_close).
+        "previous_close": 25050.0,
     }
     assert payload["expiries"] == ["2026-07-16", "2026-07-23"]
     assert payload["selected_expiry"] == "2026-07-16"
@@ -992,6 +994,55 @@ def test_main_bootstrap_degrades_gracefully_when_funds_service_unavailable() -> 
         "The Funds service is accessible from 5:30 AM to 12:00 AM IST daily. Please try again "
         "during these service hours."
     )
+
+
+class _GapDownFakeUpstoxService(FakeUpstoxService):
+    """NIFTY's LTP (25050.0, from the shared get_quotes fixture) is *below* yesterday's actual
+    close (25300.0, returned here) -- a gap-down day. Exists to prove previous_close reflects a
+    real gap correctly (negative change), not just the coincidental case where every other test's
+    daily-candle fixture happens to equal last_price (making change always 0.0 and hiding a wrong-
+    direction bug like the one this fix addresses -- see MainScreenService._fetch_previous_close).
+    """
+
+    async def get_historical_candle(
+        self,
+        access_token: str,
+        instrument_key: str,
+        *,
+        unit: str,
+        interval: str,
+        to_date: str,
+        from_date: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if unit == "days":
+            return {
+                "status": "success",
+                "data": {"candles": [["2026-07-17T00:00:00+05:30", 25250.0, 25350.0, 25200.0, 25300.0, 500000]]},
+            }
+        return await super().get_historical_candle(
+            access_token, instrument_key, unit=unit, interval=interval, to_date=to_date, from_date=from_date,
+        )
+
+
+def test_main_bootstrap_reflects_a_real_gap_down_correctly() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_upstox_service] = _GapDownFakeUpstoxService
+    try:
+        response = client.get(
+            "/api/main/bootstrap",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    underlying = response.json()["underlying"]
+    assert underlying["spot_price"] == 25050.0
+    assert underlying["previous_close"] == 25300.0
+    # The actual point of this fix: LTP below the real previous close must compute as a genuine
+    # loss, never a false gain.
+    change_percent = (underlying["spot_price"] - underlying["previous_close"]) / underlying["previous_close"] * 100.0
+    assert change_percent < 0.0
 
 
 def test_main_selected_quote_returns_bid_and_ask_for_selected_strike() -> None:
@@ -1152,10 +1203,14 @@ def test_main_position_quotes_returns_ltp_for_requested_keys() -> None:
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
+    # previous_close comes from FakeUpstoxService.get_historical_candle's daily-candle fixture
+    # (same for every instrument key in this fake) -- see
+    # MainScreenService._fetch_previous_close's doc comment for why this isn't derived from the
+    # quote's own net_change field any more.
     assert response.json() == {
         "positions": [
-            {"instrument_key": "NSE_FO|111", "ltp": 125.0, "previous_close": 0.0},
-            {"instrument_key": "NSE_FO|222", "ltp": 90.0, "previous_close": 0.0},
+            {"instrument_key": "NSE_FO|111", "ltp": 125.0, "previous_close": 25050.0},
+            {"instrument_key": "NSE_FO|222", "ltp": 90.0, "previous_close": 25050.0},
         ]
     }
 
@@ -1176,7 +1231,7 @@ def test_main_position_quotes_supports_global_instrument_keys() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "positions": [
-            {"instrument_key": "GLOBAL_INDEX|^GSPC", "ltp": 5555.5, "previous_close": 5540.0},
+            {"instrument_key": "GLOBAL_INDEX|^GSPC", "ltp": 5555.5, "previous_close": 25050.0},
         ]
     }
 

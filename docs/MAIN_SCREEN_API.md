@@ -23,17 +23,20 @@ expiry_date=<nearest available expiry>
 ```
 
 Returns the underlying, available expiries, account summary, and currently open positions.
-`previous_close` is the underlying's last trading day's closing price (from the same full-quote
-call already made for `spot_price`), letting the app show a "(+0.40%)" change badge next to the
-spot price without a separate history/OHLC call.
+`previous_close` is the underlying's last trading day's closing price, letting the app show a
+"(+0.40%)" change badge next to the spot price.
 
-FIX: this is derived as `last_price - net_change`, not `ohlc.close`. Upstox documents `ohlc.close`
-as "the most recent closing price of the symbol", but in practice it tracks the *current,
-still-forming* session's close and converges to `last_price` while that session is live/open --
-using it made every "(+x.xx%)" badge in the app read ~0% for anything actively trading, only
-becoming meaningful once a symbol's session had fully ended for the day. `net_change` is
-separately documented as "the absolute change from yesterday's close to last traded price", which
-gives the real previous close directly regardless of whether today's session has closed yet.
+FIX: this is fetched directly from the daily candle endpoint (the most recent *completed*
+session's own close, `to_date` = yesterday) -- not derived from a live quote's `net_change` field
+(`last_price - net_change`), which an earlier version of this endpoint used. That derivation
+trusted `net_change` to always be the signed change from yesterday's close, which isn't reliable
+enough to build a change-*direction* indicator on: it silently produced a wrong-but-plausible
+previous close whenever a quote's `net_change` didn't behave exactly that way (most visibly right
+around a gap-open), which showed up as the app's "(+x.xx%)" badge reading the wrong direction
+entirely -- e.g. "+0.5%" on a day that gapped down. The change badge is always just
+`(spot_price - previous_close) / previous_close`; the fix is entirely in how `previous_close`
+itself is sourced, not the formula. Cached per (instrument, day) server-side, since a previous
+close is fixed for the whole trading day.
 
 ```json
 {
@@ -42,7 +45,7 @@ gives the real previous close directly regardless of whether today's session has
     "symbol": "NIFTY",
     "name": "NIFTY",
     "spot_price": 25050.0,
-    "previous_close": 24950.0
+    "previous_close": 25050.0
   },
   "expiries": ["2026-07-16", "2026-07-23"],
   "selected_expiry": "2026-07-16",
