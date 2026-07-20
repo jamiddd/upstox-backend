@@ -39,11 +39,25 @@ _PCR_BEARISH_THRESHOLD = 0.8
 _NEAR_ATM_STRIKE_COUNT = 5
 
 # LTP within this many *absolute* points of today's session open is a "no-trade zone" -- the app's
-# user gets whipsawed trading right around the open before price has picked a direction. Fixed
-# points (not a percent of LTP like _NEAREST_LEVEL_TOLERANCE_PERCENT) per explicit product
-# decision -- this is a caution about a specific instant (the open print), not a proximity-to-a-
-# level read that should scale with the underlying's own price.
-_NO_TRADE_ZONE_POINTS = 15.0
+# user gets whipsawed trading right around the open before price has picked a direction. Dynamic,
+# not a single fixed number -- see _no_trade_zone_points -- since a flat point-count can't be right
+# for every underlying (15 points is a very different fraction of a low-priced stock than of
+# NIFTY) or even for the same underlying across different volatility regimes. Points here (not a
+# percent of LTP like _NEAREST_LEVEL_TOLERANCE_PERCENT) is still the right *unit*, though -- this
+# is a caution about a specific instant (the open print), not a general proximity-to-a-level read.
+_NO_TRADE_ZONE_ATR_MULTIPLIER = 0.75
+_NO_TRADE_ZONE_MIN_POINTS = 5.0
+# Used only when ATR itself isn't available yet (not enough candle history) -- the original fixed
+# value this whole thing used to be, kept as a safe fallback rather than disabling the caution
+# entirely.
+_NO_TRADE_ZONE_FALLBACK_POINTS = 15.0
+
+# Rolling 5-minute-change history (see _record_and_diff) -- how far back a snapshot can be and
+# still count as "5 minutes ago" (a tolerance band, not an exact match, since polling is ~60s but
+# not perfectly metronomic), and how long a snapshot is kept around at all before being pruned.
+_FIVE_MIN_MIN_SECONDS = 240.0
+_FIVE_MIN_MAX_SECONDS = 360.0
+_HISTORY_WINDOW_SECONDS = 600.0
 
 # SENSEX has no actively-traded futures contract on Upstox (unlike NIFTY/BANKNIFTY on NSE) -- per
 # explicit product decision, VWAP for SENSEX always uses Nifty's own futures contract instead.
@@ -86,6 +100,45 @@ class _OiSummary:
     # The strike with the single highest call OI -- the resistance-level mirror of support_strike.
     resistance_strike: Optional[float] = None
     resistance_oi: Optional[float] = None
+
+
+@dataclass
+class _HistorySnapshot:
+    """One poll's worth of the values that get a "5-minute change" suffix -- see
+    _record_and_diff. `vwap_distance`/`level_distance` store the *distance* (|LTP - VWAP| / |LTP -
+    level|), not VWAP/the level's own value -- see _record_and_diff's doc comment for why."""
+
+    timestamp: float
+    atr: Optional[float]
+    vwap_distance: Optional[float]
+    level_distance: Optional[float]
+    pcr: Optional[float]
+    support_strike: Optional[float]
+    support_oi: Optional[float]
+    resistance_strike: Optional[float]
+    resistance_oi: Optional[float]
+    atm_straddle: Optional[float]
+
+
+@dataclass
+class _HistoryDeltas:
+    """`current - (whatever was recorded ~5 minutes ago)` for each metric in _HistorySnapshot,
+    from _record_and_diff -- `None` for any metric with no in-band snapshot to compare against, or
+    where either side is itself `None`."""
+
+    atr: Optional[float] = None
+    vwap_distance: Optional[float] = None
+    level_distance: Optional[float] = None
+    pcr: Optional[float] = None
+    support_oi: Optional[float] = None
+    resistance_oi: Optional[float] = None
+    atm_straddle: Optional[float] = None
+
+
+# Keyed by (underlying_key, expiry_date) -- expiry-specific metrics (PCR/OI/ATM straddle) can't be
+# meaningfully diffed across an expiry switch, so the whole history resets together with one key
+# scheme rather than keeping two.
+_HISTORY: dict[tuple[str, Optional[str]], list[_HistorySnapshot]] = {}
 
 
 _CACHE: dict[tuple[Any, ...], _CacheEntry] = {}
@@ -140,7 +193,16 @@ class UnderlyingSignalsService:
             todays_candles_5m, window_candles=_OPENING_RANGE_CANDLES,
         )
         today_open = todays_candles_5m[0].open if todays_candles_5m else None
-        no_trade_zone = _is_near_day_open(ltp, today_open, tolerance_points=_NO_TRADE_ZONE_POINTS)
+        # Dynamic, not a flat constant -- scales with how volatile this session actually is (a
+        # quiet low-ATR session gets a tighter buffer than a volatile one), floored so it never
+        # shrinks to near-nothing, falling back to the original fixed value only when ATR itself
+        # isn't available yet (not enough candle history).
+        no_trade_zone_points = (
+            max(atr14_5m * _NO_TRADE_ZONE_ATR_MULTIPLIER, _NO_TRADE_ZONE_MIN_POINTS)
+            if atr14_5m is not None
+            else _NO_TRADE_ZONE_FALLBACK_POINTS
+        )
+        no_trade_zone = _is_near_day_open(ltp, today_open, tolerance_points=no_trade_zone_points)
 
         prev_day = daily_candles[-1] if daily_candles else None
         pivots = _pivots(prev_day.high, prev_day.low, prev_day.close) if prev_day else {}
@@ -185,6 +247,28 @@ class UnderlyingSignalsService:
             today=today, yesterday=yesterday,
         )
 
+        atm_straddle = await self._fetch_atm_straddle(access_token, underlying_key, expiry_date, ltp)
+
+        # 5-minute-change tracking for ATR/VWAP-distance/level-distance/PCR/OI-support/
+        # OI-resistance/ATM-straddle -- see _record_and_diff's doc comment for exactly what each
+        # one measures (VWAP/level track the *distance* closing in or pulling away, not their own
+        # value; OI support/resistance are strike-matched, ATM straddle deliberately isn't).
+        level_distance = abs(ltp - nearest_level["value"]) if nearest_level else None
+        vwap_distance = abs(ltp - vwap) if vwap is not None else None
+        deltas = _record_and_diff(
+            (underlying_key, expiry_date),
+            atr=atr14_5m,
+            vwap_distance=vwap_distance,
+            level_distance=level_distance,
+            pcr=oi_summary.pcr,
+            support_strike=oi_summary.support_strike,
+            support_oi=oi_summary.support_oi,
+            resistance_strike=oi_summary.resistance_strike,
+            resistance_oi=oi_summary.resistance_oi,
+            atm_straddle=atm_straddle,
+            now=monotonic(),
+        )
+
         tags = _build_tags(
             ltp=ltp,
             ema9_5m_value=ema9_5m,
@@ -207,6 +291,15 @@ class UnderlyingSignalsService:
             vwap_position=vwap_position,
             today_open=today_open,
             no_trade_zone=no_trade_zone,
+            no_trade_zone_points=no_trade_zone_points,
+            atm_straddle=atm_straddle,
+            atr_delta=deltas.atr,
+            vwap_distance_delta=deltas.vwap_distance,
+            level_distance_delta=deltas.level_distance,
+            pcr_delta=deltas.pcr,
+            support_oi_delta=deltas.support_oi,
+            resistance_oi_delta=deltas.resistance_oi,
+            atm_straddle_delta=deltas.atm_straddle,
         )
 
         return {
@@ -473,6 +566,44 @@ class UnderlyingSignalsService:
         _cache_set(cache_key, {"key": resolved}, ttl_seconds=3600.0)
         return resolved
 
+    async def _fetch_atm_straddle(
+        self, access_token: str, underlying_key: str, expiry_date: Optional[str], ltp: float,
+    ) -> Optional[float]:
+        """ATM call premium + ATM put premium (the strike closest to `ltp`), for the "ATM
+        Straddle" tag and its own 5-minute change (see _record_and_diff's doc comment for why that
+        change is tracked as a plain rolling series, not gated on the strike staying the same).
+        `None` -- gracefully, never raises -- whenever `expiry_date` wasn't given (straddle premium
+        only exists per-expiry, same gating as PCR/max-pain/OI), `ltp` isn't loaded yet, or the
+        option-chain fetch itself fails. Cached briefly (15s, matching
+        `MainScreenService._option_chain_live`'s own TTL for this same live per-strike data) since
+        this is live-changing, not static.
+        """
+        if not expiry_date or ltp <= 0:
+            return None
+
+        cache_key = ("atm_straddle_chain", underlying_key, expiry_date)
+        payload = _cache_get(cache_key)
+        if payload is None:
+            try:
+                payload = await self.upstox.get_option_chain(access_token, underlying_key, expiry_date=expiry_date)
+            except UpstoxApiError:
+                return None
+            _cache_set(cache_key, payload, ttl_seconds=15.0)
+
+        rows = payload.get("data")
+        usable = [
+            row for row in (rows if isinstance(rows, list) else [])
+            if isinstance(row, dict) and isinstance(row.get("strike_price"), (int, float))
+        ]
+        if not usable:
+            return None
+        atm_row = min(usable, key=lambda row: abs(row["strike_price"] - ltp))
+        ce_ltp = _option_ltp(atm_row.get("call_options"))
+        pe_ltp = _option_ltp(atm_row.get("put_options"))
+        if ce_ltp is None or pe_ltp is None:
+            return None
+        return ce_ltp + pe_ltp
+
 
 def _cache_get(key: tuple[Any, ...]) -> Optional[Any]:
     entry = _CACHE.get(key)
@@ -545,6 +676,18 @@ def _is_sensex(underlying_key: str, underlying_symbol: Optional[str]) -> bool:
     return bool(underlying_symbol) and underlying_symbol.strip().upper() == "SENSEX"
 
 
+def _option_ltp(side: Any) -> Optional[float]:
+    """Extracts `market_data.ltp` from one option-chain row's `call_options`/`put_options` side --
+    mirrors `main_screen_service.py`'s own `_option_side` extraction (not shared/imported across
+    services, same "each service calls self.upstox independently" posture used throughout this
+    file already)."""
+    if not isinstance(side, dict):
+        return None
+    market_data = side.get("market_data")
+    ltp = market_data.get("ltp") if isinstance(market_data, dict) else None
+    return float(ltp) if isinstance(ltp, (int, float)) else None
+
+
 def _vwap(candles: list[Candle]) -> Optional[float]:
     """Session VWAP = cumulative(typical price * volume) / cumulative(volume), today's candles
     only. Typical price = (high+low+close)/3 -- volume traded across a candle's whole range, not
@@ -566,6 +709,84 @@ def _ema(values: list[float], *, period: int) -> Optional[float]:
     for value in values[1:]:
         ema = value * alpha + ema * (1.0 - alpha)
     return ema
+
+
+def _record_and_diff(
+    key: tuple[str, Optional[str]],
+    *,
+    atr: Optional[float],
+    vwap_distance: Optional[float],
+    level_distance: Optional[float],
+    pcr: Optional[float],
+    support_strike: Optional[float],
+    support_oi: Optional[float],
+    resistance_strike: Optional[float],
+    resistance_oi: Optional[float],
+    atm_straddle: Optional[float],
+    now: float,
+) -> _HistoryDeltas:
+    """Records the current values as a new snapshot under [key] and returns how much each one has
+    changed since ~5 minutes ago (a 4-6 minute tolerance band, not an exact match -- see
+    _FIVE_MIN_MIN_SECONDS/_FIVE_MIN_MAX_SECONDS -- since polling is ~60s but not perfectly
+    metronomic). `None` for any metric with no in-band snapshot to compare against (e.g. right
+    after this underlying/expiry was selected), or where either side is itself `None`.
+
+    `vwap_distance`/`level_distance`: these store |LTP - VWAP| / |LTP - level|, not VWAP/the
+    level's own value -- a moving VWAP number by itself isn't actionable, what matters is whether
+    price is *approaching or pulling away* from it (or a static level), so a **negative** delta
+    here means the distance shrank (price closing in), positive means it grew (pulling away) --
+    the sign is about the distance, not VWAP/the level's own direction.
+
+    `support_oi`/`resistance_oi`: only diffed when the matched snapshot's own `support_strike`/
+    `resistance_strike` equals the *current* one -- if a different strike has taken over as
+    support/resistance since then, comparing their OI numbers wouldn't mean anything (not the same
+    thing being measured), so the delta is `None` rather than a misleading number.
+
+    `atm_straddle`: deliberately has **no** such strike-matching gate, unlike support/resistance --
+    the ATM strike is *expected* to roll as price moves, and "ATM straddle" is conventionally read
+    as a rolling index (whatever's ATM right now), not one fixed strike's own price history.
+    """
+    history = _HISTORY.setdefault(key, [])
+    history[:] = [snapshot for snapshot in history if now - snapshot.timestamp <= _HISTORY_WINDOW_SECONDS]
+
+    in_band = [
+        snapshot for snapshot in history
+        if _FIVE_MIN_MIN_SECONDS <= now - snapshot.timestamp <= _FIVE_MIN_MAX_SECONDS
+    ]
+    matched = min(in_band, key=lambda snapshot: abs((now - snapshot.timestamp) - 300.0)) if in_band else None
+
+    def diff(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+        if current is None or previous is None:
+            return None
+        return current - previous
+
+    deltas = _HistoryDeltas()
+    if matched is not None:
+        deltas.atr = diff(atr, matched.atr)
+        deltas.vwap_distance = diff(vwap_distance, matched.vwap_distance)
+        deltas.level_distance = diff(level_distance, matched.level_distance)
+        deltas.pcr = diff(pcr, matched.pcr)
+        deltas.atm_straddle = diff(atm_straddle, matched.atm_straddle)
+        if support_strike is not None and matched.support_strike == support_strike:
+            deltas.support_oi = diff(support_oi, matched.support_oi)
+        if resistance_strike is not None and matched.resistance_strike == resistance_strike:
+            deltas.resistance_oi = diff(resistance_oi, matched.resistance_oi)
+
+    history.append(
+        _HistorySnapshot(
+            timestamp=now,
+            atr=atr,
+            vwap_distance=vwap_distance,
+            level_distance=level_distance,
+            pcr=pcr,
+            support_strike=support_strike,
+            support_oi=support_oi,
+            resistance_strike=resistance_strike,
+            resistance_oi=resistance_oi,
+            atm_straddle=atm_straddle,
+        )
+    )
+    return deltas
 
 
 def _is_near_day_open(ltp: float, today_open: Optional[float], *, tolerance_points: float) -> bool:
@@ -851,6 +1072,15 @@ def _build_tags(
     vwap_position: Optional[str],
     today_open: Optional[float],
     no_trade_zone: bool,
+    no_trade_zone_points: float,
+    atm_straddle: Optional[float],
+    atr_delta: Optional[float],
+    vwap_distance_delta: Optional[float],
+    level_distance_delta: Optional[float],
+    pcr_delta: Optional[float],
+    support_oi_delta: Optional[float],
+    resistance_oi_delta: Optional[float],
+    atm_straddle_delta: Optional[float],
 ) -> list[str]:
     """Builds the ready-to-render tag strings -- every directional tag (EMA above/below, opening
     range above/below, a nearby level) spells out the absolute point distance from LTP, not just
@@ -882,10 +1112,16 @@ def _build_tags(
     "fold a second fact into the same line" pattern the OR-target caution above already uses.
     When only one of the two is available (not enough candle history yet for the other), that one
     stands alone instead, unparenthesized.
+
+    Several tags below carry a trailing 5-minute-change suffix (see _record_and_diff) via
+    [_delta_suffix]/[_oi_delta_suffix] -- `None` (no in-band history yet) simply omits it, same
+    "missing data means omit" posture as everything else here. For VWAP/nearest-level specifically,
+    the delta is the *distance's* own change (negative = price closing in, positive = pulling
+    away), not VWAP/the level's own value change -- see _record_and_diff's doc comment for why.
     """
     tags: list[str] = []
     if no_trade_zone and today_open is not None:
-        tags.append(f"No-Trade Zone -- within {_NO_TRADE_ZONE_POINTS:g} of Day Open ({today_open:g})")
+        tags.append(f"No-Trade Zone -- within {no_trade_zone_points:g} of Day Open ({today_open:g})")
     have_5m = ema9_5m_position and ema9_5m_value is not None
     have_15m = ema9_15m_position and ema9_15m_value is not None
     if have_5m and have_15m:
@@ -898,7 +1134,7 @@ def _build_tags(
     elif have_15m:
         tags.append(f"{ema9_15m_position.capitalize()} 15m EMA9 by {abs(ltp - ema9_15m_value):.2f}")
     if atr14_5m is not None:
-        tags.append(f"ATR {round(atr14_5m, 1):g}")
+        tags.append(f"ATR {round(atr14_5m, 1):g}{_delta_suffix(atr_delta)}")
     if opening_range_position == "above" and opening_range_high is not None:
         tags.append(f"Above opening range by {ltp - opening_range_high:.2f}{_or_target_caution(ltp, nearest_or_target, 'pullback')}")
     elif opening_range_position == "below" and opening_range_low is not None:
@@ -907,18 +1143,33 @@ def _build_tags(
         tags.append("Inside opening range")
     if nearest_level:
         distance = abs(ltp - nearest_level["value"])
-        tags.append(f"Near {nearest_level['label']} by {distance:.2f}")
+        tags.append(f"Near {nearest_level['label']} by {distance:.2f}{_delta_suffix(level_distance_delta)}")
     if pcr is not None and pcr_bias is not None:
-        tags.append(f"PCR {pcr:.2f} - {pcr_bias.capitalize()} bias")
+        tags.append(f"PCR {pcr:.2f} - {pcr_bias.capitalize()} bias{_delta_suffix(pcr_delta)}")
     if max_pain is not None and max_pain_pull is not None:
         tags.append(f"Max Pain {max_pain:g} by {ltp - max_pain:+.2f} - {max_pain_pull.capitalize()} pull")
     if oi_support_strike is not None:
-        tags.append(f"OI Support {oi_support_strike:g} by {ltp - oi_support_strike:+.2f}")
+        tags.append(f"OI Support {oi_support_strike:g} by {ltp - oi_support_strike:+.2f}{_oi_delta_suffix(support_oi_delta, 'Put')}")
     if oi_resistance_strike is not None:
-        tags.append(f"OI Resistance {oi_resistance_strike:g} by {ltp - oi_resistance_strike:+.2f}")
+        tags.append(f"OI Resistance {oi_resistance_strike:g} by {ltp - oi_resistance_strike:+.2f}{_oi_delta_suffix(resistance_oi_delta, 'Call')}")
     if vwap_position and vwap_value is not None:
-        tags.append(f"{vwap_position.capitalize()} VWAP by {abs(ltp - vwap_value):.2f}")
+        tags.append(f"{vwap_position.capitalize()} VWAP by {abs(ltp - vwap_value):.2f}{_delta_suffix(vwap_distance_delta)}")
+    if atm_straddle is not None:
+        tags.append(f"ATM Straddle {atm_straddle:.2f}{_delta_suffix(atm_straddle_delta)}")
     return tags
+
+
+def _delta_suffix(delta: Optional[float]) -> str:
+    """The `" (+X.XX in 5m)"` trailing suffix shared by every plain-value 5-minute-change tag --
+    empty string if no delta is available (see _record_and_diff)."""
+    return f" ({delta:+.2f} in 5m)" if delta is not None else ""
+
+
+def _oi_delta_suffix(delta: Optional[float], label: str) -> str:
+    """Same idea as [_delta_suffix], but for OI support/resistance -- comma-grouped, no decimals
+    (OI is always a whole contract count), and labeled Put/Call explicitly since a bare number
+    here would be ambiguous about which side it's counting."""
+    return f" ({label} OI {delta:+,.0f} in 5m)" if delta is not None else ""
 
 
 def _or_target_caution(ltp: float, nearest_or_target: Optional[dict[str, Any]], reversal_word: str) -> str:

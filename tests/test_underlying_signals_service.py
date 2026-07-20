@@ -12,6 +12,7 @@ from app.services.underlying_signals_service import Candle, UnderlyingSignalsSer
 @pytest.fixture(autouse=True)
 def clear_signals_cache() -> None:
     signals._CACHE = {}
+    signals._HISTORY = {}
 
 
 # --- pure math helpers -------------------------------------------------------------------
@@ -139,6 +140,118 @@ def test_is_near_day_open_flags_ltp_within_the_fixed_point_tolerance() -> None:
     assert signals._is_near_day_open(0.0, 25000.0, tolerance_points=15.0) is False
 
 
+def _record(
+    key,
+    *,
+    now: float,
+    atr=None,
+    vwap_distance=None,
+    level_distance=None,
+    pcr=None,
+    support_strike=None,
+    support_oi=None,
+    resistance_strike=None,
+    resistance_oi=None,
+    atm_straddle=None,
+):
+    """Thin wrapper around _record_and_diff with every optional metric defaulted to None, so each
+    test only has to spell out the ones it actually cares about."""
+    return signals._record_and_diff(
+        key,
+        atr=atr,
+        vwap_distance=vwap_distance,
+        level_distance=level_distance,
+        pcr=pcr,
+        support_strike=support_strike,
+        support_oi=support_oi,
+        resistance_strike=resistance_strike,
+        resistance_oi=resistance_oi,
+        atm_straddle=atm_straddle,
+        now=now,
+    )
+
+
+def test_record_and_diff_returns_no_deltas_with_no_prior_history() -> None:
+    deltas = _record(("NSE_INDEX|Nifty 50", None), now=1000.0, atr=20.0, pcr=1.1)
+
+    assert deltas.atr is None
+    assert deltas.pcr is None
+
+
+def test_record_and_diff_computes_exact_delta_for_a_five_minute_old_snapshot() -> None:
+    key = ("NSE_INDEX|Nifty 50", None)
+    _record(key, now=1000.0, atr=20.0, vwap_distance=10.0, level_distance=5.0, pcr=1.1, atm_straddle=250.0)
+
+    deltas = _record(key, now=1000.0 + 300.0, atr=23.5, vwap_distance=6.0, level_distance=8.0, pcr=1.3, atm_straddle=260.0)
+
+    assert deltas.atr == pytest.approx(3.5)
+    # Negative -- the distance shrank (price closing in), not VWAP's own value.
+    assert deltas.vwap_distance == pytest.approx(-4.0)
+    assert deltas.level_distance == pytest.approx(3.0)
+    assert deltas.pcr == pytest.approx(0.2)
+    assert deltas.atm_straddle == pytest.approx(10.0)
+
+
+def test_record_and_diff_ignores_a_snapshot_outside_the_five_minute_band() -> None:
+    key = ("NSE_INDEX|Nifty 50", None)
+    _record(key, now=1000.0, atr=20.0)
+
+    # Only 3 minutes old -- outside the 4-6 minute tolerance band.
+    deltas = _record(key, now=1000.0 + 180.0, atr=25.0)
+
+    assert deltas.atr is None
+
+
+def test_record_and_diff_prunes_snapshots_older_than_the_history_window() -> None:
+    key = ("NSE_INDEX|Nifty 50", None)
+    _record(key, now=1000.0, atr=20.0)
+
+    # 11 minutes later -- past the 10-minute prune window, so the first snapshot is gone by the
+    # time this third call looks 5 minutes back from it.
+    _record(key, now=1000.0 + 660.0, atr=30.0)
+    deltas = _record(key, now=1000.0 + 660.0 + 300.0, atr=35.0)
+
+    assert deltas.atr == pytest.approx(5.0)  # only ever compared against the 30.0 snapshot
+    assert len(signals._HISTORY[key]) == 2  # the original 20.0 snapshot was pruned out
+
+
+def test_record_and_diff_one_metric_missing_does_not_affect_the_others() -> None:
+    key = ("NSE_INDEX|Nifty 50", None)
+    _record(key, now=1000.0, atr=20.0, pcr=None)
+
+    deltas = _record(key, now=1000.0 + 300.0, atr=22.0, pcr=1.4)
+
+    assert deltas.atr == pytest.approx(2.0)
+    assert deltas.pcr is None  # no PCR 5 minutes ago to compare against
+
+
+def test_record_and_diff_oi_support_resistance_require_the_same_strike() -> None:
+    key = ("NSE_INDEX|Nifty 50", "2026-07-23")
+    _record(key, now=1000.0, support_strike=24900.0, support_oi=1_000_000.0, resistance_strike=25200.0, resistance_oi=800_000.0)
+
+    # Support strike unchanged -> real delta. Resistance strike moved to a different strike -> no
+    # apples-to-apples comparison, so that delta stays None even though both OI numbers exist.
+    deltas = _record(
+        key, now=1000.0 + 300.0,
+        support_strike=24900.0, support_oi=1_200_000.0,
+        resistance_strike=25300.0, resistance_oi=900_000.0,
+    )
+
+    assert deltas.support_oi == pytest.approx(200_000.0)
+    assert deltas.resistance_oi is None
+
+
+def test_record_and_diff_atm_straddle_has_no_strike_gating() -> None:
+    """Unlike OI support/resistance, ATM straddle is diffed unconditionally -- the ATM strike is
+    expected to roll as price moves, so there's no strike-matching requirement to satisfy."""
+    key = ("NSE_INDEX|Nifty 50", "2026-07-23")
+    _record(key, now=1000.0, atm_straddle=250.0)
+
+    deltas = _record(key, now=1000.0 + 300.0, atm_straddle=310.0)
+
+    assert deltas.atm_straddle == pytest.approx(60.0)
+
+
 def test_pcr_bias_thresholds() -> None:
     assert signals._pcr_bias(1.2) == "bullish"
     assert signals._pcr_bias(1.5) == "bullish"
@@ -179,6 +292,15 @@ def test_build_tags_composes_readable_short_labels_with_absolute_point_distances
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert tags == [
@@ -212,6 +334,15 @@ def test_build_tags_merges_5m_and_15m_ema_into_one_line_when_both_agree() -> Non
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert tags == ["Above 5m EMA9 by 50.00 (15m Above by 100.00)"]
@@ -240,6 +371,15 @@ def test_build_tags_shows_5m_or_15m_ema_alone_when_only_one_is_available() -> No
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
     only_15m = signals._build_tags(
         ltp=25100.0,
@@ -263,6 +403,15 @@ def test_build_tags_shows_5m_or_15m_ema_alone_when_only_one_is_available() -> No
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert only_5m == ["Above 5m EMA9 by 50.00"]
@@ -292,6 +441,15 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
     below = signals._build_tags(
         ltp=24990.0,
@@ -315,6 +473,15 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert above == ["Above opening range by 10.00"]
@@ -346,6 +513,15 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
     # LTP is 2 points *past* the target (overshot it) -> positive signed distance.
     past_target = signals._build_tags(
@@ -370,6 +546,15 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
     # LTP (24988.0) hasn't reached its downside target (24990.0) yet -> negative signed
     # distance, and "bounce" (not "pullback") is the reversal word on this side.
@@ -395,6 +580,15 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert on_target == ["Above opening range by 10.00 (near OR Target 1 by +0.00, caution: possible pullback)"]
@@ -425,6 +619,15 @@ def test_build_tags_adds_pcr_and_max_pain_tags() -> None:
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert tags == [
@@ -456,6 +659,15 @@ def test_build_tags_omits_pcr_and_max_pain_when_unavailable() -> None:
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert tags == []
@@ -484,6 +696,15 @@ def test_build_tags_adds_oi_support_and_resistance_tags() -> None:
         vwap_position=None,
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert tags == [
@@ -515,9 +736,100 @@ def test_build_tags_adds_vwap_tag() -> None:
         vwap_position="above",
         today_open=None,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert tags == ["Above VWAP by 50.00"]
+
+
+def test_build_tags_appends_five_minute_change_suffixes_when_present() -> None:
+    tags = signals._build_tags(
+        ltp=25050.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=42.349,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level={"label": "R1 Pivot", "value": 25040.0, "distance_percent": 0.04},
+        nearest_or_target=None,
+        pcr=1.35,
+        pcr_bias="bullish",
+        max_pain=None,
+        max_pain_pull=None,
+        oi_support_strike=24900.0,
+        oi_resistance_strike=25200.0,
+        vwap_value=25000.0,
+        vwap_position="above",
+        today_open=None,
+        no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=245.60,
+        atr_delta=2.1,
+        vwap_distance_delta=-4.0,
+        level_distance_delta=3.0,
+        pcr_delta=-0.15,
+        support_oi_delta=120000.0,
+        resistance_oi_delta=-50000.0,
+        atm_straddle_delta=12.3,
+    )
+
+    assert tags == [
+        "ATR 42.3 (+2.10 in 5m)",
+        "Near R1 Pivot by 10.00 (+3.00 in 5m)",
+        "PCR 1.35 - Bullish bias (-0.15 in 5m)",
+        "OI Support 24900 by +150.00 (Put OI +120,000 in 5m)",
+        "OI Resistance 25200 by -150.00 (Call OI -50,000 in 5m)",
+        "Above VWAP by 50.00 (-4.00 in 5m)",
+        "ATM Straddle 245.60 (+12.30 in 5m)",
+    ]
+
+
+def test_build_tags_omits_five_minute_change_suffixes_when_absent() -> None:
+    tags = signals._build_tags(
+        ltp=25050.0,
+        ema9_5m_value=None,
+        ema9_5m_position=None,
+        ema9_15m_value=None,
+        ema9_15m_position=None,
+        atr14_5m=42.349,
+        opening_range_high=None,
+        opening_range_low=None,
+        opening_range_position=None,
+        nearest_level=None,
+        nearest_or_target=None,
+        pcr=None,
+        pcr_bias=None,
+        max_pain=None,
+        max_pain_pull=None,
+        oi_support_strike=None,
+        oi_resistance_strike=None,
+        vwap_value=None,
+        vwap_position=None,
+        today_open=None,
+        no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
+    )
+
+    assert tags == ["ATR 42.3"]  # no "(... in 5m)" suffix, and no ATM Straddle tag at all
 
 
 def test_build_tags_puts_no_trade_zone_caution_first_ahead_of_every_other_tag() -> None:
@@ -543,6 +855,15 @@ def test_build_tags_puts_no_trade_zone_caution_first_ahead_of_every_other_tag() 
         vwap_position=None,
         today_open=25000.0,
         no_trade_zone=True,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert tags == [
@@ -574,6 +895,15 @@ def test_build_tags_omits_no_trade_zone_caution_when_not_flagged() -> None:
         vwap_position=None,
         today_open=25000.0,
         no_trade_zone=False,
+        no_trade_zone_points=15.0,
+        atm_straddle=None,
+        atr_delta=None,
+        vwap_distance_delta=None,
+        level_distance_delta=None,
+        pcr_delta=None,
+        support_oi_delta=None,
+        resistance_oi_delta=None,
+        atm_straddle_delta=None,
     )
 
     assert tags == []
@@ -746,6 +1076,7 @@ class _FakeUpstoxService:
         futures_search_rows: list[dict[str, object]] | None = None,
         futures_candles: list[list[object]] | None = None,
         futures_ltp: float = 0.0,
+        option_chain_rows: list[dict[str, object]] | None = None,
     ) -> None:
         self._minute_candles = minute_candles
         self._daily_candles = daily_candles
@@ -757,6 +1088,7 @@ class _FakeUpstoxService:
         self._futures_search_rows = futures_search_rows or []
         self._futures_candles = futures_candles or []
         self._futures_ltp = futures_ltp
+        self._option_chain_rows = option_chain_rows or []
 
     async def get_historical_candle(self, access_token, instrument_key, *, unit, interval, to_date, from_date=None):
         if instrument_key == "NSE_FO|53216":
@@ -777,6 +1109,9 @@ class _FakeUpstoxService:
 
     async def search_instruments(self, access_token, *, query, segments, instrument_types, expiry, records):
         return {"status": "success", "data": self._futures_search_rows}
+
+    async def get_option_chain(self, access_token, instrument_key, *, expiry_date):
+        return {"status": "success", "data": self._option_chain_rows}
 
     async def get_oi(self, access_token, instrument_key, *, expiry, date):
         return {
@@ -858,8 +1193,12 @@ def test_get_signals_wires_everything_into_tags() -> None:
 
 
 def test_get_signals_flags_no_trade_zone_when_ltp_is_near_todays_open() -> None:
-    """LTP sitting just 10 points above today's own session open (well within the fixed 15-point
-    tolerance) should flag the no-trade-zone caution and put it first in the tag list.
+    """LTP sitting just 3 points above today's own session open should flag the no-trade-zone
+    caution and put it first in the tag list. The no-trade-zone tolerance is now ATR-scaled (see
+    _NO_TRADE_ZONE_ATR_MULTIPLIER/_NO_TRADE_ZONE_MIN_POINTS) rather than a flat 15 points -- the
+    `_rising_candles` fixture's constant 4-point true range converges ATR(14) to exactly 4.0, so
+    `4.0 * 0.75 = 3.0` is below the 5.0-point floor, meaning the *floor* is what actually applies
+    here (5.0), not the ATR-scaled value -- 3 points away is comfortably inside that.
     """
     start = datetime(2026, 7, 18, 9, 15)
     minute_candles = _rising_candles(20, start=start, step_minutes=5)
@@ -871,7 +1210,7 @@ def test_get_signals_flags_no_trade_zone_when_ltp_is_near_todays_open() -> None:
             minute_candles=minute_candles,
             daily_candles=daily_candles,
             strikes=[24800.0, 24850.0, 24900.0, 24950.0],
-            ltp=110.0,
+            ltp=103.0,
         ),
     )
 
@@ -881,7 +1220,44 @@ def test_get_signals_flags_no_trade_zone_when_ltp_is_near_todays_open() -> None:
 
     assert result["today_open"] == 100.0
     assert result["no_trade_zone"] is True
-    assert result["tags"][0] == "No-Trade Zone -- within 15 of Day Open (100)"
+    assert result["tags"][0] == "No-Trade Zone -- within 5 of Day Open (100)"
+
+
+def test_get_signals_no_trade_zone_tolerance_scales_with_atr() -> None:
+    """A higher-ATR session gets a wider no-trade-zone tolerance than the 5.0-point floor -- LTP
+    16 points from today's open is outside the fixed old 15-point constant but should still flag
+    once ATR is high enough to scale the dynamic tolerance past it.
+    """
+    start = datetime(2026, 7, 18, 9, 15)
+    # A wider, still-constant true range (20, not 4) so ATR(14) converges to 20.0 -- scaled
+    # tolerance = 20.0 * 0.75 = 15.0, still not quite 16, so push the true range a bit further.
+    minute_candles = []
+    price = 100.0
+    for i in range(20):
+        ts = (start + timedelta(minutes=5 * i)).isoformat()
+        minute_candles.append([ts, price, price + 12.0, price - 12.0, price + 1.0, 1000])
+        price += 1.0
+    daily_candles = [
+        ["2026-07-17T00:00:00+05:30", 100.0, 110.0, 95.0, 105.0, 500000],
+    ]
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=minute_candles,
+            daily_candles=daily_candles,
+            strikes=[24800.0, 24850.0, 24900.0, 24950.0],
+            ltp=116.0,
+        ),
+    )
+
+    result = anyio.run(
+        lambda: service.get_signals("upstox-token", underlying_key="NSE_INDEX|Nifty 50"),
+    )
+
+    # True range is a flat 24 every candle (high-low) -- ATR(14) converges to 24.0, so the
+    # ATR-scaled tolerance is 24.0 * 0.75 = 18.0, comfortably past the 16-point gap from open.
+    assert result["today_open"] == 100.0
+    assert result["no_trade_zone"] is True
+    assert "No-Trade Zone -- within 18 of Day Open (100)" in result["tags"]
 
 
 def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> None:
@@ -1028,6 +1404,73 @@ def test_futures_instrument_key_resolves_sensex_to_niftys_own_future() -> None:
     )
 
     assert resolved == "NSE_FO|53216"
+
+
+def test_fetch_atm_straddle_sums_ce_and_pe_ltp_at_the_closest_strike() -> None:
+    option_chain_rows = [
+        {
+            "strike_price": 24900.0,
+            "call_options": {"market_data": {"ltp": 150.0}},
+            "put_options": {"market_data": {"ltp": 40.0}},
+        },
+        {
+            "strike_price": 25000.0,
+            "call_options": {"market_data": {"ltp": 120.0}},
+            "put_options": {"market_data": {"ltp": 60.0}},
+        },
+        {
+            "strike_price": 25100.0,
+            "call_options": {"market_data": {"ltp": 90.0}},
+            "put_options": {"market_data": {"ltp": 90.0}},
+        },
+    ]
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=[], daily_candles=[], strikes=[], ltp=0.0,
+            option_chain_rows=option_chain_rows,
+        ),
+    )
+
+    straddle = anyio.run(
+        lambda: service._fetch_atm_straddle(
+            "upstox-token", "NSE_INDEX|Nifty 50", "2026-07-23", 25010.0,
+        ),
+    )
+
+    # 25000 is the closest strike to ltp=25010.0 -> 120.0 (CE) + 60.0 (PE).
+    assert straddle == pytest.approx(180.0)
+
+
+def test_fetch_atm_straddle_returns_none_without_expiry_date() -> None:
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(minute_candles=[], daily_candles=[], strikes=[], ltp=0.0),
+    )
+
+    straddle = anyio.run(
+        lambda: service._fetch_atm_straddle("upstox-token", "NSE_INDEX|Nifty 50", None, 25010.0),
+    )
+
+    assert straddle is None
+
+
+def test_fetch_atm_straddle_returns_none_when_a_side_has_no_ltp() -> None:
+    option_chain_rows = [
+        {"strike_price": 25000.0, "call_options": {"market_data": {"ltp": 120.0}}, "put_options": {}},
+    ]
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=[], daily_candles=[], strikes=[], ltp=0.0,
+            option_chain_rows=option_chain_rows,
+        ),
+    )
+
+    straddle = anyio.run(
+        lambda: service._fetch_atm_straddle(
+            "upstox-token", "NSE_INDEX|Nifty 50", "2026-07-23", 25010.0,
+        ),
+    )
+
+    assert straddle is None
 
 
 def test_get_signals_includes_vwap_when_underlying_symbol_is_given() -> None:

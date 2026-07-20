@@ -749,6 +749,7 @@ def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     _SEARCH_CACHE.clear()
     oi_analysis_service._CACHE = {}
     underlying_signals_service._CACHE = {}
+    underlying_signals_service._HISTORY = {}
     instrument_rules_service._CACHE = _MasterCache(
         expires_at=9999999999,
         by_key={
@@ -1293,7 +1294,9 @@ def test_main_underlying_signals_returns_ema_atr_opening_range_and_nearest_level
 
 class _NearDayOpenFakeUpstoxService(FakeUpstoxService):
     """LTP set just 5 points above the shared candle series' first-candle open (24900.0) -- well
-    within the fixed 15-point no-trade-zone tolerance -- to exercise the caution end to end."""
+    within the dynamic no-trade-zone tolerance (the shared rising candle series' ATR(14) on 5m
+    yields 10.0, scaled by _NO_TRADE_ZONE_ATR_MULTIPLIER=0.75 to a 7.5-point tolerance) -- to
+    exercise the caution end to end."""
 
     async def get_quotes(self, access_token: str, instrument_key: str) -> dict[str, Any]:
         result = await super().get_quotes(access_token, instrument_key)
@@ -1310,6 +1313,7 @@ def test_main_underlying_signals_flags_no_trade_zone_near_days_open() -> None:
     _SEARCH_CACHE.clear()
     oi_analysis_service._CACHE = {}
     underlying_signals_service._CACHE = {}
+    underlying_signals_service._HISTORY = {}
     client = TestClient(app)
     try:
         response = client.get(
@@ -1324,7 +1328,7 @@ def test_main_underlying_signals_flags_no_trade_zone_near_days_open() -> None:
 
     assert payload["today_open"] == 24900.0
     assert payload["no_trade_zone"] is True
-    assert payload["tags"][0] == "No-Trade Zone -- within 15 of Day Open (24900)"
+    assert payload["tags"][0] == "No-Trade Zone -- within 7.5 of Day Open (24900)"
 
 
 def test_main_underlying_signals_includes_vwap_when_underlying_symbol_is_given() -> None:

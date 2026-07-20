@@ -332,12 +332,14 @@ everything else is unaffected.
   "tags": [
     "Above 5m EMA9 by 39.50 (15m Above by 60.00)",
     "Inside opening range",
-    "Near R1 Pivot by 36.60",
-    "PCR 1.35 - Bullish bias",
+    "ATR 42.3 (+2.10 in 5m)",
+    "Near R1 Pivot by 36.60 (-3.00 in 5m)",
+    "PCR 1.35 - Bullish bias (-0.15 in 5m)",
     "Max Pain 25000 by +50.00 - Bearish pull",
-    "OI Support 24900 by +150.00",
-    "OI Resistance 25200 by -150.00",
-    "Above VWAP by 9.75"
+    "OI Support 24900 by +150.00 (Put OI +120,000 in 5m)",
+    "OI Resistance 25200 by -150.00 (Call OI -50,000 in 5m)",
+    "Above VWAP by 9.75 (-4.00 in 5m)",
+    "ATM Straddle 245.60 (+12.30 in 5m)"
   ]
 }
 ```
@@ -376,11 +378,15 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   bracketing LTP. `0.0` if there isn't enough strike data to derive a step.
 - `today_open`: today's session open (the first 5-minute candle's open). `null` before any candle
   for today exists yet.
-- `no_trade_zone`: `true` when LTP is currently within a fixed **15 points** of `today_open` --
-  price whipsaws right around the open before it's picked a direction, so this is a caution not to
-  act on the rest of the bulletin yet. Always `false` (never a false caution) when `today_open`
-  isn't known yet. When `true`, a `"No-Trade Zone -- within 15 of Day Open (X)"` tag is inserted
-  **first** in `tags`, ahead of every other tag -- see the `tags` description below.
+- `no_trade_zone`: `true` when LTP is currently within a **dynamic**, ATR-scaled tolerance of
+  `today_open` -- price whipsaws right around the open before it's picked a direction, so this is a
+  caution not to act on the rest of the bulletin yet. The tolerance is
+  `max(atr14_5m * 0.75, 5.0)` points -- a quiet, low-volatility session gets a tighter buffer than a
+  volatile one, with a 5-point floor -- falling back to a flat **15 points** only when `atr14_5m`
+  isn't available yet (not enough candle history). Always `false` (never a false caution) when
+  `today_open` isn't known yet. When `true`, a `"No-Trade Zone -- within X of Day Open (Y)"` tag
+  (where `X` is that call's actual computed tolerance) is inserted **first** in `tags`, ahead of
+  every other tag -- see the `tags` description below.
 - `nearest_level`: whichever of `previous_day`'s three values, the five pivot levels, or the two
   round numbers is closest to LTP, **only if** it's within 0.15% of LTP -- `null` if nothing is
   that close right now.
@@ -415,6 +421,11 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   writing there reads as a level put writers will defend, i.e. support); `oi_resistance` is the
   strike with the highest **call** OI in the same window (the mirror image). `oi` on each is that
   strike's own OI count. `null` if there's no usable per-strike data within the window.
+- ATM straddle (no dedicated JSON field -- tag only): when `expiry_date` is given, an
+  `"ATM Straddle {value} ({delta} in 5m)"` tag is appended -- `value` is the sum of the ATM call and
+  ATM put's own LTP (the strike closest to underlying LTP, from the same option-chain fetch used
+  for `pcr`/`oi_support`/`oi_resistance`). Omitted entirely if `expiry_date` wasn't given or the
+  option chain has no usable per-strike premium data.
 - `vwap`: `null` unless `underlying_symbol` was given **and** a current-month futures contract is
   listed for this underlying (true for NIFTY/BANKNIFTY-style indices and most F&O-enabled stocks,
   false for most individual equities and any Upstox resolution failure -- degrades quietly, same
@@ -437,9 +448,34 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   with `"Above"`/`"Below"` like the others) since neither phrasing fits those two signals -- the
   app's tag-sentiment classifier checks for both. The OI support/resistance tags are informational
   (no bullish/bearish framing) -- they render as neutral on the client. When `no_trade_zone` is
-  `true`, its `"No-Trade Zone -- within 15 of Day Open (X)"` tag is always **first** in the list --
+  `true`, its `"No-Trade Zone -- within X of Day Open (Y)"` tag is always **first** in the list --
   the client's tag-sentiment classifier renders it as a distinct warning (not bullish/bearish/
   neutral) so it doesn't get lost among the rest.
+
+  **5-minute-change suffixes**: the ATR, VWAP, nearest-level, PCR, OI support, and OI resistance
+  tags (plus the ATM Straddle tag, when present) each carry a trailing bracketed suffix showing how
+  much that reading has moved over roughly the last 5 minutes, once enough polling history has
+  accumulated for this underlying/expiry (the very first call after selecting a new
+  underlying/expiry -- or any call with no in-band sample 4-6 minutes old -- omits the suffix
+  entirely, it is never fabricated). Two different formats are used:
+  - ATR, PCR, and ATM Straddle show their own **value's** change: `" ({delta:+.2f} in 5m)"`, e.g.
+    `"ATR 42.3 (+2.10 in 5m)"`, `"PCR 1.35 - Bullish bias (-0.15 in 5m)"`.
+  - VWAP and the nearest-level tag instead show the change in **distance** between LTP and that
+    line (`|LTP - VWAP|` / `|LTP - level|`) -- the same number already shown in the tag's own
+    `"by X.XX"` -- since a moving VWAP/level value on its own isn't actionable, but price closing in
+    on or pulling away from it is. A **negative** delta means the distance shrank (price is
+    approaching), positive means it grew (price is pulling away) -- the opposite reading from "the
+    line itself went up/down". E.g. `"Above VWAP by 9.75 (-4.00 in 5m)"` means price has moved 4
+    points closer to VWAP over the last 5 minutes.
+  - OI Support / OI Resistance instead show the change in **OI at that strike**, on the relevant
+    side only (put OI for support, call OI for resistance) -- this answers "is the level still
+    being defended", not just "is price closer to it": `" (Put OI {delta:+,.0f} in 5m)"` /
+    `" (Call OI {delta:+,.0f} in 5m)"`, e.g. `"OI Support 24900 by +150.00 (Put OI +120,000 in 5m)"`.
+    This delta resets to omitted for one poll whenever the support/resistance **strike itself**
+    changes (a different strike takes over the highest OI) -- comparing OI across two different
+    strikes wouldn't mean anything. ATM Straddle has **no** such reset: its delta is tracked across
+    whatever strike happens to be ATM at each sample, since the ATM strike is expected to roll
+    continuously as price moves.
 
 Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round step) are cached
 ~60 seconds -- they only meaningfully change when a new candle closes, not on every feed tick.
