@@ -339,7 +339,7 @@ everything else is unaffected.
     "OI(S) 24900 (C/+4.1L, P/+1.2L)",
     "OI(R) 25200 (C/-50,000, P/-1.1L)",
     "Above VWAP by 9.75 (-4.00 in 5m)",
-    "ATM Straddle 245.60 (+12.30 in 5m)"
+    "STR(ATM) 245.6 (+12.3)"
   ]
 }
 ```
@@ -425,11 +425,13 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   `"OI(R) {strike}"` tag additionally tracks the **other** side's OI at that same strike internally
   (not a separate JSON field) so its 5-minute-change suffix can show both sides at once -- see the
   `tags` description below.
-- ATM straddle (no dedicated JSON field -- tag only): when `expiry_date` is given, an
-  `"ATM Straddle {value} ({delta} in 5m)"` tag is appended -- `value` is the sum of the ATM call and
-  ATM put's own LTP (the strike closest to underlying LTP, from the same option-chain fetch used
-  for `pcr`/`oi_support`/`oi_resistance`). Omitted entirely if `expiry_date` wasn't given or the
-  option chain has no usable per-strike premium data.
+- ATM straddle (no dedicated JSON field -- tag only): when `expiry_date` is given, a
+  `"STR(ATM) {value} ({delta})"` tag is appended -- `value` is the sum of the ATM call and ATM
+  put's own LTP (the strike closest to underlying LTP, from the same option-chain fetch used for
+  `pcr`/`oi_support`/`oi_resistance`). This is a ticker-only tag (see the client's `isOiTag`), so
+  its delta uses the same compact one-decimal format as the OI tags rather than the bulletin's
+  `"in 5m"` wording. Omitted entirely if `expiry_date` wasn't given or the option chain has no
+  usable per-strike premium data.
 - `vwap`: `null` unless `underlying_symbol` was given **and** a current-month futures contract is
   listed for this underlying (true for NIFTY/BANKNIFTY-style indices and most F&O-enabled stocks,
   false for most individual equities and any Upstox resolution failure -- degrades quietly, same
@@ -459,14 +461,17 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   Open (Y)"` tag is always **first** in the list -- the client's tag-sentiment classifier renders
   it as a distinct warning (not bullish/bearish/neutral) so it doesn't get lost among the rest.
 
-  **5-minute-change suffixes**: the ATR, VWAP, nearest-level, PCR, `OI(S)`, and `OI(R)` tags (plus
-  the ATM Straddle tag, when present) each carry a trailing bracketed suffix showing how much that
-  reading has moved over roughly the last 5 minutes, once enough polling history has accumulated
-  for this underlying/expiry (the very first call after selecting a new underlying/expiry -- or any
-  call with no in-band sample 4-6 minutes old -- omits the suffix entirely, it is never
-  fabricated). Three different formats are used:
-  - ATR, PCR, and ATM Straddle show their own **value's** change: `" ({delta:+.2f} in 5m)"`, e.g.
-    `"ATR 42.3 (+2.10 in 5m)"`, `"PCR 1.35 (-0.15 in 5m)"`.
+  **5-minute-change suffixes**: the ATR, VWAP, nearest-level, PCR, `OI(S)`, `OI(R)`, and `STR(ATM)`
+  tags each carry a trailing bracketed suffix showing how much that reading has moved over roughly
+  the last 5 minutes, once enough polling history has accumulated for this underlying/expiry (the
+  very first call after selecting a new underlying/expiry -- or any call with no in-band sample
+  4-6 minutes old -- omits the suffix entirely, it is never fabricated). A few different formats
+  are used:
+  - ATR and PCR (bulletin-style tags) show their own **value's** change with the full `"in 5m"`
+    wording: `" ({delta:+.2f} in 5m)"`, e.g. `"ATR 42.3 (+2.10 in 5m)"`, `"PCR 1.35 (-0.15 in 5m)"`.
+  - `STR(ATM)` (a ticker-only tag -- see below) also shows its own value's change, but in the
+    ticker's more compact one-decimal form with no `"in 5m"` wording: `" (+X.X)"`, e.g.
+    `"STR(ATM) 245.6 (+12.3)"`.
   - VWAP and the nearest-level tag instead show the change in **distance** between LTP and that
     line (`|LTP - VWAP|` / `|LTP - level|`) -- the same number already shown in the tag's own
     `"by X.XX"` -- since a moving VWAP/level value on its own isn't actionable, but price closing in
@@ -484,9 +489,14 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
     (no in-band history yet) drops just that side, not the whole suffix. Both sides reset to
     omitted for one poll whenever the support/resistance **strike itself** changes (a different
     strike takes over the highest OI) -- comparing OI across two different strikes wouldn't mean
-    anything. ATM Straddle has **no** such reset: its delta is tracked across whatever strike
-    happens to be ATM at each sample, since the ATM strike is expected to roll continuously as
-    price moves.
+    anything. `STR(ATM)` has **no** such reset: its delta is tracked across whatever strike happens
+    to be ATM at each sample, since the ATM strike is expected to roll continuously as price moves.
+
+  **Ticker-only tags**: `PCR`, `Max Pain`, `OI(S)`, `OI(R)`, and `STR(ATM)` are all shown by the
+  Android client only in the sticky action panel's scrolling ticker (`isOiTag`, despite the name,
+  now also matches `STR(ATM)`), not in the full bulletin -- they're already single-line facts, so
+  showing them twice would be redundant. `STR(ATM)`'s own chevron/color always renders neutral
+  (no bullish/bearish framing), same as `OI(S)`/`OI(R)`.
 
 Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round step) are cached
 ~60 seconds -- they only meaningfully change when a new candle closes, not on every feed tick.

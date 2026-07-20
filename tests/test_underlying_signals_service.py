@@ -830,7 +830,7 @@ def test_build_tags_appends_five_minute_change_suffixes_when_present() -> None:
         "OI(S) 24900 (C/+4.1L, P/+1.2L)",
         "OI(R) 25200 (C/-50,000, P/-1.1L)",
         "Above VWAP by 50.00 (-4.00 in 5m)",
-        "ATM Straddle 245.60 (+12.30 in 5m)",
+        "STR(ATM) 245.6 (+12.3)",
     ]
 
 

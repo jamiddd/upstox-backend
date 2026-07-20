@@ -1207,7 +1207,7 @@ def _build_tags(
     if vwap_position and vwap_value is not None:
         tags.append(f"{vwap_position.capitalize()} VWAP by {abs(ltp - vwap_value):.2f}{_delta_suffix(vwap_distance_delta)}")
     if atm_straddle is not None:
-        tags.append(f"ATM Straddle {atm_straddle:.2f}{_delta_suffix(atm_straddle_delta)}")
+        tags.append(f"STR(ATM) {atm_straddle:.1f}{_compact_delta_suffix(atm_straddle_delta)}")
     return tags
 
 
@@ -1215,6 +1215,14 @@ def _delta_suffix(delta: Optional[float]) -> str:
     """The `" (+X.XX in 5m)"` trailing suffix shared by every plain-value 5-minute-change tag --
     empty string if no delta is available (see _record_and_diff)."""
     return f" ({delta:+.2f} in 5m)" if delta is not None else ""
+
+
+def _compact_delta_suffix(delta: Optional[float]) -> str:
+    """The `" (+X.X)"` trailing suffix used by ticker-only tags (currently just ATM straddle) --
+    same idea as [_delta_suffix], but one decimal place and no "in 5m" wording, since these tags
+    live in the space-constrained scrolling ticker rather than the full bulletin. Empty string if
+    no delta is available (see _record_and_diff)."""
+    return f" ({delta:+.1f})" if delta is not None else ""
 
 
 def _short_oi_delta(delta: Optional[float]) -> Optional[str]:
