@@ -613,17 +613,19 @@ async def place_smart_bracket_order(
 @protected_router.get("/orders/gtt")
 async def get_gtt_orders(
     instrument_key: str = Query(..., min_length=1),
+    include_history: bool = Query(False),
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> list[dict[str, Any]]:
-    """Active GTT orders for one instrument -- lets the app find the bracket order behind an open
-    position so its target/stoploss can be shown and edited. See
-    SmartOrderService.get_gtt_orders_for_instrument.
+    """GTT orders for one instrument -- lets the app find the bracket order behind an open
+    position so its target/stoploss can be shown and edited, or (with include_history=true) find
+    the bracket a now-closed order had by matching created_at against the order's own fill time.
+    See SmartOrderService.get_gtt_orders_for_instrument.
     """
     access_token = _load_access_token(token_store)
     try:
         return await SmartOrderService(service).get_gtt_orders_for_instrument(
-            access_token, instrument_key=instrument_key
+            access_token, instrument_key=instrument_key, include_history=include_history
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc

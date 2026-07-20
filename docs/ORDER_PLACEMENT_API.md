@@ -138,11 +138,18 @@ Normal Upstox v3 place-order supports slice=true, but GTT place order does not d
 
 ```http
 GET /api/orders/gtt?instrument_key=NSE_FO|111
+GET /api/orders/gtt?instrument_key=NSE_FO|111&include_history=true
 ```
 
-Returns the active (not `CANCELLED`/`REJECTED`/`COMPLETED`) GTT orders for one instrument --
-lets the client find the bracket order behind an open position so its target/stoploss can be
-shown and edited. `instrument_key` is required.
+By default, returns the active (not `CANCELLED`/`REJECTED`/`COMPLETED`) GTT orders for one
+instrument -- lets the client find the bracket order behind an open position so its
+target/stoploss can be shown and edited. `instrument_key` is required.
+
+With `include_history=true`, also returns `COMPLETED` brackets (still excludes
+`CANCELLED`/`REJECTED`, which never actually fired) -- lets the client recover the
+target/stoploss a now-closed position had, by matching a specific order's own fill timestamp
+against each returned GTT's `created_at` (Unix microseconds) and picking the closest one that
+isn't after it.
 
 Response (raw passthrough of the matching Upstox GTT order entries):
 
@@ -154,6 +161,7 @@ Response (raw passthrough of the matching Upstox GTT order entries):
     "quantity": 75,
     "product": "I",
     "status": "ACTIVE",
+    "created_at": 1740641185000000,
     "rules": [
       { "strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": 125.5 },
       { "strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 140.0 },

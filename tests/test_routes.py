@@ -333,6 +333,19 @@ class FakeUpstoxService:
                     "rules": [],
                 },
                 {
+                    "gtt_order_id": "GTT-done",
+                    "instrument_token": "NSE_FO|111",
+                    "quantity": 75,
+                    "product": "I",
+                    "status": "COMPLETED",
+                    "created_at": 1740641185000000,
+                    "rules": [
+                        {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": 100.0},
+                        {"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 115.0},
+                        {"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 92.0},
+                    ],
+                },
+                {
                     "gtt_order_id": "GTT-other",
                     "instrument_token": "NSE_FO|222",
                     "quantity": 75,
@@ -1837,6 +1850,25 @@ def test_get_gtt_orders_filters_by_instrument_and_active_status() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert [order["gtt_order_id"] for order in payload] == ["GTT-111"]
+
+
+def test_get_gtt_orders_with_history_includes_completed_but_not_cancelled() -> None:
+    """include_history=true also returns COMPLETED brackets (so a closed order's historical
+    target/stoploss can be recovered), but still excludes CANCELLED/REJECTED -- those never
+    actually fired so they aren't a real target/stoploss the position had."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/orders/gtt",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|111", "include_history": "true"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert {order["gtt_order_id"] for order in payload} == {"GTT-111", "GTT-done"}
 
 
 def test_modify_gtt_order_resends_full_rule_set() -> None:

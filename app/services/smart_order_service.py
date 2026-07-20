@@ -168,22 +168,30 @@ class SmartOrderService:
         }
 
     async def get_gtt_orders_for_instrument(
-        self, access_token: str, *, instrument_key: str
+        self, access_token: str, *, instrument_key: str, include_history: bool = False
     ) -> list[dict[str, Any]]:
-        """Active GTT orders for one instrument -- lets the app find the bracket order behind an
-        open position so its target/stoploss can be edited (see modify_gtt_bracket). "Active"
-        excludes terminal statuses (cancelled/rejected/completed); anything else is treated as
-        still-live so an unfamiliar status fails open rather than silently hiding a real order.
+        """GTT orders for one instrument.
+
+        By default, "active" only -- excludes terminal statuses (cancelled/rejected/completed);
+        anything else is treated as still-live so an unfamiliar status fails open rather than
+        silently hiding a real order. Lets the app find the bracket order behind an open position
+        so its target/stoploss can be edited (see modify_gtt_bracket).
+
+        With include_history=True, COMPLETED brackets are also returned (still excludes
+        cancelled/rejected, which never actually fired) -- lets the app show what target/stoploss
+        was active for a now-closed position, by matching a specific order's fill time against
+        each returned GTT's own `created_at`.
         """
         payload = await self.upstox.get_gtt_orders(access_token)
         data = payload.get("data")
         orders = data if isinstance(data, list) else []
+        excluded_statuses = _TERMINAL_GTT_STATUSES if not include_history else _NEVER_FIRED_GTT_STATUSES
         return [
             order
             for order in orders
             if isinstance(order, dict)
             and order.get("instrument_token") == instrument_key
-            and str(order.get("status", "")).upper() not in _INACTIVE_GTT_STATUSES
+            and str(order.get("status", "")).upper() not in excluded_statuses
         ]
 
     async def modify_gtt_bracket(
@@ -324,7 +332,12 @@ class SmartOrderService:
 
 # Terminal GTT statuses -- anything else (e.g. a still-pending/triggered rule) is treated as
 # active. See SmartOrderService.get_gtt_orders_for_instrument.
-_INACTIVE_GTT_STATUSES = {"CANCELLED", "REJECTED", "COMPLETED"}
+_TERMINAL_GTT_STATUSES = {"CANCELLED", "REJECTED", "COMPLETED"}
+
+# Statuses that mean the bracket's rules never actually fired -- excluded even from history
+# lookups since they don't represent real target/stoploss levels a position ever had. COMPLETED
+# is kept for history since it means a rule genuinely triggered.
+_NEVER_FIRED_GTT_STATUSES = {"CANCELLED", "REJECTED"}
 
 
 def _build_gtt_rules(
