@@ -150,8 +150,10 @@ def _record(
     pcr=None,
     support_strike=None,
     support_oi=None,
+    support_call_oi=None,
     resistance_strike=None,
     resistance_oi=None,
+    resistance_put_oi=None,
     atm_straddle=None,
 ):
     """Thin wrapper around _record_and_diff with every optional metric defaulted to None, so each
@@ -164,8 +166,10 @@ def _record(
         pcr=pcr,
         support_strike=support_strike,
         support_oi=support_oi,
+        support_call_oi=support_call_oi,
         resistance_strike=resistance_strike,
         resistance_oi=resistance_oi,
+        resistance_put_oi=resistance_put_oi,
         atm_straddle=atm_straddle,
         now=now,
     )
@@ -227,18 +231,25 @@ def test_record_and_diff_one_metric_missing_does_not_affect_the_others() -> None
 
 def test_record_and_diff_oi_support_resistance_require_the_same_strike() -> None:
     key = ("NSE_INDEX|Nifty 50", "2026-07-23")
-    _record(key, now=1000.0, support_strike=24900.0, support_oi=1_000_000.0, resistance_strike=25200.0, resistance_oi=800_000.0)
+    _record(
+        key, now=1000.0,
+        support_strike=24900.0, support_oi=1_000_000.0, support_call_oi=300_000.0,
+        resistance_strike=25200.0, resistance_oi=800_000.0, resistance_put_oi=200_000.0,
+    )
 
-    # Support strike unchanged -> real delta. Resistance strike moved to a different strike -> no
-    # apples-to-apples comparison, so that delta stays None even though both OI numbers exist.
+    # Support strike unchanged -> real deltas on both sides. Resistance strike moved to a
+    # different strike -> no apples-to-apples comparison, so both its deltas stay None even
+    # though all the OI numbers exist.
     deltas = _record(
         key, now=1000.0 + 300.0,
-        support_strike=24900.0, support_oi=1_200_000.0,
-        resistance_strike=25300.0, resistance_oi=900_000.0,
+        support_strike=24900.0, support_oi=1_200_000.0, support_call_oi=350_000.0,
+        resistance_strike=25300.0, resistance_oi=900_000.0, resistance_put_oi=250_000.0,
     )
 
     assert deltas.support_oi == pytest.approx(200_000.0)
+    assert deltas.support_call_oi == pytest.approx(50_000.0)
     assert deltas.resistance_oi is None
+    assert deltas.resistance_put_oi is None
 
 
 def test_record_and_diff_atm_straddle_has_no_strike_gating() -> None:
@@ -299,7 +310,9 @@ def test_build_tags_composes_readable_short_labels_with_absolute_point_distances
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -341,7 +354,9 @@ def test_build_tags_merges_5m_and_15m_ema_into_one_line_when_both_agree() -> Non
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -378,7 +393,9 @@ def test_build_tags_shows_5m_or_15m_ema_alone_when_only_one_is_available() -> No
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
     only_15m = signals._build_tags(
@@ -410,7 +427,9 @@ def test_build_tags_shows_5m_or_15m_ema_alone_when_only_one_is_available() -> No
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -448,7 +467,9 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
     below = signals._build_tags(
@@ -480,7 +501,9 @@ def test_build_tags_reports_opening_range_breakout_distance() -> None:
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -520,7 +543,9 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
     # LTP is 2 points *past* the target (overshot it) -> positive signed distance.
@@ -553,7 +578,9 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
     # LTP (24988.0) hasn't reached its downside target (24990.0) yet -> negative signed
@@ -587,7 +614,9 @@ def test_build_tags_folds_or_target_caution_into_the_opening_range_tag() -> None
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -626,12 +655,14 @@ def test_build_tags_adds_pcr_and_max_pain_tags() -> None:
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
     assert tags == [
-        "PCR 1.35 - Bullish bias",
+        "PCR 1.35",
         "Max Pain 25000 by +50.00 - Bearish pull",
     ]
 
@@ -666,7 +697,9 @@ def test_build_tags_omits_pcr_and_max_pain_when_unavailable() -> None:
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -703,13 +736,15 @@ def test_build_tags_adds_oi_support_and_resistance_tags() -> None:
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
     assert tags == [
-        "OI Support 24900 by +150.00",
-        "OI Resistance 25200 by -150.00",
+        "OI(S) 24900",
+        "OI(R) 25200",
     ]
 
 
@@ -743,7 +778,9 @@ def test_build_tags_adds_vwap_tag() -> None:
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -780,16 +817,18 @@ def test_build_tags_appends_five_minute_change_suffixes_when_present() -> None:
         level_distance_delta=3.0,
         pcr_delta=-0.15,
         support_oi_delta=120000.0,
+        support_call_oi_delta=410000.0,
         resistance_oi_delta=-50000.0,
+        resistance_put_oi_delta=-110000.0,
         atm_straddle_delta=12.3,
     )
 
     assert tags == [
         "ATR 42.3 (+2.10 in 5m)",
         "Near R1 Pivot by 10.00 (+3.00 in 5m)",
-        "PCR 1.35 - Bullish bias (-0.15 in 5m)",
-        "OI Support 24900 by +150.00 (Put OI +120,000 in 5m)",
-        "OI Resistance 25200 by -150.00 (Call OI -50,000 in 5m)",
+        "PCR 1.35 (-0.15 in 5m)",
+        "OI(S) 24900 (C/+4.1L, P/+1.2L)",
+        "OI(R) 25200 (C/-50,000, P/-1.1L)",
         "Above VWAP by 50.00 (-4.00 in 5m)",
         "ATM Straddle 245.60 (+12.30 in 5m)",
     ]
@@ -825,7 +864,9 @@ def test_build_tags_omits_five_minute_change_suffixes_when_absent() -> None:
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -862,7 +903,9 @@ def test_build_tags_puts_no_trade_zone_caution_first_ahead_of_every_other_tag() 
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -902,7 +945,9 @@ def test_build_tags_omits_no_trade_zone_caution_when_not_flagged() -> None:
         level_distance_delta=None,
         pcr_delta=None,
         support_oi_delta=None,
+        support_call_oi_delta=None,
         resistance_oi_delta=None,
+        resistance_put_oi_delta=None,
         atm_straddle_delta=None,
     )
 
@@ -916,16 +961,23 @@ def test_oi_support_resistance_picks_highest_put_and_call_oi_strikes() -> None:
         {"strike_price": 25100.0, "call_oi": 1500000, "put_oi": 400000},
     ]
 
-    support_strike, support_oi, resistance_strike, resistance_oi = signals._oi_support_resistance(rows)
+    (
+        support_strike, support_oi, support_call_oi,
+        resistance_strike, resistance_oi, resistance_put_oi,
+    ) = signals._oi_support_resistance(rows)
 
     assert (support_strike, support_oi) == (24900.0, 1200000.0)
     assert (resistance_strike, resistance_oi) == (25100.0, 1500000.0)
+    # The *other* side's OI at each of those same two strikes -- call OI at 24900 (the support
+    # strike), put OI at 25100 (the resistance strike).
+    assert support_call_oi == 500000.0
+    assert resistance_put_oi == 400000.0
 
 
 def test_oi_support_resistance_returns_none_for_empty_or_unusable_rows() -> None:
-    assert signals._oi_support_resistance([]) == (None, None, None, None)
+    assert signals._oi_support_resistance([]) == (None, None, None, None, None, None)
     assert signals._oi_support_resistance([{"strike_price": None, "call_oi": 100, "put_oi": 100}]) == (
-        None, None, None, None,
+        None, None, None, None, None, None,
     )
 
 
@@ -1311,10 +1363,10 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
     assert result["max_pain"] == {"value": 190.0, "pull": "bearish"}
     assert result["oi_support"] == {"value": 190.0, "oi": 1200000.0}
     assert result["oi_resistance"] == {"value": 210.0, "oi": 1500000.0}
-    assert any(tag.startswith("PCR 0.80 - Bearish bias") for tag in result["tags"])
+    assert any(tag.startswith("PCR 0.80") for tag in result["tags"])
     assert any(tag.startswith("Max Pain 190 by +10.00 - Bearish pull") for tag in result["tags"])
-    assert any(tag.startswith("OI Support 190 by +10.00") for tag in result["tags"])
-    assert any(tag.startswith("OI Resistance 210 by -10.00") for tag in result["tags"])
+    assert any(tag.startswith("OI(S) 190") for tag in result["tags"])
+    assert any(tag.startswith("OI(R) 210") for tag in result["tags"])
 
 
 # --- futures resolution + VWAP wiring --------------------------------------------------------

@@ -334,10 +334,10 @@ everything else is unaffected.
     "Inside opening range",
     "ATR 42.3 (+2.10 in 5m)",
     "Near R1 Pivot by 36.60 (-3.00 in 5m)",
-    "PCR 1.35 - Bullish bias (-0.15 in 5m)",
+    "PCR 1.35 (-0.15 in 5m)",
     "Max Pain 25000 by +50.00 - Bearish pull",
-    "OI Support 24900 by +150.00 (Put OI +120,000 in 5m)",
-    "OI Resistance 25200 by -150.00 (Call OI -50,000 in 5m)",
+    "OI(S) 24900 (C/+4.1L, P/+1.2L)",
+    "OI(R) 25200 (C/-50,000, P/-1.1L)",
     "Above VWAP by 9.75 (-4.00 in 5m)",
     "ATM Straddle 245.60 (+12.30 in 5m)"
   ]
@@ -420,7 +420,11 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   `oi_support` is the strike with the single highest **put** OI *within that window* (heavy put
   writing there reads as a level put writers will defend, i.e. support); `oi_resistance` is the
   strike with the highest **call** OI in the same window (the mirror image). `oi` on each is that
-  strike's own OI count. `null` if there's no usable per-strike data within the window.
+  strike's own OI count (put OI for `oi_support`, call OI for `oi_resistance`). `null` if there's
+  no usable per-strike data within the window. The corresponding `"OI(S) {strike}"` /
+  `"OI(R) {strike}"` tag additionally tracks the **other** side's OI at that same strike internally
+  (not a separate JSON field) so its 5-minute-change suffix can show both sides at once -- see the
+  `tags` description below.
 - ATM straddle (no dedicated JSON field -- tag only): when `expiry_date` is given, an
   `"ATM Straddle {value} ({delta} in 5m)"` tag is appended -- `value` is the sum of the ATM call and
   ATM put's own LTP (the strike closest to underlying LTP, from the same option-chain fetch used
@@ -436,30 +440,33 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   own LTP relative to it (not the underlying's LTP, since VWAP itself is a futures-contract-only
   concept here -- the index has no traded volume of its own to compute VWAP from).
 - `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50 (15m Above by
-  60.00)"`, `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35 - Bullish bias"`, `"OI Support
-  24900 by +150.00"`) built from the fields above -- the client can display these directly without
-  any string-building of its own. The 5m and 15m EMA reads share a single line -- the 5m read (the
-  one meant for scalping timing) drives the line's leading `"Above"`/`"Below"`, with the 15m read
-  parenthesized alongside it; when only one of the two has enough candle history yet, that one
-  appears alone, unparenthesized. Every directional tag (EMA above/below, opening-range
-  above/below, a nearby level, PCR bias, max-pain pull, OI support/resistance) spells out its
-  magnitude, not just the direction -- `ATR` and `"Inside opening range"` are the only two with no
-  direction/distance to report. The PCR/max-pain tags say `"Bullish"`/`"Bearish"` explicitly (rather than starting
-  with `"Above"`/`"Below"` like the others) since neither phrasing fits those two signals -- the
-  app's tag-sentiment classifier checks for both. The OI support/resistance tags are informational
-  (no bullish/bearish framing) -- they render as neutral on the client. When `no_trade_zone` is
-  `true`, its `"No-Trade Zone -- within X of Day Open (Y)"` tag is always **first** in the list --
-  the client's tag-sentiment classifier renders it as a distinct warning (not bullish/bearish/
-  neutral) so it doesn't get lost among the rest.
+  60.00)"`, `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35"`, `"OI(S) 24900"`) built from the
+  fields above -- the client can display these directly without any string-building of its own.
+  The 5m and 15m EMA reads share a single line -- the 5m read (the one meant for scalping timing)
+  drives the line's leading `"Above"`/`"Below"`, with the 15m read parenthesized alongside it; when
+  only one of the two has enough candle history yet, that one appears alone, unparenthesized.
+  Every directional tag (EMA above/below, opening-range above/below, a nearby level, max-pain pull)
+  spells out its magnitude, not just the direction -- `ATR`, `PCR`, `OI(S)`/`OI(R)`, and
+  `"Inside opening range"` are the ones with no absolute-distance figure to report. The Max Pain
+  tag says `"Bullish"`/`"Bearish"` explicitly (rather than starting with `"Above"`/`"Below"` like
+  the others) since neither phrasing fits that signal -- the app's tag-sentiment classifier checks
+  for the bare word. **PCR deliberately omits a "Bullish/Bearish bias" phrase in its own text** --
+  the Android ticker already renders a bullish/bearish/neutral chevron per item (for PCR, derived
+  straight from the numeric value against the `bias` thresholds documented above), so the client
+  doesn't need the word restated in the tag itself. **OI Support/Resistance are named `"OI(S)"`/
+  `"OI(R)"`** (not spelled out) -- informational tags, no bullish/bearish framing, render as
+  neutral on the client. When `no_trade_zone` is `true`, its `"No-Trade Zone -- within X of Day
+  Open (Y)"` tag is always **first** in the list -- the client's tag-sentiment classifier renders
+  it as a distinct warning (not bullish/bearish/neutral) so it doesn't get lost among the rest.
 
-  **5-minute-change suffixes**: the ATR, VWAP, nearest-level, PCR, OI support, and OI resistance
-  tags (plus the ATM Straddle tag, when present) each carry a trailing bracketed suffix showing how
-  much that reading has moved over roughly the last 5 minutes, once enough polling history has
-  accumulated for this underlying/expiry (the very first call after selecting a new
-  underlying/expiry -- or any call with no in-band sample 4-6 minutes old -- omits the suffix
-  entirely, it is never fabricated). Two different formats are used:
+  **5-minute-change suffixes**: the ATR, VWAP, nearest-level, PCR, `OI(S)`, and `OI(R)` tags (plus
+  the ATM Straddle tag, when present) each carry a trailing bracketed suffix showing how much that
+  reading has moved over roughly the last 5 minutes, once enough polling history has accumulated
+  for this underlying/expiry (the very first call after selecting a new underlying/expiry -- or any
+  call with no in-band sample 4-6 minutes old -- omits the suffix entirely, it is never
+  fabricated). Three different formats are used:
   - ATR, PCR, and ATM Straddle show their own **value's** change: `" ({delta:+.2f} in 5m)"`, e.g.
-    `"ATR 42.3 (+2.10 in 5m)"`, `"PCR 1.35 - Bullish bias (-0.15 in 5m)"`.
+    `"ATR 42.3 (+2.10 in 5m)"`, `"PCR 1.35 (-0.15 in 5m)"`.
   - VWAP and the nearest-level tag instead show the change in **distance** between LTP and that
     line (`|LTP - VWAP|` / `|LTP - level|`) -- the same number already shown in the tag's own
     `"by X.XX"` -- since a moving VWAP/level value on its own isn't actionable, but price closing in
@@ -467,15 +474,19 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
     approaching), positive means it grew (price is pulling away) -- the opposite reading from "the
     line itself went up/down". E.g. `"Above VWAP by 9.75 (-4.00 in 5m)"` means price has moved 4
     points closer to VWAP over the last 5 minutes.
-  - OI Support / OI Resistance instead show the change in **OI at that strike**, on the relevant
-    side only (put OI for support, call OI for resistance) -- this answers "is the level still
-    being defended", not just "is price closer to it": `" (Put OI {delta:+,.0f} in 5m)"` /
-    `" (Call OI {delta:+,.0f} in 5m)"`, e.g. `"OI Support 24900 by +150.00 (Put OI +120,000 in 5m)"`.
-    This delta resets to omitted for one poll whenever the support/resistance **strike itself**
-    changes (a different strike takes over the highest OI) -- comparing OI across two different
-    strikes wouldn't mean anything. ATM Straddle has **no** such reset: its delta is tracked across
-    whatever strike happens to be ATM at each sample, since the ATM strike is expected to roll
-    continuously as price moves.
+  - `OI(S)` / `OI(R)` instead show the actual **OI change at that strike, on both sides** -- calls
+    and puts -- since "is the level still being defended" depends on both how the side that made it
+    support/resistance is moving, and how the other side is building there too:
+    `" (C/{call_delta}, P/{put_delta})"`. Each side's own delta is formatted as a short signed
+    Indian-style magnitude -- plain comma-grouped below 1 lakh (e.g. `+4,500`), `L` (lakh, 1,00,000)
+    with one decimal above that (e.g. `+4.1L`), `Cr` (crore, 1,00,00,000) above that -- e.g.
+    `"OI(S) 24900 (C/+4.1L, P/+1.2L)"`, `"OI(R) 25200 (C/-50,000, P/-1.1L)"`. Either side missing
+    (no in-band history yet) drops just that side, not the whole suffix. Both sides reset to
+    omitted for one poll whenever the support/resistance **strike itself** changes (a different
+    strike takes over the highest OI) -- comparing OI across two different strikes wouldn't mean
+    anything. ATM Straddle has **no** such reset: its delta is tracked across whatever strike
+    happens to be ATM at each sample, since the ATM strike is expected to roll continuously as
+    price moves.
 
 Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round step) are cached
 ~60 seconds -- they only meaningfully change when a new candle closes, not on every feed tick.

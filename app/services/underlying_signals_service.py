@@ -97,9 +97,14 @@ class _OiSummary:
     # level (put writers are betting price stays above it, and will defend that bet).
     support_strike: Optional[float] = None
     support_oi: Optional[float] = None
+    # The *call* OI at that same support strike -- tracked alongside support_oi so the ticker can
+    # show both sides' 5-minute OI change at that strike, not just the put side.
+    support_call_oi: Optional[float] = None
     # The strike with the single highest call OI -- the resistance-level mirror of support_strike.
     resistance_strike: Optional[float] = None
     resistance_oi: Optional[float] = None
+    # The *put* OI at that same resistance strike -- the mirror of support_call_oi.
+    resistance_put_oi: Optional[float] = None
 
 
 @dataclass
@@ -115,8 +120,10 @@ class _HistorySnapshot:
     pcr: Optional[float]
     support_strike: Optional[float]
     support_oi: Optional[float]
+    support_call_oi: Optional[float]
     resistance_strike: Optional[float]
     resistance_oi: Optional[float]
+    resistance_put_oi: Optional[float]
     atm_straddle: Optional[float]
 
 
@@ -131,7 +138,9 @@ class _HistoryDeltas:
     level_distance: Optional[float] = None
     pcr: Optional[float] = None
     support_oi: Optional[float] = None
+    support_call_oi: Optional[float] = None
     resistance_oi: Optional[float] = None
+    resistance_put_oi: Optional[float] = None
     atm_straddle: Optional[float] = None
 
 
@@ -263,8 +272,10 @@ class UnderlyingSignalsService:
             pcr=oi_summary.pcr,
             support_strike=oi_summary.support_strike,
             support_oi=oi_summary.support_oi,
+            support_call_oi=oi_summary.support_call_oi,
             resistance_strike=oi_summary.resistance_strike,
             resistance_oi=oi_summary.resistance_oi,
+            resistance_put_oi=oi_summary.resistance_put_oi,
             atm_straddle=atm_straddle,
             now=monotonic(),
         )
@@ -298,7 +309,9 @@ class UnderlyingSignalsService:
             level_distance_delta=deltas.level_distance,
             pcr_delta=deltas.pcr,
             support_oi_delta=deltas.support_oi,
+            support_call_oi_delta=deltas.support_call_oi,
             resistance_oi_delta=deltas.resistance_oi,
+            resistance_put_oi_delta=deltas.resistance_put_oi,
             atm_straddle_delta=deltas.atm_straddle,
         )
 
@@ -390,15 +403,20 @@ class UnderlyingSignalsService:
             count=_NEAR_ATM_STRIKE_COUNT,
         )
         pcr = _local_pcr(near_atm_rows)
-        support_strike, support_oi, resistance_strike, resistance_oi = _oi_support_resistance(near_atm_rows)
+        (
+            support_strike, support_oi, support_call_oi,
+            resistance_strike, resistance_oi, resistance_put_oi,
+        ) = _oi_support_resistance(near_atm_rows)
 
         return _OiSummary(
             pcr=pcr,
             max_pain=max_pain,
             support_strike=support_strike,
             support_oi=support_oi,
+            support_call_oi=support_call_oi,
             resistance_strike=resistance_strike,
             resistance_oi=resistance_oi,
+            resistance_put_oi=resistance_put_oi,
         )
 
     async def _minute_series(
@@ -720,8 +738,10 @@ def _record_and_diff(
     pcr: Optional[float],
     support_strike: Optional[float],
     support_oi: Optional[float],
+    support_call_oi: Optional[float],
     resistance_strike: Optional[float],
     resistance_oi: Optional[float],
+    resistance_put_oi: Optional[float],
     atm_straddle: Optional[float],
     now: float,
 ) -> _HistoryDeltas:
@@ -737,10 +757,12 @@ def _record_and_diff(
     here means the distance shrank (price closing in), positive means it grew (pulling away) --
     the sign is about the distance, not VWAP/the level's own direction.
 
-    `support_oi`/`resistance_oi`: only diffed when the matched snapshot's own `support_strike`/
-    `resistance_strike` equals the *current* one -- if a different strike has taken over as
-    support/resistance since then, comparing their OI numbers wouldn't mean anything (not the same
-    thing being measured), so the delta is `None` rather than a misleading number.
+    `support_oi`/`support_call_oi`/`resistance_oi`/`resistance_put_oi`: only diffed when the
+    matched snapshot's own `support_strike`/`resistance_strike` equals the *current* one -- if a
+    different strike has taken over as support/resistance since then, comparing their OI numbers
+    wouldn't mean anything (not the same thing being measured), so the delta is `None` rather than
+    a misleading number. Both sides at a given strike (put and call) share that strike's own gate,
+    since a strike handoff invalidates both at once.
 
     `atm_straddle`: deliberately has **no** such strike-matching gate, unlike support/resistance --
     the ATM strike is *expected* to roll as price moves, and "ATM straddle" is conventionally read
@@ -769,8 +791,10 @@ def _record_and_diff(
         deltas.atm_straddle = diff(atm_straddle, matched.atm_straddle)
         if support_strike is not None and matched.support_strike == support_strike:
             deltas.support_oi = diff(support_oi, matched.support_oi)
+            deltas.support_call_oi = diff(support_call_oi, matched.support_call_oi)
         if resistance_strike is not None and matched.resistance_strike == resistance_strike:
             deltas.resistance_oi = diff(resistance_oi, matched.resistance_oi)
+            deltas.resistance_put_oi = diff(resistance_put_oi, matched.resistance_put_oi)
 
     history.append(
         _HistorySnapshot(
@@ -781,8 +805,10 @@ def _record_and_diff(
             pcr=pcr,
             support_strike=support_strike,
             support_oi=support_oi,
+            support_call_oi=support_call_oi,
             resistance_strike=resistance_strike,
             resistance_oi=resistance_oi,
+            resistance_put_oi=resistance_put_oi,
             atm_straddle=atm_straddle,
         )
     )
@@ -1018,16 +1044,23 @@ def _local_pcr(near_atm_rows: list[dict[str, Any]]) -> Optional[float]:
 
 def _oi_support_resistance(
     strike_rows: list[dict[str, Any]],
-) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """Returns `(support_strike, support_oi, resistance_strike, resistance_oi)` from Upstox's
-    per-strike `call_put_oi_data_list` -- support is the strike with the single highest put OI,
-    resistance the strike with the single highest call OI (see _OiSummary's doc comment for why).
-    All `None` if [strike_rows] is empty or has no usable rows.
+) -> tuple[
+    Optional[float], Optional[float], Optional[float],
+    Optional[float], Optional[float], Optional[float],
+]:
+    """Returns `(support_strike, support_oi, support_call_oi, resistance_strike, resistance_oi,
+    resistance_put_oi)` from Upstox's per-strike `call_put_oi_data_list` -- support is the strike
+    with the single highest put OI, resistance the strike with the single highest call OI (see
+    _OiSummary's doc comment for why). `support_call_oi`/`resistance_put_oi` are the *other* side's
+    OI at those same two strikes -- the ticker shows both sides' 5-minute change at each strike, not
+    just the side that made it "support"/"resistance" in the first place. All `None` if
+    [strike_rows] is empty or has no usable rows.
     """
     support_strike: Optional[float] = None
     support_oi: Optional[float] = None
     resistance_strike: Optional[float] = None
     resistance_oi: Optional[float] = None
+    by_strike: dict[float, tuple[Optional[float], Optional[float]]] = {}
 
     for row in strike_rows:
         if not isinstance(row, dict):
@@ -1035,18 +1068,26 @@ def _oi_support_resistance(
         strike = row.get("strike_price")
         if not isinstance(strike, (int, float)):
             continue
+        strike = float(strike)
 
         put_oi = row.get("put_oi")
-        if isinstance(put_oi, (int, float)) and (support_oi is None or put_oi > support_oi):
-            support_oi = float(put_oi)
-            support_strike = float(strike)
-
+        put_oi = float(put_oi) if isinstance(put_oi, (int, float)) else None
         call_oi = row.get("call_oi")
-        if isinstance(call_oi, (int, float)) and (resistance_oi is None or call_oi > resistance_oi):
-            resistance_oi = float(call_oi)
-            resistance_strike = float(strike)
+        call_oi = float(call_oi) if isinstance(call_oi, (int, float)) else None
+        by_strike[strike] = (put_oi, call_oi)
 
-    return support_strike, support_oi, resistance_strike, resistance_oi
+        if put_oi is not None and (support_oi is None or put_oi > support_oi):
+            support_oi = put_oi
+            support_strike = strike
+
+        if call_oi is not None and (resistance_oi is None or call_oi > resistance_oi):
+            resistance_oi = call_oi
+            resistance_strike = strike
+
+    support_call_oi = by_strike[support_strike][1] if support_strike is not None else None
+    resistance_put_oi = by_strike[resistance_strike][0] if resistance_strike is not None else None
+
+    return support_strike, support_oi, support_call_oi, resistance_strike, resistance_oi, resistance_put_oi
 
 
 def _build_tags(
@@ -1079,7 +1120,9 @@ def _build_tags(
     level_distance_delta: Optional[float],
     pcr_delta: Optional[float],
     support_oi_delta: Optional[float],
+    support_call_oi_delta: Optional[float],
     resistance_oi_delta: Optional[float],
+    resistance_put_oi_delta: Optional[float],
     atm_straddle_delta: Optional[float],
 ) -> list[str]:
     """Builds the ready-to-render tag strings -- every directional tag (EMA above/below, opening
@@ -1095,10 +1138,19 @@ def _build_tags(
     with an explicit +/-), not absolute -- the sign tells you which side of the exact target
     price currently sits on.
 
-    The PCR/max-pain tags don't start with "Above"/"Below" like every other tag here -- the
-    Android client's tag-sentiment classifier (`sentimentForSignalTag`) also recognizes a bare
-    "bullish"/"bearish" word anywhere in the text, which is why both are spelled out explicitly
-    below rather than reusing the "Above X"/"Below X" phrasing that wouldn't fit either signal.
+    The max-pain tag doesn't start with "Above"/"Below" like every other tag here -- the Android
+    client's tag-sentiment classifier (`sentimentForSignalTag`) also recognizes a bare "bullish"/
+    "bearish" word anywhere in the text, which is why it's spelled out explicitly rather than
+    reusing the "Above X"/"Below X" phrasing that wouldn't fit. PCR deliberately does **not** spell
+    out "Bullish/Bearish bias" in its own text -- the Android ticker already shows a bullish/
+    bearish/neutral chevron per item (derived, for PCR specifically, straight from the numeric
+    value against the same >=1.2/<=0.8 thresholds documented on `_pcr_bias`), so restating the word
+    in the tag text itself would just be the same fact said twice.
+
+    OI Support/Resistance are named `"OI(S)"`/`"OI(R)"` (not spelled out) and show **both** sides'
+    OI change at that strike -- e.g. `"OI(R) 25200 (C/-1.1L, P/+0.3L)"` -- since "is the level still
+    holding" depends on both how the OI that made it support/resistance in the first place is
+    moving, and how the *other* side is building there too (see `_short_oi_delta`).
 
     The no-trade-zone caution ([no_trade_zone], see _is_near_day_open) is inserted first, ahead
     of every other tag -- it's a warning not to act on the rest of the bulletin right now, so it
@@ -1114,7 +1166,7 @@ def _build_tags(
     stands alone instead, unparenthesized.
 
     Several tags below carry a trailing 5-minute-change suffix (see _record_and_diff) via
-    [_delta_suffix]/[_oi_delta_suffix] -- `None` (no in-band history yet) simply omits it, same
+    [_delta_suffix]/[_oi_both_sides_suffix] -- `None` (no in-band history yet) simply omits it, same
     "missing data means omit" posture as everything else here. For VWAP/nearest-level specifically,
     the delta is the *distance's* own change (negative = price closing in, positive = pulling
     away), not VWAP/the level's own value change -- see _record_and_diff's doc comment for why.
@@ -1145,13 +1197,13 @@ def _build_tags(
         distance = abs(ltp - nearest_level["value"])
         tags.append(f"Near {nearest_level['label']} by {distance:.2f}{_delta_suffix(level_distance_delta)}")
     if pcr is not None and pcr_bias is not None:
-        tags.append(f"PCR {pcr:.2f} - {pcr_bias.capitalize()} bias{_delta_suffix(pcr_delta)}")
+        tags.append(f"PCR {pcr:.2f}{_delta_suffix(pcr_delta)}")
     if max_pain is not None and max_pain_pull is not None:
         tags.append(f"Max Pain {max_pain:g} by {ltp - max_pain:+.2f} - {max_pain_pull.capitalize()} pull")
     if oi_support_strike is not None:
-        tags.append(f"OI Support {oi_support_strike:g} by {ltp - oi_support_strike:+.2f}{_oi_delta_suffix(support_oi_delta, 'Put')}")
+        tags.append(f"OI(S) {oi_support_strike:g}{_oi_both_sides_suffix(support_call_oi_delta, support_oi_delta)}")
     if oi_resistance_strike is not None:
-        tags.append(f"OI Resistance {oi_resistance_strike:g} by {ltp - oi_resistance_strike:+.2f}{_oi_delta_suffix(resistance_oi_delta, 'Call')}")
+        tags.append(f"OI(R) {oi_resistance_strike:g}{_oi_both_sides_suffix(resistance_oi_delta, resistance_put_oi_delta)}")
     if vwap_position and vwap_value is not None:
         tags.append(f"{vwap_position.capitalize()} VWAP by {abs(ltp - vwap_value):.2f}{_delta_suffix(vwap_distance_delta)}")
     if atm_straddle is not None:
@@ -1165,11 +1217,36 @@ def _delta_suffix(delta: Optional[float]) -> str:
     return f" ({delta:+.2f} in 5m)" if delta is not None else ""
 
 
-def _oi_delta_suffix(delta: Optional[float], label: str) -> str:
-    """Same idea as [_delta_suffix], but for OI support/resistance -- comma-grouped, no decimals
-    (OI is always a whole contract count), and labeled Put/Call explicitly since a bare number
-    here would be ambiguous about which side it's counting."""
-    return f" ({label} OI {delta:+,.0f} in 5m)" if delta is not None else ""
+def _short_oi_delta(delta: Optional[float]) -> Optional[str]:
+    """Formats an OI change as a short signed Indian-style magnitude -- Cr (1,00,00,000) or L
+    (1,00,000) with one decimal place once the value crosses that tier, otherwise a plain
+    comma-grouped whole number -- e.g. `+4.1L`, `-1.1L`, `+120Cr`, `+4,500`. `None` in, `None` out
+    (see _oi_both_sides_suffix)."""
+    if delta is None:
+        return None
+    magnitude = abs(delta)
+    sign = "+" if delta >= 0 else "-"
+    if magnitude >= 1_00_00_000:
+        return f"{sign}{magnitude / 1_00_00_000:.1f}Cr"
+    if magnitude >= 1_00_000:
+        return f"{sign}{magnitude / 1_00_000:.1f}L"
+    return f"{sign}{magnitude:,.0f}"
+
+
+def _oi_both_sides_suffix(call_delta: Optional[float], put_delta: Optional[float]) -> str:
+    """The `" (C/+4.1L, P/-1.1L)"` trailing suffix on the OI(S)/OI(R) tags -- both sides' actual
+    5-minute OI change (how many contracts were added/closed) at that strike, in short form (see
+    _short_oi_delta). Either side missing (no in-band history, or a strike handoff -- see
+    _record_and_diff) drops just that side's entry rather than the whole suffix; both missing
+    omits the suffix entirely."""
+    parts = []
+    call_text = _short_oi_delta(call_delta)
+    if call_text is not None:
+        parts.append(f"C/{call_text}")
+    put_text = _short_oi_delta(put_delta)
+    if put_text is not None:
+        parts.append(f"P/{put_text}")
+    return f" ({', '.join(parts)})" if parts else ""
 
 
 def _or_target_caution(ltp: float, nearest_or_target: Optional[dict[str, Any]], reversal_word: str) -> str:
