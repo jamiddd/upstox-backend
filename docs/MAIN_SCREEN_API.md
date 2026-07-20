@@ -337,7 +337,7 @@ everything else is unaffected.
     "PCR 1.35 (-0.15 in 5m)",
     "MP 25000 (+50.0)",
     "OI(S) 24900 (C/+4.1L, P/+1.2L)",
-    "OI(R) 25200 (C/-50,000, P/-1.1L)",
+    "OI(R) 25200 (C/-0.50L, P/-1.1L)",
     "Above VWAP by 9.75 (-4.00 in 5m)",
     "STR(ATM) 245.6 (+12.3)"
   ]
@@ -484,9 +484,11 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
     and puts -- since "is the level still being defended" depends on both how the side that made it
     support/resistance is moving, and how the other side is building there too:
     `" (C/{call_delta}, P/{put_delta})"`. Each side's own delta is formatted as a short signed
-    Indian-style magnitude -- plain comma-grouped below 1 lakh (e.g. `+4,500`), `L` (lakh, 1,00,000)
-    with one decimal above that (e.g. `+4.1L`), `Cr` (crore, 1,00,00,000) above that -- e.g.
-    `"OI(S) 24900 (C/+4.1L, P/+1.2L)"`, `"OI(R) 25200 (C/-50,000, P/-1.1L)"`. Either side missing
+    Indian-style magnitude, always in `L`/`Cr` units -- `L` (lakh, 1,00,000) with **two** decimal
+    places below a full lakh so a sub-lakh change still carries useful precision (e.g. `+0.81L`
+    for a change of 81,000), **one** decimal place at/above a full lakh (e.g. `+4.1L`), `Cr`
+    (crore, 1,00,00,000) above that -- e.g. `"OI(S) 24900 (C/+4.1L, P/+1.2L)"`,
+    `"OI(R) 25200 (C/-0.50L, P/-1.1L)"`. Either side missing
     (no in-band history yet) drops just that side, not the whole suffix. Both sides reset to
     omitted for one poll whenever the support/resistance **strike itself** changes (a different
     strike takes over the highest OI) -- comparing OI across two different strikes wouldn't mean

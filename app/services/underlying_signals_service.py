@@ -1224,10 +1224,12 @@ def _compact_delta_suffix(delta: Optional[float]) -> str:
 
 
 def _short_oi_delta(delta: Optional[float]) -> Optional[str]:
-    """Formats an OI change as a short signed Indian-style magnitude -- Cr (1,00,00,000) or L
-    (1,00,000) with one decimal place once the value crosses that tier, otherwise a plain
-    comma-grouped whole number -- e.g. `+4.1L`, `-1.1L`, `+120Cr`, `+4,500`. `None` in, `None` out
-    (see _oi_both_sides_suffix)."""
+    """Formats an OI change as a short signed Indian-style magnitude, always in lakh/crore units
+    -- Cr (1,00,00,000) once the value crosses that tier, otherwise L (1,00,000), one decimal
+    place at/above a full lakh (e.g. `+4.1L`), two decimal places below a full lakh so a
+    sub-lakh change still carries enough precision to be useful (e.g. `+0.81L` for 81,000) --
+    e.g. `+4.1L`, `-1.1L`, `+120.0Cr`, `+0.81L`. `None` in, `None` out (see
+    _oi_both_sides_suffix)."""
     if delta is None:
         return None
     magnitude = abs(delta)
@@ -1236,7 +1238,7 @@ def _short_oi_delta(delta: Optional[float]) -> Optional[str]:
         return f"{sign}{magnitude / 1_00_00_000:.1f}Cr"
     if magnitude >= 1_00_000:
         return f"{sign}{magnitude / 1_00_000:.1f}L"
-    return f"{sign}{magnitude:,.0f}"
+    return f"{sign}{magnitude / 1_00_000:.2f}L"
 
 
 def _oi_both_sides_suffix(call_delta: Optional[float], put_delta: Optional[float]) -> str:

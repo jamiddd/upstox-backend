@@ -787,6 +787,19 @@ def test_build_tags_adds_vwap_tag() -> None:
     assert tags == ["Above VWAP by 50.00"]
 
 
+def test_short_oi_delta_formats_every_magnitude_tier() -> None:
+    assert signals._short_oi_delta(None) is None
+    # Below a full lakh -- two decimals, so a sub-lakh change still carries useful precision.
+    assert signals._short_oi_delta(81_000.0) == "+0.81L"
+    assert signals._short_oi_delta(-50_000.0) == "-0.50L"
+    assert signals._short_oi_delta(500.0) == "+0.01L"
+    # At/above a full lakh -- one decimal.
+    assert signals._short_oi_delta(410_000.0) == "+4.1L"
+    assert signals._short_oi_delta(-110_000.0) == "-1.1L"
+    # At/above a full crore.
+    assert signals._short_oi_delta(1_20_00_000.0) == "+1.2Cr"
+
+
 def test_build_tags_appends_five_minute_change_suffixes_when_present() -> None:
     tags = signals._build_tags(
         ltp=25050.0,
@@ -828,7 +841,7 @@ def test_build_tags_appends_five_minute_change_suffixes_when_present() -> None:
         "Near R1 Pivot by 10.00 (+3.00 in 5m)",
         "PCR 1.35 (-0.15 in 5m)",
         "OI(S) 24900 (C/+4.1L, P/+1.2L)",
-        "OI(R) 25200 (C/-50,000, P/-1.1L)",
+        "OI(R) 25200 (C/-0.50L, P/-1.1L)",
         "Above VWAP by 50.00 (-4.00 in 5m)",
         "STR(ATM) 245.6 (+12.3)",
     ]
