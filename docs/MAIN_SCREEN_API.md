@@ -335,7 +335,7 @@ everything else is unaffected.
     "ATR 42.3 (+2.10 in 5m)",
     "Near R1 Pivot by 36.60 (-3.00 in 5m)",
     "PCR 1.35 (-0.15 in 5m)",
-    "Max Pain 25000 by +50.00 - Bearish pull",
+    "MP 25000 (+50.0)",
     "OI(S) 24900 (C/+4.1L, P/+1.2L)",
     "OI(R) 25200 (C/-50,000, P/-1.1L)",
     "Above VWAP by 9.75 (-4.00 in 5m)",
@@ -414,7 +414,8 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   by expiry, across every strike), since narrowing its inputs would just make it a different,
   wrong number rather than a more scalping-relevant one. Price tends to gravitate toward it as
   expiry approaches. `pull` is `"bullish"` if LTP is currently below it (expected pull up),
-  `"bearish"` if above (pull down), `"neutral"` if exactly on it.
+  `"bearish"` if above (pull down), `"neutral"` if exactly on it. The `"MP {value} ({distance})"`
+  tag doesn't spell out `pull` in words -- see the `tags` description below for why.
 - `oi_support` / `oi_resistance`: same availability as `pcr`, and same near-ATM restriction (the 5
   strikes on each side of ATM) computed from the same per-strike `call_put_oi_data_list`.
   `oi_support` is the strike with the single highest **put** OI *within that window* (heavy put
@@ -442,24 +443,24 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   own LTP relative to it (not the underlying's LTP, since VWAP itself is a futures-contract-only
   concept here -- the index has no traded volume of its own to compute VWAP from).
 - `tags`: a small set of ready-to-render short labels (e.g. `"Above 5m EMA9 by 39.50 (15m Above by
-  60.00)"`, `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35"`, `"OI(S) 24900"`) built from the
-  fields above -- the client can display these directly without any string-building of its own.
-  The 5m and 15m EMA reads share a single line -- the 5m read (the one meant for scalping timing)
-  drives the line's leading `"Above"`/`"Below"`, with the 15m read parenthesized alongside it; when
-  only one of the two has enough candle history yet, that one appears alone, unparenthesized.
-  Every directional tag (EMA above/below, opening-range above/below, a nearby level, max-pain pull)
-  spells out its magnitude, not just the direction -- `ATR`, `PCR`, `OI(S)`/`OI(R)`, and
-  `"Inside opening range"` are the ones with no absolute-distance figure to report. The Max Pain
-  tag says `"Bullish"`/`"Bearish"` explicitly (rather than starting with `"Above"`/`"Below"` like
-  the others) since neither phrasing fits that signal -- the app's tag-sentiment classifier checks
-  for the bare word. **PCR deliberately omits a "Bullish/Bearish bias" phrase in its own text** --
-  the Android ticker already renders a bullish/bearish/neutral chevron per item (for PCR, derived
-  straight from the numeric value against the `bias` thresholds documented above), so the client
-  doesn't need the word restated in the tag itself. **OI Support/Resistance are named `"OI(S)"`/
-  `"OI(R)"`** (not spelled out) -- informational tags, no bullish/bearish framing, render as
-  neutral on the client. When `no_trade_zone` is `true`, its `"No-Trade Zone -- within X of Day
-  Open (Y)"` tag is always **first** in the list -- the client's tag-sentiment classifier renders
-  it as a distinct warning (not bullish/bearish/neutral) so it doesn't get lost among the rest.
+  60.00)"`, `"ATR 42.3"`, `"Near R1 Pivot by 36.60"`, `"PCR 1.35"`, `"OI(S) 24900"`, `"MP 25000
+  (+50.0)"`) built from the fields above -- the client can display these directly without any
+  string-building of its own. The 5m and 15m EMA reads share a single line -- the 5m read (the one
+  meant for scalping timing) drives the line's leading `"Above"`/`"Below"`, with the 15m read
+  parenthesized alongside it; when only one of the two has enough candle history yet, that one
+  appears alone, unparenthesized. Every directional tag (EMA above/below, opening-range
+  above/below, a nearby level) spells out its magnitude, not just the direction -- `ATR`, `PCR`,
+  `OI(S)`/`OI(R)`, and `"Inside opening range"` are the ones with no absolute-distance figure to
+  report. **None of `PCR`, `MP`, `OI(S)`, or `OI(R)` spell out "Bullish"/"Bearish" in their own
+  text**, even though PCR and MP each have a direction -- the Android ticker already renders a
+  bullish/bearish/neutral chevron per item, derived straight from the number itself rather than
+  the words (PCR against the `bias` thresholds documented above; MP from the sign of its own
+  `({distance})` -- positive means LTP is above max pain, i.e. bearish pull, negative means below,
+  i.e. bullish pull; OI support/resistance render neutral, no direction at all) -- so restating the
+  direction in the tag text would just be the same fact said twice. When `no_trade_zone` is `true`,
+  its `"No-Trade Zone -- within X of Day Open (Y)"` tag is always **first** in the list -- the
+  client's tag-sentiment classifier renders it as a distinct warning (not bullish/bearish/neutral)
+  so it doesn't get lost among the rest.
 
   **5-minute-change suffixes**: the ATR, VWAP, nearest-level, PCR, `OI(S)`, `OI(R)`, and `STR(ATM)`
   tags each carry a trailing bracketed suffix showing how much that reading has moved over roughly
@@ -492,9 +493,9 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
     anything. `STR(ATM)` has **no** such reset: its delta is tracked across whatever strike happens
     to be ATM at each sample, since the ATM strike is expected to roll continuously as price moves.
 
-  **Ticker-only tags**: `PCR`, `Max Pain`, `OI(S)`, `OI(R)`, and `STR(ATM)` are all shown by the
-  Android client only in the sticky action panel's scrolling ticker (`isOiTag`, despite the name,
-  now also matches `STR(ATM)`), not in the full bulletin -- they're already single-line facts, so
+  **Ticker-only tags**: `PCR`, `MP`, `OI(S)`, `OI(R)`, and `STR(ATM)` are all shown by the Android
+  client only in the sticky action panel's scrolling ticker (`isOiTag`, despite the name, now also
+  matches `MP` and `STR(ATM)`), not in the full bulletin -- they're already single-line facts, so
   showing them twice would be redundant. `STR(ATM)`'s own chevron/color always renders neutral
   (no bullish/bearish framing), same as `OI(S)`/`OI(R)`.
 

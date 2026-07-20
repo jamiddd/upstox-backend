@@ -1138,14 +1138,12 @@ def _build_tags(
     with an explicit +/-), not absolute -- the sign tells you which side of the exact target
     price currently sits on.
 
-    The max-pain tag doesn't start with "Above"/"Below" like every other tag here -- the Android
-    client's tag-sentiment classifier (`sentimentForSignalTag`) also recognizes a bare "bullish"/
-    "bearish" word anywhere in the text, which is why it's spelled out explicitly rather than
-    reusing the "Above X"/"Below X" phrasing that wouldn't fit. PCR deliberately does **not** spell
-    out "Bullish/Bearish bias" in its own text -- the Android ticker already shows a bullish/
-    bearish/neutral chevron per item (derived, for PCR specifically, straight from the numeric
-    value against the same >=1.2/<=0.8 thresholds documented on `_pcr_bias`), so restating the word
-    in the tag text itself would just be the same fact said twice.
+    Neither the max-pain (`"MP"`) nor PCR tag spells out "Bullish"/"Bearish pull"/"bias" in its own
+    text, even though both have a direction -- the Android ticker already shows a bullish/bearish/
+    neutral chevron per item, derived straight from the number itself (PCR against the >=1.2/<=0.8
+    thresholds on `_pcr_bias`; max-pain from the sign of its own signed distance, mirroring
+    `_max_pain_pull`), so restating the direction in the tag text would just be the same fact said
+    twice.
 
     OI Support/Resistance are named `"OI(S)"`/`"OI(R)"` (not spelled out) and show **both** sides'
     OI change at that strike -- e.g. `"OI(R) 25200 (C/-1.1L, P/+0.3L)"` -- since "is the level still
@@ -1199,7 +1197,7 @@ def _build_tags(
     if pcr is not None and pcr_bias is not None:
         tags.append(f"PCR {pcr:.2f}{_delta_suffix(pcr_delta)}")
     if max_pain is not None and max_pain_pull is not None:
-        tags.append(f"Max Pain {max_pain:g} by {ltp - max_pain:+.2f} - {max_pain_pull.capitalize()} pull")
+        tags.append(f"MP {max_pain:g} ({ltp - max_pain:+.1f})")
     if oi_support_strike is not None:
         tags.append(f"OI(S) {oi_support_strike:g}{_oi_both_sides_suffix(support_call_oi_delta, support_oi_delta)}")
     if oi_resistance_strike is not None:

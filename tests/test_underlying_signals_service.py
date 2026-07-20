@@ -663,7 +663,7 @@ def test_build_tags_adds_pcr_and_max_pain_tags() -> None:
 
     assert tags == [
         "PCR 1.35",
-        "Max Pain 25000 by +50.00 - Bearish pull",
+        "MP 25000 (+50.0)",
     ]
 
 
@@ -1364,7 +1364,7 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
     assert result["oi_support"] == {"value": 190.0, "oi": 1200000.0}
     assert result["oi_resistance"] == {"value": 210.0, "oi": 1500000.0}
     assert any(tag.startswith("PCR 0.80") for tag in result["tags"])
-    assert any(tag.startswith("Max Pain 190 by +10.00 - Bearish pull") for tag in result["tags"])
+    assert any(tag.startswith("MP 190 (+10.0)") for tag in result["tags"])
     assert any(tag.startswith("OI(S) 190") for tag in result["tags"])
     assert any(tag.startswith("OI(R) 210") for tag in result["tags"])
 

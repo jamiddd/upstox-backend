@@ -1415,7 +1415,7 @@ def test_main_underlying_signals_includes_pcr_and_max_pain_when_expiry_date_is_g
 
     # LTP (25050.0) sits above max pain (25000.0) -> bearish pull, +50.00 away.
     assert payload["max_pain"] == {"value": 25000.0, "pull": "bearish"}
-    assert "Max Pain 25000 by +50.00 - Bearish pull" in payload["tags"]
+    assert "MP 25000 (+50.0)" in payload["tags"]
     # FakeUpstoxService.get_oi's call_put_oi_data_list is empty (shared with the OI Analysis
     # route's own exact-match test, so not changed here) -- no per-strike data means no PCR/OI
     # support/resistance to compute, not an error.
