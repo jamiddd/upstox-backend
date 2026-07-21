@@ -4,6 +4,8 @@ from typing import Any, Optional
 
 from app.core.exceptions import AppConfigError, UpstoxApiError
 from app.services.instrument_rules_service import InstrumentRulesService, slice_quantity_for_freeze
+from app.services.order_book_lookup import TERMINAL_ORDER_STATUSES, index_orders_by_id, order_status
+from app.services.pending_oco_pairs_store import OcoPair, PendingOcoPairsStore
 from app.services.upstox_service import UpstoxService
 
 
@@ -91,9 +93,11 @@ class SmartOrderService:
         target_trigger_price: float,
         stoploss_trigger_price: float,
         slice_quantity: int,
+        pending_oco_store: PendingOcoPairsStore,
     ) -> dict[str, Any]:
-        """Places a real immediate-fill MARKET order for entry, then attaches target/stoploss GTT
-        legs the same way attach_gtt_exits does for an already-open position with no bracket.
+        """Places a real immediate-fill MARKET order for entry, then attaches target/stoploss
+        exit legs the same way attach_gtt_exits does for an already-open position with no
+        bracket -- see that method's own doc comment for why those are plain orders, not GTT.
 
         Unlike place_bracket_order, whose GTT ENTRY leg Upstox always executes as a LIMIT order at
         the trigger price -- a GTT order is *always* placed as a LIMIT order on execution, even
@@ -147,6 +151,7 @@ class SmartOrderService:
                 target_trigger_price=target_trigger_price,
                 stoploss_trigger_price=stoploss_trigger_price,
                 slice_quantity=slice_quantity,
+                pending_oco_store=pending_oco_store,
             )
 
         entry_all_succeeded = all(slice_result["status"] == "success" for slice_result in entry_slices)
@@ -180,50 +185,73 @@ class SmartOrderService:
         target_trigger_price: float,
         stoploss_trigger_price: float,
         slice_quantity: int,
+        pending_oco_store: PendingOcoPairsStore,
     ) -> dict[str, Any]:
         """Attaches a target and a stoploss to an already-open position that has no existing GTT
-        bracket, without touching the entry. Places two independent Upstox GTT type=SINGLE orders
-        per slice (one rule each) rather than reusing place_bracket_order's type=MULTIPLE shape --
-        MULTIPLE always includes its own ENTRY rule (entry_trigger_type IMMEDIATE fires right
-        away), which would submit a second live entry and double the position.
+        bracket, without touching the entry.
+
+        FIX: this used to place two independent Upstox GTT type=SINGLE orders per slice (one rule
+        each), specifically to avoid place_bracket_order's type=MULTIPLE shape -- MULTIPLE always
+        includes its own ENTRY rule (entry_trigger_type IMMEDIATE fires right away), which would
+        submit a second live entry and double the position. That SINGLE-with-no-ENTRY shape was
+        never actually valid: Upstox's GTT API requires exactly one ENTRY rule in *every* GTT
+        order regardless of type, so every one of these calls was rejected outright with "One
+        ENTRY strategy is required." -- 100% of the time, not an edge case.
+
+        There is no GTT shape that attaches only exits to an already-open position without also
+        re-firing a live entry (the ENTRY rule Upstox requires always executes once its condition
+        is met, and for an already-open position that condition is already true). So this now
+        places two independent plain (non-GTT) orders per slice instead -- a LIMIT order for the
+        target, an SL-M order for the stoploss -- which carry no OCO (one-cancels-other) guarantee
+        on their own. Each successfully-placed pair is registered in [pending_oco_store] so
+        `oco_watcher`'s background loop can cancel whichever leg doesn't fill once the other does.
+
         [exit_transaction_type] is the *exit* side (opposite of how the position was opened --
-        e.g. "SELL" to exit a long), since a SINGLE-type order has no ENTRY leg to infer direction
-        from. [quantity] is sliced by [slice_quantity] the same way place_bracket_order slices its
-        own entry -- a position sized over the instrument's freeze quantity would otherwise have
-        both legs rejected outright by Upstox.
+        e.g. "SELL" to exit a long), since a plain order has no ENTRY leg to infer direction from.
+        [quantity] is sliced by [slice_quantity] the same way place_bracket_order slices its own
+        entry -- a position sized over the instrument's freeze quantity would otherwise have both
+        legs rejected outright by Upstox.
 
         Best-effort per leg per slice, same as exit_positions: one leg/slice failing doesn't stop
-        the rest. Returns "success" (every leg of every slice placed), "partial_success" (some
-        placed), or "error" (none placed).
+        the rest. A slice's pair is only registered for OCO watching once *both* legs place
+        successfully -- a lone surviving leg (the other failed) isn't a pair to reconcile, it's
+        just a resting order the caller's own partial_success/error reporting already surfaces.
+        Returns "success" (every leg of every slice placed), "partial_success" (some placed), or
+        "error" (none placed).
         """
         slices = _split_quantity(quantity, slice_quantity)
         placed_slices: list[dict[str, Any]] = []
         for index, slice_qty in enumerate(slices, start=1):
             leg_results: dict[str, dict[str, Any]] = {}
-            for key, strategy, trigger_price in (
-                ("target", "TARGET", target_trigger_price),
-                ("stoploss", "STOPLOSS", stoploss_trigger_price),
+            for key, order_type, price, trigger_price in (
+                ("target", "LIMIT", target_trigger_price, 0.0),
+                ("stoploss", "SL-M", 0.0, stoploss_trigger_price),
             ):
                 order = {
-                    "type": "SINGLE",
                     "quantity": slice_qty,
                     "product": product,
-                    "rules": [
-                        {
-                            "strategy": strategy,
-                            "trigger_type": "IMMEDIATE",
-                            "trigger_price": trigger_price,
-                        }
-                    ],
+                    "order_type": order_type,
+                    "price": price,
+                    "trigger_price": trigger_price,
                     "instrument_token": instrument_key,
                     "transaction_type": exit_transaction_type,
                 }
                 try:
-                    response = await self.upstox.place_gtt_order(access_token, order)
+                    response = await self.upstox.place_order(
+                        access_token,
+                        instrument_key=instrument_key,
+                        transaction_type=exit_transaction_type,
+                        quantity=slice_qty,
+                        product=product,
+                        order_type=order_type,
+                        price=price,
+                        trigger_price=trigger_price,
+                    )
                     leg_results[key] = {
                         "status": "success",
                         "submitted_order": order,
                         "upstox_response": response,
+                        "order_id": _extract_order_id(response),
                     }
                 except UpstoxApiError as exc:
                     leg_results[key] = {
@@ -239,6 +267,16 @@ class SmartOrderService:
                     "stoploss": leg_results["stoploss"],
                 }
             )
+            target_order_id = leg_results["target"].get("order_id")
+            stoploss_order_id = leg_results["stoploss"].get("order_id")
+            if target_order_id and stoploss_order_id:
+                pending_oco_store.add(
+                    OcoPair(
+                        target_order_id=target_order_id,
+                        stoploss_order_id=stoploss_order_id,
+                        instrument_key=instrument_key,
+                    )
+                )
 
         successes = sum(
             1
@@ -282,6 +320,56 @@ class SmartOrderService:
             and order.get("instrument_token") == instrument_key
             and str(order.get("status", "")).upper() not in excluded_statuses
         ]
+
+    async def get_pending_exit_orders(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        pending_oco_store: PendingOcoPairsStore,
+    ) -> list[dict[str, Any]]:
+        """Plain target/stoploss order pairs attach_gtt_exits placed for one instrument, still
+        pending reconciliation by `oco_watcher` -- lets the app find the exit orders behind an
+        open position that has no GTT bracket, so they can be shown and modified (via
+        OrderModificationService.modify_orders), the same way get_gtt_orders_for_instrument lets
+        it find/modify a GTT bracket. Without this, GttEditDialog only ever finds a GTT bracket,
+        never a plain-order pair -- reopening it for a position protected this way looked
+        identical to "no protection yet" and would attach a second, redundant pair on top of the
+        first.
+
+        A pair is only returned once both legs are confirmed still live in the order book -- one
+        that's already reached a terminal status (filled/cancelled/rejected) is stale and about to
+        be dropped by oco_watcher's own next tick, not something to offer for editing.
+        """
+        pairs = [pair for pair in pending_oco_store.load() if pair.instrument_key == instrument_key]
+        if not pairs:
+            return []
+
+        order_book_payload = await self.upstox.get_order_book(access_token)
+        orders_by_id = index_orders_by_id(order_book_payload)
+
+        results: list[dict[str, Any]] = []
+        for pair in pairs:
+            target_order = orders_by_id.get(pair.target_order_id)
+            stoploss_order = orders_by_id.get(pair.stoploss_order_id)
+            if target_order is None or stoploss_order is None:
+                continue
+            if (
+                order_status(target_order) in TERMINAL_ORDER_STATUSES
+                or order_status(stoploss_order) in TERMINAL_ORDER_STATUSES
+            ):
+                continue
+            results.append(
+                {
+                    "target_order_id": pair.target_order_id,
+                    "stoploss_order_id": pair.stoploss_order_id,
+                    "quantity": target_order.get("quantity"),
+                    "product": target_order.get("product"),
+                    "target_trigger_price": target_order.get("price"),
+                    "stoploss_trigger_price": stoploss_order.get("trigger_price"),
+                }
+            )
+        return results
 
     async def modify_gtt_bracket(
         self,
@@ -515,3 +603,17 @@ def _string_value(payload: dict[str, Any], *names: str) -> str:
         if isinstance(value, str):
             return value
     return ""
+
+
+def _extract_order_id(place_order_response: dict[str, Any]) -> Optional[str]:
+    """Pulls the new order's id out of a Place Order V3 response (`{"data": {"order_id":
+    "..."}}`) -- see SmartOrderService.attach_gtt_exits, which needs each leg's own order id to
+    register the pair for OCO watching. Returns None for any unexpected shape rather than raising
+    -- a leg that placed successfully but whose id couldn't be read just doesn't get OCO-watched,
+    same "degrade, don't crash" posture as the rest of this service's best-effort semantics.
+    """
+    data = place_order_response.get("data")
+    if not isinstance(data, dict):
+        return None
+    order_id = data.get("order_id")
+    return order_id if isinstance(order_id, str) else None

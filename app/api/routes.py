@@ -35,7 +35,9 @@ from app.services.instrument_rules_service import (
 )
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 from app.services.order_history_service import OrderHistoryService
+from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
+from app.services.pending_oco_pairs_store import PendingOcoPairsStore
 from app.services.oi_analysis_service import OIAnalysisService
 from app.services.search_screen_service import SearchScreenService
 from app.services.smart_order_service import SmartOrderService
@@ -148,6 +150,14 @@ class ModifyOrdersRequest(BaseModel):
     """A non-empty collection with no application-level order-count cap."""
 
     orders: list[ModifyOrderRequest] = Field(min_length=1)
+
+
+class CancelOrdersRequest(BaseModel):
+    """A non-empty collection of still-open order ids to cancel, same best-effort shape as
+    ModifyOrdersRequest -- one order failing to cancel doesn't stop the rest.
+    """
+
+    order_ids: list[str] = Field(min_length=1)
 
 
 @protected_router.get("/status")
@@ -653,6 +663,7 @@ async def place_market_bracket_order(
             target_trigger_price=order.target_trigger_price,
             stoploss_trigger_price=order.stoploss_trigger_price,
             slice_quantity=slice_quantity,
+            pending_oco_store=PendingOcoPairsStore(settings),
         )
     except AppConfigError as exc:
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -676,6 +687,29 @@ async def get_gtt_orders(
     try:
         return await SmartOrderService(service).get_gtt_orders_for_instrument(
             access_token, instrument_key=instrument_key, include_history=include_history
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/orders/pending-exits")
+async def get_pending_exit_orders(
+    instrument_key: str = Query(..., min_length=1),
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
+) -> list[dict[str, Any]]:
+    """Plain target/stoploss order pairs (attach_gtt_exits, no GTT bracket) for one instrument --
+    the plain-order counterpart of GET /orders/gtt, so the app can find and edit the exits behind
+    a position that has no GTT bracket instead of only ever finding "nothing" and attaching a
+    redundant second pair. See SmartOrderService.get_pending_exit_orders.
+    """
+    access_token = _load_access_token(token_store)
+    try:
+        return await SmartOrderService(service).get_pending_exit_orders(
+            access_token,
+            instrument_key=instrument_key,
+            pending_oco_store=PendingOcoPairsStore(settings),
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
@@ -737,6 +771,7 @@ async def attach_gtt_exits(
             target_trigger_price=order.target_trigger_price,
             stoploss_trigger_price=order.stoploss_trigger_price,
             slice_quantity=slice_quantity,
+            pending_oco_store=PendingOcoPairsStore(settings),
         )
     except AppConfigError as exc:
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -794,6 +829,19 @@ async def modify_orders(
     access_token = _load_access_token(token_store)
     orders = [order.model_dump(exclude_none=True) for order in request.orders]
     return await OrderModificationService(service).modify_orders(access_token, orders)
+
+
+@protected_router.post("/orders/cancel")
+async def cancel_orders(
+    request: CancelOrdersRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Cancel any number of still-open regular orders. See
+    OrderCancellationService.cancel_orders.
+    """
+    access_token = _load_access_token(token_store)
+    return await OrderCancellationService(service).cancel_orders(access_token, request.order_ids)
 
 
 def _load_access_token(token_store: EncryptedTokenStore) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -49,6 +50,9 @@ class FakeTokenStore:
 
 
 class FakeUpstoxService:
+    def __init__(self) -> None:
+        self.place_order_call_count = 0
+
     def build_login_url(self, *, state: Optional[str] = None) -> str:
         return f"https://upstox.test/login?state={state}"
 
@@ -388,6 +392,38 @@ class FakeUpstoxService:
             "status": "success",
             "data": {"order_ids": [f"MKT-{instrument_key}"]},
         }
+
+    async def place_order(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        transaction_type: str,
+        quantity: int,
+        product: str,
+        order_type: str,
+        price: float = 0,
+        trigger_price: float = 0,
+    ) -> dict[str, Any]:
+        # Sentinel trigger price used by attach-exits tests to simulate one leg's placement
+        # failing (the SL-M stoploss leg specifically) without disturbing every other place_order
+        # caller.
+        if order_type == "SL-M" and trigger_price == 105.0:
+            from app.core.exceptions import UpstoxApiError
+
+            raise UpstoxApiError(
+                "Order cannot be placed",
+                status_code=400,
+                upstox_code="UDAPI100041",
+            )
+        self.place_order_call_count += 1
+        return {
+            "status": "success",
+            "data": {"order_id": f"ORD-{order_type}-{self.place_order_call_count}"},
+        }
+
+    async def cancel_order(self, access_token: str, order_id: str) -> dict[str, Any]:
+        return {"status": "success", "data": {"order_id": order_id}}
 
     async def modify_order(
         self,
@@ -760,6 +796,7 @@ def _settings() -> Settings:
         mobile_api_key="mobile-secret",
         token_encryption_key="",
         token_store_path=Path("/tmp/token.enc"),
+        pending_oco_pairs_path=Path("/tmp/pending_oco_pairs.json"),
     )
 
 
@@ -1871,6 +1908,128 @@ def test_get_gtt_orders_with_history_includes_completed_but_not_cancelled() -> N
     assert {order["gtt_order_id"] for order in payload} == {"GTT-111", "GTT-done"}
 
 
+class _PendingExitsFakeUpstoxService(FakeUpstoxService):
+    """A resting LIMIT target order and SL-M stoploss order for NSE_FO|111, both still open --
+    the order-book shape get_pending_exit_orders needs to resolve a pending OCO pair's actual
+    prices/quantity/product."""
+
+    async def get_order_book(self, access_token: str) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "order_id": "TGT-1",
+                    "instrument_token": "NSE_FO|111",
+                    "status": "open",
+                    "quantity": 75,
+                    "product": "I",
+                    "order_type": "LIMIT",
+                    "price": 140.0,
+                    "trigger_price": 0,
+                },
+                {
+                    "order_id": "SL-1",
+                    "instrument_token": "NSE_FO|111",
+                    "status": "open",
+                    "quantity": 75,
+                    "product": "I",
+                    "order_type": "SL-M",
+                    "price": 0,
+                    "trigger_price": 115.0,
+                },
+            ],
+        }
+
+
+def test_get_pending_exit_orders_resolves_a_registered_pair(tmp_path: Path) -> None:
+    """A pair registered in PendingOcoPairsStore comes back with its real price/trigger_price/
+    quantity/product read from the live order book."""
+    from app.services.pending_oco_pairs_store import OcoPair, PendingOcoPairsStore
+
+    pairs_path = tmp_path / "pairs.json"
+    settings = replace(_settings(), pending_oco_pairs_path=pairs_path)
+    PendingOcoPairsStore(settings).add(
+        OcoPair(target_order_id="TGT-1", stoploss_order_id="SL-1", instrument_key="NSE_FO|111"),
+    )
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_upstox_service] = _PendingExitsFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.get(
+            "/api/orders/pending-exits",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == [
+        {
+            "target_order_id": "TGT-1",
+            "stoploss_order_id": "SL-1",
+            "quantity": 75,
+            "product": "I",
+            "target_trigger_price": 140.0,
+            "stoploss_trigger_price": 115.0,
+        }
+    ]
+
+
+def test_get_pending_exit_orders_excludes_a_pair_with_a_terminal_leg(tmp_path: Path) -> None:
+    """A pair whose leg already filled/cancelled/rejected is stale -- oco_watcher will drop it on
+    its own next tick, so it shouldn't be offered to the app for editing in the meantime."""
+    from app.services.pending_oco_pairs_store import OcoPair, PendingOcoPairsStore
+
+    pairs_path = tmp_path / "pairs.json"
+    settings = replace(_settings(), pending_oco_pairs_path=pairs_path)
+    # order-older/order-newer are FakeUpstoxService's default fixture orders -- "complete" and
+    # "rejected" respectively, i.e. both already terminal.
+    PendingOcoPairsStore(settings).add(
+        OcoPair(target_order_id="order-older", stoploss_order_id="order-newer", instrument_key="NSE_FO|111"),
+    )
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_upstox_service] = FakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.get(
+            "/api/orders/pending-exits",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_get_pending_exit_orders_returns_empty_when_nothing_pending(tmp_path: Path) -> None:
+    pairs_path = tmp_path / "pairs.json"
+    settings = replace(_settings(), pending_oco_pairs_path=pairs_path)
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_upstox_service] = FakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.get(
+            "/api/orders/pending-exits",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
 def test_modify_gtt_order_resends_full_rule_set() -> None:
     """Modifying a GTT bracket rebuilds ENTRY/TARGET/STOPLOSS together, not a partial patch."""
     client = _client(FakeTokenStore(token="stored-token"))
@@ -1958,9 +2117,10 @@ def test_modify_gtt_order_surfaces_upstox_failure() -> None:
     assert response.status_code == 400
 
 
-def test_attach_gtt_exits_places_two_single_leg_orders() -> None:
-    """Attaching exits to a position with no existing bracket places independent SINGLE-type
-    target and stoploss orders -- neither includes an ENTRY rule, so nothing re-enters."""
+def test_attach_gtt_exits_places_two_plain_leg_orders() -> None:
+    """Attaching exits to a position with no existing bracket places independent plain (non-GTT)
+    target and stoploss orders -- neither is a GTT ENTRY rule, so nothing re-enters. See
+    SmartOrderService.attach_gtt_exits's own doc comment for why these are plain orders."""
     client = _client(FakeTokenStore(token="stored-token"))
     try:
         response = client.post(
@@ -1986,26 +2146,59 @@ def test_attach_gtt_exits_places_two_single_leg_orders() -> None:
     slice_0 = payload["slices"][0]
     assert slice_0["quantity"] == 75
     assert slice_0["target"]["submitted_order"] == {
-        "type": "SINGLE",
         "quantity": 75,
         "product": "I",
-        "rules": [{"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 140.0}],
+        "order_type": "LIMIT",
+        "price": 140.0,
+        "trigger_price": 0.0,
         "instrument_token": "NSE_FO|111",
         "transaction_type": "SELL",
     }
     assert slice_0["stoploss"]["submitted_order"] == {
-        "type": "SINGLE",
         "quantity": 75,
         "product": "I",
-        "rules": [{"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 115.0}],
+        "order_type": "SL-M",
+        "price": 0.0,
+        "trigger_price": 115.0,
         "instrument_token": "NSE_FO|111",
         "transaction_type": "SELL",
     }
 
 
+def test_attach_gtt_exits_registers_a_pending_oco_pair_for_oco_watcher(tmp_path: Path) -> None:
+    """Both legs placing successfully registers the pair in PendingOcoPairsStore -- see that
+    store's own doc comment and oco_watcher.run_oco_watcher, which reconciles it once one leg
+    fills."""
+    from app.services.pending_oco_pairs_store import PendingOcoPairsStore
+
+    pairs_path = tmp_path / "pairs.json"
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: replace(_settings(), pending_oco_pairs_path=pairs_path)
+    try:
+        response = client.post(
+            "/api/orders/gtt/attach-exits",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "exit_transaction_type": "SELL",
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    pending_pairs = PendingOcoPairsStore(replace(_settings(), pending_oco_pairs_path=pairs_path)).load()
+    assert len(pending_pairs) == 1
+    assert pending_pairs[0].instrument_key == "NSE_FO|111"
+
+
 def test_attach_gtt_exits_reports_partial_success_when_one_leg_fails() -> None:
-    """One leg failing doesn't stop the other -- see FakeUpstoxService.place_gtt_order's
-    STOPLOSS-at-105.0 sentinel."""
+    """One leg failing doesn't stop the other -- see FakeUpstoxService.place_order's
+    SL-M-at-105.0 sentinel."""
     client = _client(FakeTokenStore(token="stored-token"))
     try:
         response = client.post(

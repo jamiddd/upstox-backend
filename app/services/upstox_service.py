@@ -199,7 +199,7 @@ class UpstoxService:
             raise UpstoxApiError("Unexpected Upstox GTT modify response")
         return payload
 
-    async def place_market_order(
+    async def place_order(
         self,
         access_token: str,
         *,
@@ -207,12 +207,17 @@ class UpstoxService:
         transaction_type: str,
         quantity: int,
         product: str,
+        order_type: str,
+        price: float = 0,
+        trigger_price: float = 0,
     ) -> dict[str, Any]:
-        """Places an immediate market order via Place Order V3 -- unlike place_gtt_order (a
-        conditional GTT rule, this app's only other order-placement path, used for every normal
-        Buy/Sell tap), this fills right away at whatever the market gives. Used to actually flatten
-        a position (see SmartOrderService.exit_all_positions), where a GTT rule would be too slow/
-        indirect for something meant to happen right now.
+        """Places a regular (non-GTT) order via Place Order V3 -- unlike place_gtt_order (a
+        conditional GTT rule watched by Upstox's own GTT engine), this becomes a real live order
+        on the exchange's order book immediately. Used for MARKET fills (see place_market_order)
+        and, since GTT structurally can't attach only a target/stoploss to an already-open
+        position without also re-firing a live entry, for the plain LIMIT (target) and SL-M
+        (stoploss) exit legs SmartOrderService.attach_exit_orders places instead -- see that
+        method's own doc comment.
 
         Only documented on the separate api-hft.upstox.com host (upstox_api_hft_base_url), not the
         regular v3 base URL the rest of this class's order endpoints use.
@@ -221,12 +226,12 @@ class UpstoxService:
             "quantity": quantity,
             "product": product,
             "validity": "DAY",
-            "price": 0,
+            "price": price,
             "instrument_token": instrument_key,
-            "order_type": "MARKET",
+            "order_type": order_type,
             "transaction_type": transaction_type,
             "disclosed_quantity": 0,
-            "trigger_price": 0,
+            "trigger_price": trigger_price,
             "is_amo": False,
         }
         response = await self._request(
@@ -243,6 +248,28 @@ class UpstoxService:
         if not isinstance(payload, dict):
             raise UpstoxApiError("Unexpected Upstox place order response")
         return payload
+
+    async def place_market_order(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        transaction_type: str,
+        quantity: int,
+        product: str,
+    ) -> dict[str, Any]:
+        """Places an immediate market order -- fills right away at whatever the market gives.
+        Used to actually flatten a position (see SmartOrderService.exit_all_positions), where a
+        GTT rule would be too slow/indirect for something meant to happen right now.
+        """
+        return await self.place_order(
+            access_token,
+            instrument_key=instrument_key,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            product=product,
+            order_type="MARKET",
+        )
 
     async def modify_order(
         self,
@@ -263,6 +290,25 @@ class UpstoxService:
         payload = response.json()
         if not isinstance(payload, dict):
             raise UpstoxApiError("Unexpected Upstox modify order response")
+        return payload
+
+    async def cancel_order(self, access_token: str, order_id: str) -> dict[str, Any]:
+        """Cancel a still-open regular order through the V3 endpoint. Lives on the same
+        api-hft.upstox.com host as place_market_order -- Upstox's V3 cancel-order docs put it
+        there, not on the regular v3 base URL the rest of this class's order endpoints use.
+        """
+        response = await self._request(
+            "DELETE",
+            f"{self.settings.upstox_api_hft_base_url}/order/cancel",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+            params={"order_id": order_id},
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox cancel order response")
         return payload
 
     async def get_option_contracts(

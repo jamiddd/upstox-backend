@@ -519,15 +519,19 @@ def _shape_position(position: dict[str, Any]) -> dict[str, Any]:
 
 
 def _entry_price(position: dict[str, Any]) -> float:
-    # Upstox can report average_price as exactly 0 for a moment right after a fresh fill, before
-    # its own position-keeping has caught up -- even though buy_price/sell_price (set from the
-    # order itself) are already correct by then. Treat 0 the same as missing and fall through,
-    # rather than locking in a known-wrong entry price for the rest of the day.
-    for key in ("average_price", "buy_price", "sell_price"):
-        value = position.get(key)
-        if isinstance(value, (int, float)) and value != 0:
-            return float(value)
-    return 0.0
+    # average_price is the currently-open lot's real average entry -- buy_price/sell_price are
+    # Upstox's *cumulative day-total* buy/sell averages for the instrument, not the open lot's
+    # entry, so they go stale/wrong the moment an instrument has more than one round trip in a
+    # day (e.g. bought, squared off, bought again -- buy_price then blends both fills). Don't use
+    # them as a stand-in.
+    #
+    # average_price can still legitimately read 0 for a moment right after a fresh fill, before
+    # Upstox's own position-keeping catches up -- that gap is handled client-side (see
+    # MainViewModel.mergeOpenPositions), which keeps the previous confirmed entry price until a
+    # real one arrives, rather than papering over it here with a value that can be permanently
+    # wrong.
+    value = position.get("average_price")
+    return float(value) if isinstance(value, (int, float)) else 0.0
 
 
 def _available_to_trade(payload: dict[str, Any]) -> dict[str, Any]:

@@ -24,6 +24,7 @@ class Settings:
     token_encryption_key: str
     token_store_path: Path
     tracked_instruments_path: Path = Path("/data/tracked_instruments.json")
+    pending_oco_pairs_path: Path = Path("/data/pending_oco_pairs.json")
     upstox_api_base_url: str = "https://api.upstox.com/v2"
     upstox_api_v3_base_url: str = "https://api.upstox.com/v3"
     # Place Order V3 is only documented on this separate low-latency host, not api.upstox.com --
@@ -55,6 +56,9 @@ class Settings:
             token_store_path=Path(os.getenv("TOKEN_STORE_PATH", "/data/upstox_token.enc")),
             tracked_instruments_path=Path(
                 os.getenv("TRACKED_INSTRUMENTS_PATH", "/data/tracked_instruments.json"),
+            ),
+            pending_oco_pairs_path=Path(
+                os.getenv("PENDING_OCO_PAIRS_PATH", "/data/pending_oco_pairs.json"),
             ),
             upstox_api_base_url=os.getenv("UPSTOX_API_BASE_URL", "https://api.upstox.com/v2"),
             upstox_api_v3_base_url=os.getenv(
