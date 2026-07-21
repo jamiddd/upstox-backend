@@ -7,12 +7,24 @@ Personal FastAPI backend for Android/iPhone clients that integrates with Upstox.
 - Handle Upstox OAuth and encrypted token persistence
 - Fetch REST market quote snapshots, holdings, and positions
 - Run in Docker on a VPS
-- Keep the first version database-free
+- Persist short-lived five-minute OI snapshots in an embedded SQLite database
 
 ## Project structure
 - app/: FastAPI application code
 - tests/: automated tests
 - Dockerfile and docker-compose.yml: container setup
+
+## OI snapshot retention
+
+For every underlying selected through the tracked-instruments setting, the backend stores one
+lossless OI analysis snapshot per wall-clock-aligned five-minute NSE market slot (`09:15` through
+`15:25` IST). Summary values and per-strike OI/change-OI are also normalized into SQLite for fast
+analysis. The database defaults to `/data/oi_snapshots.sqlite3`, which is covered by the existing
+Docker volume.
+
+Expiry-day data remains available through the full session. On the first collector tick after
+midnight IST, snapshots with an earlier expiry date are deleted; startup performs the same cleanup
+if the service was offline overnight. Set `OI_DATABASE_PATH` to override the database location.
 
 ## Development
 Create a virtualenv and install dependencies:

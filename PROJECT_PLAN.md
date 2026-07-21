@@ -1,7 +1,7 @@
 # Upstox Personal Backend V1 Plan
 
 ## 1. Goal
-Build a personal backend API service that uses Upstox REST APIs and exposes endpoints for Android/iPhone apps to authenticate, fetch market data, and view portfolio data. There will be no database in v1; the Upstox token is stored in an encrypted file on the VPS.
+Build a personal backend API service that uses Upstox REST APIs and exposes endpoints for Android/iPhone apps to authenticate, fetch market data, and view portfolio data. The Upstox token is stored in an encrypted file on the VPS, while short-lived OI snapshots use embedded SQLite storage.
 
 ## 2. Recommended stack
 - Language: Python 3.12
@@ -13,8 +13,8 @@ Build a personal backend API service that uses Upstox REST APIs and exposes endp
 - Version control: GitHub
 
 ## 3. Core constraints
-- No database access
-- No database requirement
+- No external database service requirement
+- Embedded SQLite storage for five-minute OI snapshots only
 - The backend should be stateless where possible
 - Upstox token is stored in an encrypted server-side file
 - Android/iPhone apps will call these API endpoints over HTTPS

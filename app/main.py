@@ -11,30 +11,36 @@ from fastapi.responses import JSONResponse
 from app.api.routes import router as api_router
 from app.core.config import get_settings
 from app.services.oco_watcher import run_oco_watcher
+from app.services.oi_snapshot_collector import run_oi_snapshot_collector
 from app.services.tracked_instruments_poller import run_tracked_instruments_poller
 
 
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings = get_settings()
     # See TrackedInstrumentsStore / run_tracked_instruments_poller's own doc comment for why this
     # exists -- keeps 5-minute-change history warm for Settings-picked underlyings even while no
     # client is actively polling. Cancelled cleanly on shutdown, same as any other background task
     # tied to the app's own lifetime.
-    poller_task = asyncio.create_task(run_tracked_instruments_poller(get_settings()))
+    poller_task = asyncio.create_task(run_tracked_instruments_poller(settings))
     # See PendingOcoPairsStore / run_oco_watcher's own doc comment -- reconciles the plain
     # target/stoploss order pairs SmartOrderService.attach_gtt_exits places for a position with
     # no GTT bracket, independent of whether the app itself is open. Same lifecycle as the poller
     # above.
-    oco_watcher_task = asyncio.create_task(run_oco_watcher(get_settings()))
+    oco_watcher_task = asyncio.create_task(run_oco_watcher(settings))
+    oi_collector_task = asyncio.create_task(run_oi_snapshot_collector(settings))
     try:
         yield
     finally:
         poller_task.cancel()
         oco_watcher_task.cancel()
+        oi_collector_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await poller_task
         with contextlib.suppress(asyncio.CancelledError):
             await oco_watcher_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await oi_collector_task
 
 
 app = FastAPI(title="Upstox Scalper Backend", version="0.1.0", lifespan=_lifespan)
