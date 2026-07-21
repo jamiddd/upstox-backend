@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from app.core.config import Settings
@@ -9,32 +9,44 @@ from app.core.exceptions import PendingOcoPairsStoreError
 
 
 @dataclass(frozen=True)
-class OcoPair:
-    """One target+stoploss order pair placed by SmartOrderService.attach_exit_orders for a
-    position with no GTT bracket -- see that method's own doc comment for why these are plain
-    orders instead of a GTT MULTIPLE order. Watched by `oco_watcher` until one leg fills, at
-    which point the other is cancelled and the pair is dropped.
+class PendingExit:
+    """A target+stoploss exit `SmartOrderService.attach_gtt_exits` armed for a position with no
+    GTT bracket -- see that method's own doc comment for why only the stoploss is a real live
+    order.
+
+    FIX: this used to be a pair of two live order ids (a resting LIMIT target + a resting SL-M
+    stoploss). Upstox rejected the *second* of those two live sell orders outright: placing a
+    LIMIT sell for the full held quantity reserves all of it against that order, so a second SELL
+    order for the same quantity has nothing left to "cover" it and gets margin-checked as a brand
+    new naked short (the "You need to add Rs. X" rejection) -- there is no way to have two live
+    sell orders each covering the full position at once. Only [stoploss_order_id] is ever a real
+    Upstox order now; [target_trigger_price] is a price level `oco_watcher` itself watches
+    (against live quotes, not a broker-side conditional), and only becomes a real MARKET sell
+    order once price actually crosses it -- see that module's own doc comment.
     """
 
-    target_order_id: str
     stoploss_order_id: str
     instrument_key: str
+    exit_transaction_type: str  # "BUY" or "SELL" -- the exit side
+    quantity: int
+    product: str
+    target_trigger_price: float
 
 
 class PendingOcoPairsStore:
-    """Persists [OcoPair]s awaiting reconciliation by `oco_watcher.run_oco_watcher`, so the
+    """Persists [PendingExit]s awaiting reconciliation by `oco_watcher.run_oco_watcher`, so the
     watch list survives a server/container restart -- same "small flat JSON file, database-free"
-    posture as [TrackedInstrumentsStore]. Not sensitive (just order ids), so plain JSON, not
-    Fernet-encrypted, same as that store.
+    posture as [TrackedInstrumentsStore]. Not sensitive (just order ids/prices), so plain JSON,
+    not Fernet-encrypted, same as that store.
     """
 
     def __init__(self, settings: Settings) -> None:
         self.path = Path(settings.pending_oco_pairs_path)
 
-    def load(self) -> list[OcoPair]:
-        """Return the persisted pairs, or an empty list if nothing's been saved yet (or the file
-        is unreadable/corrupt -- degrades to "nothing pending", not a crash, same "missing data
-        means omit" posture as the rest of this backend)."""
+    def load(self) -> list[PendingExit]:
+        """Return the persisted pending exits, or an empty list if nothing's been saved yet (or
+        the file is unreadable/corrupt -- degrades to "nothing pending", not a crash, same
+        "missing data means omit" posture as the rest of this backend)."""
         if not self.path.exists():
             return []
         try:
@@ -44,48 +56,80 @@ class PendingOcoPairsStore:
         raw_pairs = payload.get("pairs") if isinstance(payload, dict) else None
         if not isinstance(raw_pairs, list):
             return []
-        pairs: list[OcoPair] = []
+        pending_exits: list[PendingExit] = []
         for raw in raw_pairs:
             if not isinstance(raw, dict):
                 continue
-            target_order_id = raw.get("target_order_id")
             stoploss_order_id = raw.get("stoploss_order_id")
             instrument_key = raw.get("instrument_key")
+            exit_transaction_type = raw.get("exit_transaction_type")
+            quantity = raw.get("quantity")
+            product = raw.get("product")
+            target_trigger_price = raw.get("target_trigger_price")
             if (
-                isinstance(target_order_id, str)
-                and isinstance(stoploss_order_id, str)
+                isinstance(stoploss_order_id, str)
                 and isinstance(instrument_key, str)
+                and isinstance(exit_transaction_type, str)
+                and isinstance(quantity, int)
+                and isinstance(product, str)
+                and isinstance(target_trigger_price, (int, float))
             ):
-                pairs.append(
-                    OcoPair(
-                        target_order_id=target_order_id,
+                pending_exits.append(
+                    PendingExit(
                         stoploss_order_id=stoploss_order_id,
                         instrument_key=instrument_key,
+                        exit_transaction_type=exit_transaction_type,
+                        quantity=quantity,
+                        product=product,
+                        target_trigger_price=float(target_trigger_price),
                     )
                 )
-        return pairs
+        return pending_exits
 
-    def save(self, pairs: list[OcoPair]) -> None:
+    def save(self, pending_exits: list[PendingExit]) -> None:
         """Replaces the whole persisted set."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.path.write_text(
-                json.dumps({"pairs": [asdict(pair) for pair in pairs]}),
+                json.dumps({"pairs": [asdict(pending_exit) for pending_exit in pending_exits]}),
                 encoding="utf-8",
             )
         except OSError as exc:
             raise PendingOcoPairsStoreError("Unable to write pending-OCO-pairs store") from exc
 
-    def add(self, pair: OcoPair) -> None:
-        """Appends one pair to whatever's already persisted."""
-        self.save(self.load() + [pair])
+    def add(self, pending_exit: PendingExit) -> None:
+        """Appends one pending exit to whatever's already persisted."""
+        self.save(self.load() + [pending_exit])
 
-    def remove(self, pairs_to_remove: list[OcoPair]) -> None:
-        """Drops resolved pairs (either leg filled/cancelled/rejected) from the persisted set.
-        Ignores any pair not actually present -- lets `oco_watcher` remove-then-not-worry about
-        a concurrent modification between its own load() and this call.
+    def remove(self, pending_exits_to_remove: list[PendingExit]) -> None:
+        """Drops resolved pending exits (stoploss filled/cancelled/rejected, or the target fired)
+        from the persisted set. Ignores any entry not actually present -- lets `oco_watcher`
+        remove-then-not-worry about a concurrent modification between its own load() and this
+        call.
         """
-        if not pairs_to_remove:
+        if not pending_exits_to_remove:
             return
-        remaining = [pair for pair in self.load() if pair not in pairs_to_remove]
+        remaining = [
+            pending_exit for pending_exit in self.load() if pending_exit not in pending_exits_to_remove
+        ]
         self.save(remaining)
+
+    def update_target_trigger_price(self, *, stoploss_order_id: str, target_trigger_price: float) -> bool:
+        """Re-points the stored target price for the pending exit identified by
+        [stoploss_order_id] -- the target itself is never a live Upstox order (see [PendingExit]'s
+        own doc comment), so "modifying" it is purely a local store update, unlike the stoploss
+        leg (a real order, modified via the ordinary `PUT /orders/modify` endpoint instead).
+        Returns whether a matching entry was actually found and updated.
+        """
+        pending_exits = self.load()
+        updated = False
+        result: list[PendingExit] = []
+        for pending_exit in pending_exits:
+            if pending_exit.stoploss_order_id == stoploss_order_id:
+                result.append(replace(pending_exit, target_trigger_price=target_trigger_price))
+                updated = True
+            else:
+                result.append(pending_exit)
+        if updated:
+            self.save(result)
+        return updated

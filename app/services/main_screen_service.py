@@ -519,19 +519,31 @@ def _shape_position(position: dict[str, Any]) -> dict[str, Any]:
 
 
 def _entry_price(position: dict[str, Any]) -> float:
-    # average_price is the currently-open lot's real average entry -- buy_price/sell_price are
-    # Upstox's *cumulative day-total* buy/sell averages for the instrument, not the open lot's
-    # entry, so they go stale/wrong the moment an instrument has more than one round trip in a
-    # day (e.g. bought, squared off, bought again -- buy_price then blends both fills). Don't use
-    # them as a stand-in.
-    #
-    # average_price can still legitimately read 0 for a moment right after a fresh fill, before
-    # Upstox's own position-keeping catches up -- that gap is handled client-side (see
-    # MainViewModel.mergeOpenPositions), which keeps the previous confirmed entry price until a
-    # real one arrives, rather than papering over it here with a value that can be permanently
-    # wrong.
+    # FIX: average_price is documented by Upstox itself as null for "positions without prior
+    # session holdings" -- i.e. a pure same-day (no overnight carry-forward) position, which is
+    # the *normal* case for this app, not a rare edge case. That's not a momentary post-fill lag
+    # that self-corrects (which is what the previous version of this function assumed) -- it can
+    # stay null for the position's entire life, regressing entry_price to 0 forever.
     value = position.get("average_price")
-    return float(value) if isinstance(value, (int, float)) else 0.0
+    if isinstance(value, (int, float)) and value != 0:
+        return float(value)
+
+    # Fall back to the *directional* day-cumulative average -- buy_price for a net-long position,
+    # sell_price for net-short -- which coincides exactly with the true entry price for the
+    # common case (this instrument only ever entered once today). buy_price/sell_price are
+    # Upstox's cumulative-day averages across *all* of the day's buy/sell fills for the
+    # instrument, not specifically the currently-open lot's, so this is only wrong (a stale/
+    # blended figure, not a fabricated one) for the rarer case of multiple round trips in the same
+    # instrument the same day -- still strictly better than the guaranteed-wrong 0 this replaces.
+    # A momentary 0 right after a fresh fill, before Upstox's own position-keeping catches up, is
+    # separately handled client-side (see MainViewModel.mergeOpenPositions), which keeps the
+    # previous confirmed entry price until a real one arrives.
+    quantity = position.get("quantity")
+    if not isinstance(quantity, (int, float)) or quantity == 0:
+        return 0.0
+    fallback_key = "buy_price" if quantity > 0 else "sell_price"
+    fallback_value = position.get(fallback_key)
+    return float(fallback_value) if isinstance(fallback_value, (int, float)) else 0.0
 
 
 def _available_to_trade(payload: dict[str, Any]) -> dict[str, Any]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.core.config import Settings
-from app.services.pending_oco_pairs_store import OcoPair, PendingOcoPairsStore
+from app.services.pending_oco_pairs_store import PendingExit, PendingOcoPairsStore
 
 
 def _settings(path: Path) -> Settings:
@@ -19,6 +19,24 @@ def _settings(path: Path) -> Settings:
     )
 
 
+def _pending_exit(
+    stoploss_order_id: str = "S-1",
+    instrument_key: str = "NSE_FO|111",
+    exit_transaction_type: str = "SELL",
+    quantity: int = 75,
+    product: str = "I",
+    target_trigger_price: float = 140.0,
+) -> PendingExit:
+    return PendingExit(
+        stoploss_order_id=stoploss_order_id,
+        instrument_key=instrument_key,
+        exit_transaction_type=exit_transaction_type,
+        quantity=quantity,
+        product=product,
+        target_trigger_price=target_trigger_price,
+    )
+
+
 def test_load_returns_empty_list_when_nothing_saved_yet(tmp_path: Path) -> None:
     store = PendingOcoPairsStore(_settings(tmp_path / "pairs.json"))
 
@@ -27,17 +45,17 @@ def test_load_returns_empty_list_when_nothing_saved_yet(tmp_path: Path) -> None:
 
 def test_add_and_load_round_trip(tmp_path: Path) -> None:
     store = PendingOcoPairsStore(_settings(tmp_path / "pairs.json"))
-    pair = OcoPair(target_order_id="T-1", stoploss_order_id="S-1", instrument_key="NSE_FO|111")
+    pending_exit = _pending_exit()
 
-    store.add(pair)
+    store.add(pending_exit)
 
-    assert store.load() == [pair]
+    assert store.load() == [pending_exit]
 
 
-def test_add_appends_to_existing_pairs(tmp_path: Path) -> None:
+def test_add_appends_to_existing_pending_exits(tmp_path: Path) -> None:
     store = PendingOcoPairsStore(_settings(tmp_path / "pairs.json"))
-    first = OcoPair(target_order_id="T-1", stoploss_order_id="S-1", instrument_key="NSE_FO|111")
-    second = OcoPair(target_order_id="T-2", stoploss_order_id="S-2", instrument_key="NSE_FO|222")
+    first = _pending_exit(stoploss_order_id="S-1", instrument_key="NSE_FO|111")
+    second = _pending_exit(stoploss_order_id="S-2", instrument_key="NSE_FO|222")
 
     store.add(first)
     store.add(second)
@@ -45,10 +63,10 @@ def test_add_appends_to_existing_pairs(tmp_path: Path) -> None:
     assert store.load() == [first, second]
 
 
-def test_remove_drops_only_the_resolved_pairs(tmp_path: Path) -> None:
+def test_remove_drops_only_the_resolved_pending_exits(tmp_path: Path) -> None:
     store = PendingOcoPairsStore(_settings(tmp_path / "pairs.json"))
-    keep = OcoPair(target_order_id="T-1", stoploss_order_id="S-1", instrument_key="NSE_FO|111")
-    drop = OcoPair(target_order_id="T-2", stoploss_order_id="S-2", instrument_key="NSE_FO|222")
+    keep = _pending_exit(stoploss_order_id="S-1")
+    drop = _pending_exit(stoploss_order_id="S-2")
     store.add(keep)
     store.add(drop)
 
@@ -57,15 +75,35 @@ def test_remove_drops_only_the_resolved_pairs(tmp_path: Path) -> None:
     assert store.load() == [keep]
 
 
-def test_remove_ignores_a_pair_not_actually_present(tmp_path: Path) -> None:
+def test_remove_ignores_a_pending_exit_not_actually_present(tmp_path: Path) -> None:
     store = PendingOcoPairsStore(_settings(tmp_path / "pairs.json"))
-    keep = OcoPair(target_order_id="T-1", stoploss_order_id="S-1", instrument_key="NSE_FO|111")
+    keep = _pending_exit(stoploss_order_id="S-1")
     store.add(keep)
-    not_present = OcoPair(target_order_id="T-x", stoploss_order_id="S-x", instrument_key="NSE_FO|999")
+    not_present = _pending_exit(stoploss_order_id="S-x")
 
     store.remove([not_present])
 
     assert store.load() == [keep]
+
+
+def test_update_target_trigger_price_repoints_the_matching_entry(tmp_path: Path) -> None:
+    store = PendingOcoPairsStore(_settings(tmp_path / "pairs.json"))
+    store.add(_pending_exit(stoploss_order_id="S-1", target_trigger_price=140.0))
+
+    updated = store.update_target_trigger_price(stoploss_order_id="S-1", target_trigger_price=150.0)
+
+    assert updated is True
+    assert store.load()[0].target_trigger_price == 150.0
+
+
+def test_update_target_trigger_price_returns_false_when_not_found(tmp_path: Path) -> None:
+    store = PendingOcoPairsStore(_settings(tmp_path / "pairs.json"))
+    store.add(_pending_exit(stoploss_order_id="S-1"))
+
+    updated = store.update_target_trigger_price(stoploss_order_id="S-does-not-exist", target_trigger_price=150.0)
+
+    assert updated is False
+    assert store.load()[0].target_trigger_price == 140.0
 
 
 def test_load_tolerates_a_corrupt_file(tmp_path: Path) -> None:
@@ -87,12 +125,21 @@ def test_load_tolerates_unexpected_json_shape(tmp_path: Path) -> None:
 def test_load_skips_malformed_entries(tmp_path: Path) -> None:
     path = tmp_path / "pairs.json"
     path.write_text(
-        '{"pairs": [{"target_order_id": "T-1"}, '
-        '{"target_order_id": "T-2", "stoploss_order_id": "S-2", "instrument_key": "NSE_FO|222"}]}',
+        '{"pairs": [{"stoploss_order_id": "S-1"}, '
+        '{"stoploss_order_id": "S-2", "instrument_key": "NSE_FO|222", '
+        '"exit_transaction_type": "SELL", "quantity": 75, "product": "I", '
+        '"target_trigger_price": 140.0}]}',
         encoding="utf-8",
     )
     store = PendingOcoPairsStore(_settings(path))
 
     assert store.load() == [
-        OcoPair(target_order_id="T-2", stoploss_order_id="S-2", instrument_key="NSE_FO|222"),
+        PendingExit(
+            stoploss_order_id="S-2",
+            instrument_key="NSE_FO|222",
+            exit_transaction_type="SELL",
+            quantity=75,
+            product="I",
+            target_trigger_price=140.0,
+        ),
     ]

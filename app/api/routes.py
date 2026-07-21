@@ -133,6 +133,16 @@ class AttachGttExitsRequest(BaseModel):
     slice_quantity: Optional[int] = Field(default=None, gt=0)
 
 
+class UpdatePendingExitTargetPriceRequest(BaseModel):
+    """Re-points one pending exit's stored target price. See
+    SmartOrderService.update_pending_exit_target_price.
+    """
+
+    instrument_key: str = Field(min_length=1)
+    stoploss_order_id: str = Field(min_length=1)
+    target_trigger_price: float = Field(gt=0)
+
+
 class ModifyOrderRequest(BaseModel):
     """Fields accepted by the Upstox V3 modify-order endpoint."""
 
@@ -699,10 +709,10 @@ async def get_pending_exit_orders(
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
 ) -> list[dict[str, Any]]:
-    """Plain target/stoploss order pairs (attach_gtt_exits, no GTT bracket) for one instrument --
-    the plain-order counterpart of GET /orders/gtt, so the app can find and edit the exits behind
-    a position that has no GTT bracket instead of only ever finding "nothing" and attaching a
-    redundant second pair. See SmartOrderService.get_pending_exit_orders.
+    """Pending exits (attach_gtt_exits, no GTT bracket) for one instrument -- the plain-order
+    counterpart of GET /orders/gtt, so the app can find and edit the exit behind a position that
+    has no GTT bracket instead of only ever finding "nothing" and attaching a redundant second
+    one. See SmartOrderService.get_pending_exit_orders.
     """
     access_token = _load_access_token(token_store)
     try:
@@ -713,6 +723,27 @@ async def get_pending_exit_orders(
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
+
+
+@protected_router.put("/orders/pending-exits/target-price")
+async def update_pending_exit_target_price(
+    request: UpdatePendingExitTargetPriceRequest,
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Re-points a pending exit's stored target price -- doesn't touch Upstox at all, since the
+    target was never a live order (see PendingExit's own doc comment). The stoploss leg's price
+    is still modified through the ordinary PUT /orders/modify (a real order). See
+    SmartOrderService.update_pending_exit_target_price.
+    """
+    found = SmartOrderService.update_pending_exit_target_price(
+        instrument_key=request.instrument_key,
+        stoploss_order_id=request.stoploss_order_id,
+        target_trigger_price=request.target_trigger_price,
+        pending_oco_store=PendingOcoPairsStore(settings),
+    )
+    if not found:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "No pending exit found for that stoploss order id.")
+    return {"status": "success"}
 
 
 @protected_router.put("/orders/gtt/modify")
