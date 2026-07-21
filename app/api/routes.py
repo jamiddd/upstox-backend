@@ -438,7 +438,8 @@ async def main_option_chain(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Return every strike's live CE/PE market data + option greeks for the underlying + expiry."""
+    """Return every strike's live CE/PE market data + option greeks (+ lot_size) for the
+    underlying + expiry."""
     access_token = _load_access_token(token_store)
     try:
         return await MainScreenService(service).option_chain(

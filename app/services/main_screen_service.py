@@ -133,7 +133,9 @@ class MainScreenService:
     ) -> dict[str, Any]:
         """Return every strike's live CE/PE market data + greeks for one underlying + expiry --
         powers the app's smart strike selector (ATM/delta-target/liquidity/manual-offset/
-        DTE-aware modes all pick from this same per-strike data, client-side).
+        DTE-aware modes all pick from this same per-strike data, client-side) and the Gamma
+        Exposure chart (which additionally needs [lot_size] as the contract multiplier -- see
+        that response field's own note below).
 
         FIX: this used to call Upstox's `/option/contract` endpoint, which only returns bare
         contract metadata (instrument key, lot size, tick size) -- no LTP, no bid/ask, no OI, no
@@ -169,8 +171,29 @@ class MainScreenService:
             "underlying_key": underlying_key,
             "expiry_date": expiry_date,
             "underlying_spot_price": underlying_spot_price,
+            "lot_size": await self._lot_size(access_token, underlying_key, expiry_date=expiry_date),
             "strikes": strikes,
         }
+
+    async def _lot_size(self, access_token: str, underlying_key: str, *, expiry_date: str) -> int:
+        """The lot size shared by every strike of one underlying+expiry.
+
+        FIX: this used to look up lot_size via InstrumentRulesService, which reads Upstox's daily
+        instrument-master *file* (cached 24h) -- a source completely independent from
+        _resolve_contract's own live `/option/contract` lookup, which is what order placement
+        actually validates quantities against. Nothing guaranteed the two ever agreed, and in
+        practice they didn't -- the instrument-master path reported a stale/wrong lot size for
+        NIFTY. Reusing _option_contracts here instead (the exact same call + 600s cache
+        _resolve_contract already uses to resolve a contract for order placement) guarantees the
+        Gamma Exposure chart's contract multiplier always matches the lot size the rest of the app
+        actually trades against -- one source of truth, not two that can silently drift apart.
+        """
+        contracts = await self._option_contracts(access_token, underlying_key, expiry_date=expiry_date)
+        for contract in _contracts_data(contracts):
+            lot_size = _number_value(contract, "lot_size")
+            if lot_size > 0:
+                return int(lot_size)
+        return 0
 
     async def position_quotes(
         self,

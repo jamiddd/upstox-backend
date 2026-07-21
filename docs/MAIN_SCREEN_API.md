@@ -111,22 +111,33 @@ The app sends the selected strike and CE/PE toggle. The backend resolves the mat
 GET /api/main/option-chain?expiry_date=2026-07-16&underlying_key=NSE_INDEX|Nifty 50
 ```
 
-Returns every listed strike's **live** CE/PE market data and option greeks for the given
-underlying + expiry -- powers the app's smart strike selector (ATM/delta-target/liquidity/
-manual-offset/DTE-aware modes all pick from this same per-strike data, client-side; see
-`ui/main/strikeselection/StrikeSelector.kt` in the app repo).
+Returns every listed strike's **live** CE/PE market data and option greeks, plus the underlying's
+lot size, for the given underlying + expiry -- powers the app's smart strike selector (ATM/
+delta-target/liquidity/manual-offset/DTE-aware modes all pick from this same per-strike data,
+client-side; see `ui/main/strikeselection/StrikeSelector.kt` in the app repo) and the Gamma
+Exposure chart (`ui/gex/GexCalculator.kt`), which additionally needs `lot_size` as the contract
+multiplier.
 
-FIX: this used to wrap Upstox's `/option/contract` endpoint, which only returns bare contract
-metadata (instrument key, lot size, tick size) -- no LTP, no bid/ask, no OI, no greeks, so there
-was no data to build anything "smart" from. Now wraps Upstox's `/option/chain` endpoint instead,
-which returns everything needed for every strike in one call. Cached much more briefly than
-before (15s, not 600s) since this data is live-changing throughout the day, not static.
+FIX: the CE/PE market data + greeks used to come from Upstox's `/option/contract` endpoint, which
+only returns bare contract metadata (instrument key, lot size, tick size) -- no LTP, no bid/ask,
+no OI, no greeks, so there was no data to build anything "smart" from. Now wraps Upstox's
+`/option/chain` endpoint instead, which returns everything needed for every strike in one call.
+Cached much more briefly than `/option/contract` (15s, not 600s) since this data is live-changing
+throughout the day, not static.
+
+`lot_size` is still resolved via `/option/contract` (`_lot_size`, the same lookup + 600s cache
+`_resolve_contract` uses to validate order placement) -- deliberately *not* via
+`InstrumentRulesService`'s separate instrument-master-file lookup, which is an independent Upstox
+data source that isn't guaranteed to agree with it (and in practice didn't -- it reported a
+stale/wrong lot size for NIFTY). Reusing the same source order placement already trusts guarantees
+this chart's contract multiplier always matches what the app actually trades against.
 
 ```json
 {
   "underlying_key": "NSE_INDEX|Nifty 50",
   "expiry_date": "2026-07-16",
   "underlying_spot_price": 25050.0,
+  "lot_size": 75,
   "strikes": [
     {
       "strike_price": 25000.0,

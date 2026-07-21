@@ -1154,6 +1154,12 @@ def test_main_option_chain_returns_live_market_data_and_greeks_per_strike() -> N
         "underlying_key": "NSE_INDEX|Nifty 50",
         "expiry_date": "2026-07-16",
         "underlying_spot_price": 25050.0,
+        # From FakeUpstoxService.get_option_contracts (the same /option/contract lookup order
+        # placement uses) -- not FakeUpstoxService's separate instrument-rules-cache fixture
+        # (lot_size 75), confirming lot_size now comes from that single shared source. See
+        # option_chain()/_lot_size's own doc comments for why those two must not be allowed to
+        # silently disagree.
+        "lot_size": 65,
         "strikes": [
             {
                 "strike_price": 25000.0,
