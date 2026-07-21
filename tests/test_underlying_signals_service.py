@@ -1350,6 +1350,14 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
         {"strike_price": 225.0, "call_oi": 0, "put_oi": 0},
         {"strike_price": 230.0, "call_oi": 99999999, "put_oi": 100},  # excluded
     ]
+    class _SnapshotStore:
+        calls = []
+
+        def record_and_find_previous(self, **kwargs):
+            self.calls.append(kwargs)
+            return None
+
+    snapshot_store = _SnapshotStore()
     service = UnderlyingSignalsService(
         _FakeUpstoxService(
             minute_candles=minute_candles,
@@ -1359,6 +1367,7 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
             max_pain=190.0,
             oi_strike_rows=oi_strike_rows,
         ),
+        snapshot_store=snapshot_store,
     )
 
     result = anyio.run(
@@ -1371,6 +1380,9 @@ def test_get_signals_includes_pcr_and_max_pain_when_expiry_date_is_given() -> No
     # excluded strikes had leaked in, this would instead be ~1.0 (huge put and huge call roughly
     # cancel out) or skewed the other way -- either way, not 0.8.
     assert result["pcr"] == {"value": 0.8, "bias": "bearish"}
+    assert len(snapshot_store.calls) == 1
+    assert snapshot_store.calls[0]["expiry_date"] == "2026-07-23"
+    assert snapshot_store.calls[0]["metrics"]["pcr"] == pytest.approx(0.8)
     # LTP (200.0) is above max pain (190.0) -> bearish pull. max_pain itself is intentionally
     # NOT restricted to the near-ATM window (see _oi_analysis's doc comment).
     assert result["max_pain"] == {"value": 190.0, "pull": "bearish"}

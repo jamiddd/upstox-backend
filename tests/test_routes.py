@@ -9,6 +9,7 @@ import anyio
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import (
+    get_signal_snapshot_store,
     get_token_store,
     get_tracked_instruments_store,
     get_upstox_service,
@@ -821,6 +822,9 @@ def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = FakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: token_store or FakeTokenStore()
+    # Existing route tests exercise the legacy pure in-memory delta helper. Durable-store behavior
+    # and the history route have focused tests of their own.
+    app.dependency_overrides[get_signal_snapshot_store] = lambda: None
     return TestClient(app)
 
 
@@ -1354,6 +1358,53 @@ def test_main_underlying_signals_returns_ema_atr_opening_range_and_nearest_level
     assert payload["no_trade_zone"] is False
 
 
+def test_main_underlying_signals_history_is_available_without_upstox_token() -> None:
+    class _HistoryStore:
+        def list_snapshots(self, **kwargs):
+            assert kwargs == {
+                "underlying_key": "NSE_INDEX|Nifty 50",
+                "expiry_date": "2026-07-23",
+                "limit": 25,
+            }
+            return [
+                {
+                    "expiry_date": "2026-07-23",
+                    "trading_date": "2026-07-21",
+                    "slot_start": "2026-07-21T03:45:00+00:00",
+                    "observed_at": "2026-07-21T03:45:08+00:00",
+                    "atr": 20.5,
+                    "pcr": 1.2,
+                },
+            ]
+
+    client = _client(FakeTokenStore(token=None))
+    app.dependency_overrides[get_signal_snapshot_store] = _HistoryStore
+    try:
+        response = client.get(
+            "/api/main/underlying-signals/history"
+            "?underlying_key=NSE_INDEX|Nifty 50&expiry_date=2026-07-23&limit=25",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "underlying_key": "NSE_INDEX|Nifty 50",
+        "expiry_date": "2026-07-23",
+        "snapshots": [
+            {
+                "expiry_date": "2026-07-23",
+                "trading_date": "2026-07-21",
+                "slot_start": "2026-07-21T03:45:00+00:00",
+                "observed_at": "2026-07-21T03:45:08+00:00",
+                "atr": 20.5,
+                "pcr": 1.2,
+            },
+        ],
+    }
+
+
 class _NearDayOpenFakeUpstoxService(FakeUpstoxService):
     """LTP set just 5 points above the shared candle series' first-candle open (24900.0) -- well
     within the dynamic no-trade-zone tolerance (the shared rising candle series' ATR(14) on 5m
@@ -1371,6 +1422,7 @@ def test_main_underlying_signals_flags_no_trade_zone_near_days_open() -> None:
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _NearDayOpenFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_signal_snapshot_store] = lambda: None
     _CACHE.clear()
     _SEARCH_CACHE.clear()
     oi_analysis_service._CACHE = {}

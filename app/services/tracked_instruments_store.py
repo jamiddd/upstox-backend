@@ -13,10 +13,9 @@ class TrackedInstrumentsStore:
     `UnderlyingSignalsService._record_and_diff`) -- so the list survives a server/container
     restart without the Android client having to notice and re-push it.
 
-    A small flat JSON file, same posture as [EncryptedTokenStore] -- this repo is deliberately
-    database-free (see README's "Keep the first version database-free" goal), and a handful of
-    instrument keys don't warrant one. Unlike the token store, this isn't sensitive, so it's
-    plain JSON, not Fernet-encrypted.
+    A small flat JSON file, same posture as [EncryptedTokenStore]. A handful of selection keys do
+    not warrant a database table even though their collected OI/signal history is stored in
+    SQLite. Unlike the token store, this isn't sensitive, so it's plain JSON, not Fernet-encrypted.
     """
 
     def __init__(self, settings: Settings) -> None:

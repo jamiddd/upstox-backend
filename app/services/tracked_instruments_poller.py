@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import date, datetime
 from time import monotonic
+from zoneinfo import ZoneInfo
 
 from app.core.config import Settings
 from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequiredError
 from app.core.market_hours import is_market_open
 from app.services.main_screen_service import MainScreenService
+from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.token_store import EncryptedTokenStore
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.underlying_signals_service import UnderlyingSignalsService
@@ -23,6 +26,7 @@ _LOOP_INTERVAL_SECONDS = 60.0
 # closer-together snapshot wouldn't be used for the delta anyway. This is what keeps the call
 # volume down to roughly one call per tracked underlying every 5 minutes during market hours.
 _MIN_REFRESH_SECONDS = 300.0
+_IST = ZoneInfo("Asia/Kolkata")
 
 
 async def run_tracked_instruments_poller(settings: Settings) -> None:
@@ -31,11 +35,10 @@ async def run_tracked_instruments_poller(settings: Settings) -> None:
     has opted into via Settings (see `TrackedInstrumentsStore`), independent of whether the app
     itself is open and polling.
 
-    Without this, a delta suffix only ever appears once the *app* has been open, polling the same
-    underlying/expiry, for 5 continuous minutes -- opening the app fresh (or reopening after a
-    while) always starts from zero. This closes that gap for whichever instruments are tracked:
+    Without this, a delta suffix only ever appears once the *app* has been polling the same
+    underlying/expiry for 5 continuous minutes. This closes that gap for tracked instruments:
     each tick just calls `UnderlyingSignalsService.get_signals` -- the exact same call a real
-    client request makes -- purely for its `_record_and_diff` side effect; the returned payload
+    client request makes -- persisting the metrics used for deltas in SQLite; the returned payload
     itself is discarded here.
 
     Runs forever until the task is cancelled (see `app.main`'s lifespan shutdown). Every failure
@@ -47,12 +50,20 @@ async def run_tracked_instruments_poller(settings: Settings) -> None:
     tracked_store = TrackedInstrumentsStore(settings)
     upstox = UpstoxService(settings)
     main_screen = MainScreenService(upstox)
-    signals_service = UnderlyingSignalsService(upstox)
+    snapshot_store = SignalSnapshotStore(settings)
+    signals_service = UnderlyingSignalsService(upstox, snapshot_store=snapshot_store)
     last_polled: dict[str, float] = {}
+    cleanup_completed_for: date | None = None
 
     while True:
         await asyncio.sleep(_LOOP_INTERVAL_SECONDS)
         try:
+            today = datetime.now(_IST).date()
+            if cleanup_completed_for != today:
+                deleted = await asyncio.to_thread(snapshot_store.delete_expired_before, today)
+                cleanup_completed_for = today
+                if deleted:
+                    logger.info("Deleted %d expired signal snapshots before %s", deleted, today)
             await _poll_due_instruments(
                 token_store=token_store,
                 tracked_store=tracked_store,

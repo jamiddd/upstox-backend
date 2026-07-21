@@ -22,8 +22,9 @@ https://api.scalp8.xyz/api/auth/callback
   - `MOBILE_API_KEY`
   - `TOKEN_ENCRYPTION_KEY`
   - `TOKEN_STORE_PATH=/data/upstox_token.enc`
-  - `OI_DATABASE_PATH=/data/oi_snapshots.sqlite3` -- optional; this is the default and is retained
-    by the `upstox-data` Docker volume. OI data is deleted overnight after its expiry date.
+  - `OI_DATABASE_PATH=/data/oi_snapshots.sqlite3` -- optional; this is the default shared OI and
+    signal-history database and is retained by the `upstox-data` Docker volume. Expiry-scoped data
+    is deleted overnight after its expiry date.
   - `MOBILE_APP_REDIRECT_URL` -- only needs setting if the Android app's intent-filter scheme
     ever changes; defaults to `personalscalper://auth/callback`, which must match `MainActivity`'s
     intent-filter in the app repo exactly.

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from dataclasses import asdict, dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from time import monotonic
 from typing import Any, Optional
 
 from app.core.exceptions import UpstoxApiError
 from app.services.oi_analysis_service import OIAnalysisService
+from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.upstox_service import UpstoxService
 
 # How far apart LTP has to be from a candidate level for it to still count as "near" it -- see
@@ -52,9 +54,10 @@ _NO_TRADE_ZONE_MIN_POINTS = 5.0
 # entirely.
 _NO_TRADE_ZONE_FALLBACK_POINTS = 15.0
 
-# Rolling 5-minute-change history (see _record_and_diff) -- how far back a snapshot can be and
-# still count as "5 minutes ago" (a tolerance band, not an exact match, since polling is ~60s but
-# not perfectly metronomic), and how long a snapshot is kept around at all before being pruned.
+# Rolling 5-minute-change matching -- how far back a snapshot can be and
+# still count as "5 minutes ago" (a tolerance band, not an exact match, since polling is not
+# perfectly metronomic). The 10-minute window applies only to the legacy in-memory fallback used
+# by isolated unit callers; production snapshots remain in SQLite through expiry.
 _FIVE_MIN_MIN_SECONDS = 240.0
 _FIVE_MIN_MAX_SECONDS = 360.0
 _HISTORY_WINDOW_SECONDS = 600.0
@@ -144,9 +147,9 @@ class _HistoryDeltas:
     atm_straddle: Optional[float] = None
 
 
-# Keyed by (underlying_key, expiry_date) -- expiry-specific metrics (PCR/OI/ATM straddle) can't be
-# meaningfully diffed across an expiry switch, so the whole history resets together with one key
-# scheme rather than keeping two.
+# In-memory fallback for callers that do not inject SignalSnapshotStore (primarily pure unit
+# tests). Production API/poller instances use SQLite. The key remains expiry-specific because
+# PCR/OI/ATM-straddle metrics cannot be meaningfully diffed across an expiry switch.
 _HISTORY: dict[tuple[str, Optional[str]], list[_HistorySnapshot]] = {}
 
 
@@ -169,8 +172,14 @@ class UnderlyingSignalsService:
     would be meaningless for this purpose.
     """
 
-    def __init__(self, upstox_service: UpstoxService) -> None:
+    def __init__(
+        self,
+        upstox_service: UpstoxService,
+        *,
+        snapshot_store: SignalSnapshotStore | None = None,
+    ) -> None:
         self.upstox = upstox_service
+        self.snapshot_store = snapshot_store
 
     async def get_signals(
         self,
@@ -264,8 +273,7 @@ class UnderlyingSignalsService:
         # value; OI support/resistance are strike-matched, ATM straddle deliberately isn't).
         level_distance = abs(ltp - nearest_level["value"]) if nearest_level else None
         vwap_distance = abs(ltp - vwap) if vwap is not None else None
-        deltas = _record_and_diff(
-            (underlying_key, expiry_date),
+        history_values = dict(
             atr=atr14_5m,
             vwap_distance=vwap_distance,
             level_distance=level_distance,
@@ -277,8 +285,35 @@ class UnderlyingSignalsService:
             resistance_oi=oi_summary.resistance_oi,
             resistance_put_oi=oi_summary.resistance_put_oi,
             atm_straddle=atm_straddle,
-            now=monotonic(),
         )
+        # Durable retention is expiry-scoped. Calls without an expiry still get their normal
+        # short in-memory delta behavior, but do not create rows that have no defined cleanup day.
+        if self.snapshot_store is None or expiry_date is None:
+            deltas = _record_and_diff(
+                (underlying_key, expiry_date),
+                **history_values,
+                now=monotonic(),
+            )
+        else:
+            observed_at = datetime.now(timezone.utc)
+            previous = await asyncio.to_thread(
+                self.snapshot_store.record_and_find_previous,
+                underlying_key=underlying_key,
+                expiry_date=expiry_date,
+                observed_at=observed_at,
+                metrics=history_values,
+                minimum_age_seconds=_FIVE_MIN_MIN_SECONDS,
+                maximum_age_seconds=_FIVE_MIN_MAX_SECONDS,
+                target_age_seconds=300.0,
+            )
+            current_snapshot = _HistorySnapshot(timestamp=observed_at.timestamp(), **history_values)
+            previous_snapshot = None
+            if previous is not None:
+                previous_snapshot = _HistorySnapshot(
+                    timestamp=float(previous.pop("observed_epoch")),
+                    **previous,
+                )
+            deltas = _history_deltas(current_snapshot, previous_snapshot)
 
         tags = _build_tags(
             ltp=ltp,
@@ -777,41 +812,47 @@ def _record_and_diff(
     ]
     matched = min(in_band, key=lambda snapshot: abs((now - snapshot.timestamp) - 300.0)) if in_band else None
 
-    def diff(current: Optional[float], previous: Optional[float]) -> Optional[float]:
-        if current is None or previous is None:
+    current = _HistorySnapshot(
+        timestamp=now,
+        atr=atr,
+        vwap_distance=vwap_distance,
+        level_distance=level_distance,
+        pcr=pcr,
+        support_strike=support_strike,
+        support_oi=support_oi,
+        support_call_oi=support_call_oi,
+        resistance_strike=resistance_strike,
+        resistance_oi=resistance_oi,
+        resistance_put_oi=resistance_put_oi,
+        atm_straddle=atm_straddle,
+    )
+    history.append(current)
+    return _history_deltas(current, matched)
+
+
+def _history_deltas(
+    current: _HistorySnapshot,
+    previous: Optional[_HistorySnapshot],
+) -> _HistoryDeltas:
+    """Compute the existing delta semantics from a current and optional prior snapshot."""
+    def diff(current_value: Optional[float], previous_value: Optional[float]) -> Optional[float]:
+        if current_value is None or previous_value is None:
             return None
-        return current - previous
+        return current_value - previous_value
 
     deltas = _HistoryDeltas()
-    if matched is not None:
-        deltas.atr = diff(atr, matched.atr)
-        deltas.vwap_distance = diff(vwap_distance, matched.vwap_distance)
-        deltas.level_distance = diff(level_distance, matched.level_distance)
-        deltas.pcr = diff(pcr, matched.pcr)
-        deltas.atm_straddle = diff(atm_straddle, matched.atm_straddle)
-        if support_strike is not None and matched.support_strike == support_strike:
-            deltas.support_oi = diff(support_oi, matched.support_oi)
-            deltas.support_call_oi = diff(support_call_oi, matched.support_call_oi)
-        if resistance_strike is not None and matched.resistance_strike == resistance_strike:
-            deltas.resistance_oi = diff(resistance_oi, matched.resistance_oi)
-            deltas.resistance_put_oi = diff(resistance_put_oi, matched.resistance_put_oi)
-
-    history.append(
-        _HistorySnapshot(
-            timestamp=now,
-            atr=atr,
-            vwap_distance=vwap_distance,
-            level_distance=level_distance,
-            pcr=pcr,
-            support_strike=support_strike,
-            support_oi=support_oi,
-            support_call_oi=support_call_oi,
-            resistance_strike=resistance_strike,
-            resistance_oi=resistance_oi,
-            resistance_put_oi=resistance_put_oi,
-            atm_straddle=atm_straddle,
-        )
-    )
+    if previous is not None:
+        deltas.atr = diff(current.atr, previous.atr)
+        deltas.vwap_distance = diff(current.vwap_distance, previous.vwap_distance)
+        deltas.level_distance = diff(current.level_distance, previous.level_distance)
+        deltas.pcr = diff(current.pcr, previous.pcr)
+        deltas.atm_straddle = diff(current.atm_straddle, previous.atm_straddle)
+        if current.support_strike is not None and previous.support_strike == current.support_strike:
+            deltas.support_oi = diff(current.support_oi, previous.support_oi)
+            deltas.support_call_oi = diff(current.support_call_oi, previous.support_call_oi)
+        if current.resistance_strike is not None and previous.resistance_strike == current.resistance_strike:
+            deltas.resistance_oi = diff(current.resistance_oi, previous.resistance_oi)
+            deltas.resistance_put_oi = diff(current.resistance_put_oi, previous.resistance_put_oi)
     return deltas
 
 

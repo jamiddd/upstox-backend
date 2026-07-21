@@ -522,15 +522,14 @@ on every call.
 ```http
 GET /api/user/tracked-instruments
 PUT /api/user/tracked-instruments
+GET /api/main/underlying-signals/history?underlying_key=NSE_INDEX%7CNifty%2050&expiry_date=2026-07-23
 ```
 
-The 5-minute-change suffixes above only ever appear once *something* has been polling the same
-underlying/expiry for 5 continuous minutes -- normally that "something" is the app itself, which
-means opening the app fresh (or reopening it after a while) always starts from zero, with no
-delta on the very first poll. This pair of routes lets the Android Settings screen opt specific
-underlyings into a **server-side background poller** (started from `app.main`'s lifespan, see
-`app.services.tracked_instruments_poller`) that keeps their history warm independently of whether
-the app is open at all -- so reopening the app on a tracked underlying shows a delta immediately.
+The 5-minute-change suffixes above require two snapshots roughly five minutes apart. The Android
+Settings screen can opt specific underlyings into a **server-side background poller** (started
+from `app.main`'s lifespan, see `app.services.tracked_instruments_poller`) that records those
+snapshots independently of whether the app is open. The history is persisted in SQLite, so a
+backend restart no longer resets the delta calculation.
 
 `GET` returns the current selection:
 
@@ -546,9 +545,9 @@ PUT /api/user/tracked-instruments
 {"underlying_keys": ["NSE_INDEX|Nifty 50"]}
 ```
 
-Persisted to a small flat JSON file (`TRACKED_INSTRUMENTS_PATH`, default
-`/data/tracked_instruments.json`) -- not a database, consistent with this backend's "database-free"
-posture (see `TrackedInstrumentsStore`) -- so the selection survives a server/container restart.
+The selection itself is persisted to a small flat JSON file (`TRACKED_INSTRUMENTS_PATH`, default
+`/data/tracked_instruments.json`), while collected metrics use the shared SQLite database at
+`OI_DATABASE_PATH` (default `/data/oi_snapshots.sqlite3`). Both are covered by the Docker volume.
 
 **What the poller actually does**, roughly once every 5 minutes per tracked underlying, only
 during NSE market hours (09:15-15:30 IST, Mon-Fri -- see `app.core.market_hours.is_market_open`,
@@ -556,8 +555,8 @@ a server-side port of the Android client's own `MarketHours.kt`) and only once a
 stored: for each tracked `underlying_key`, it resolves the underlying's symbol text and nearest
 listed expiry (`MainScreenService.resolve_underlying_symbol_and_expiry` -- the same "nearest
 expiry" convention `bootstrap` uses), then calls `UnderlyingSignalsService.get_signals` exactly
-as a real client request would. The response itself is discarded -- the only thing that matters
-is the `_record_and_diff` side effect, i.e. one more snapshot in that underlying's history. A
+as a real client request would. The response itself is discarded; the delta metrics are written
+as one idempotent row per five-minute slot. A
 failure on one tracked underlying (Upstox error, no listed contracts) is logged and skipped;
 it never stops the others or crashes the loop.
 
@@ -570,6 +569,13 @@ deliberate about how many instruments are tracked at once.
 Untracked underlyings are entirely unaffected -- polling them from the app still works exactly as
 before (no delta on the first poll, needs 5 live minutes), this feature only removes that
 cold-start wait for whichever instruments are explicitly opted in.
+
+`GET /api/main/underlying-signals/history` returns the stored rows newest-first and needs only the
+mobile API key, not a currently valid Upstox token. `underlying_key` is required; `expiry_date` is
+optional, and `limit` defaults to 200 (maximum 1000). Each row contains its trading date, UTC slot
+and observation timestamps, ATR, VWAP distance, crucial-level distance, PCR, support/resistance
+strikes and both-side OI values, and ATM straddle. Dated rows are deleted overnight after their
+expiry day, matching the raw OI retention policy.
 
 ## USD/INR (non-Upstox)
 

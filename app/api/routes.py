@@ -10,6 +10,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import (
+    get_signal_snapshot_store,
     get_token_store,
     get_tracked_instruments_store,
     get_upstox_service,
@@ -40,6 +41,7 @@ from app.services.order_modification_service import OrderModificationService
 from app.services.pending_oco_pairs_store import PendingOcoPairsStore
 from app.services.oi_analysis_service import OIAnalysisService
 from app.services.search_screen_service import SearchScreenService
+from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.smart_order_service import SmartOrderService
 from app.services.underlying_signals_service import UnderlyingSignalsService
 from app.services.usd_inr_service import UsdInrService
@@ -489,6 +491,7 @@ async def main_underlying_signals(
     underlying_symbol: Optional[str] = None,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    snapshot_store: SignalSnapshotStore = Depends(get_signal_snapshot_store),
 ) -> dict[str, Any]:
     """Return 9 EMA (5m/15m)/ATR(14)/opening-range/crucial-level/PCR/max-pain/VWAP tags for the
     underlying -- shown to the user just before they place a strike order. See
@@ -501,7 +504,7 @@ async def main_underlying_signals(
     """
     access_token = _load_access_token(token_store)
     try:
-        return await UnderlyingSignalsService(service).get_signals(
+        return await UnderlyingSignalsService(service, snapshot_store=snapshot_store).get_signals(
             access_token,
             underlying_key=underlying_key,
             expiry_date=expiry_date,
@@ -509,6 +512,25 @@ async def main_underlying_signals(
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/main/underlying-signals/history")
+async def main_underlying_signals_history(
+    underlying_key: str = Query(min_length=1),
+    expiry_date: Optional[str] = None,
+    limit: int = Query(default=200, ge=1, le=1000),
+    snapshot_store: SignalSnapshotStore = Depends(get_signal_snapshot_store),
+) -> dict[str, Any]:
+    """Return durable five-minute signal metrics without requiring a live Upstox token."""
+    return {
+        "underlying_key": underlying_key,
+        "expiry_date": expiry_date,
+        "snapshots": snapshot_store.list_snapshots(
+            underlying_key=underlying_key,
+            expiry_date=expiry_date,
+            limit=limit,
+        ),
+    }
 
 
 @protected_router.get("/user/tracked-instruments")

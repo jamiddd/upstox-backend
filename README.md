@@ -22,9 +22,13 @@ lossless OI analysis snapshot per wall-clock-aligned five-minute NSE market slot
 analysis. The database defaults to `/data/oi_snapshots.sqlite3`, which is covered by the existing
 Docker volume.
 
-Expiry-day data remains available through the full session. On the first collector tick after
-midnight IST, snapshots with an earlier expiry date are deleted; startup performs the same cleanup
-if the service was offline overnight. Set `OI_DATABASE_PATH` to override the database location.
+The same database stores the five-minute ATR, VWAP/level distance, PCR, support/resistance OI, and
+ATM-straddle history used by underlying-signal deltas. This makes those deltas restart-safe and
+allows authenticated clients to retrieve the history later.
+
+Expiry-day OI and signal data remains available through the full session. Shortly after midnight
+IST, snapshots with an earlier expiry date are deleted; startup performs the same cleanup if the
+service was offline overnight. Set `OI_DATABASE_PATH` to override the database location.
 
 ## Development
 Create a virtualenv and install dependencies:
