@@ -80,6 +80,95 @@ class SmartOrderService:
             "slices": placed_slices,
         }
 
+    async def place_market_bracket_order(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        transaction_type: str,
+        quantity: int,
+        product: str,
+        target_trigger_price: float,
+        stoploss_trigger_price: float,
+        slice_quantity: int,
+    ) -> dict[str, Any]:
+        """Places a real immediate-fill MARKET order for entry, then attaches target/stoploss GTT
+        legs the same way attach_gtt_exits does for an already-open position with no bracket.
+
+        Unlike place_bracket_order, whose GTT ENTRY leg Upstox always executes as a LIMIT order at
+        the trigger price -- a GTT order is *always* placed as a LIMIT order on execution, even
+        with trigger_type=IMMEDIATE, per Upstox's own docs -- this is for the app's "MKT" order
+        button, where pressing Buy/Sell Market must actually fill at market, not silently become a
+        limit order.
+
+        Only the quantity that actually got submitted as a market entry has exits attached -- a
+        slice that fails to enter must not end up with a stray target/stoploss bracket for shares
+        that were never bought.
+        """
+        slices = _split_quantity(quantity, slice_quantity)
+        entry_slices: list[dict[str, Any]] = []
+        for index, slice_qty in enumerate(slices, start=1):
+            try:
+                response = await self.upstox.place_market_order(
+                    access_token,
+                    instrument_key=instrument_key,
+                    transaction_type=transaction_type,
+                    quantity=slice_qty,
+                    product=product,
+                )
+                entry_slices.append(
+                    {
+                        "slice_number": index,
+                        "quantity": slice_qty,
+                        "status": "success",
+                        "upstox_response": response,
+                    }
+                )
+            except UpstoxApiError as exc:
+                entry_slices.append(
+                    {
+                        "slice_number": index,
+                        "quantity": slice_qty,
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+
+        entered_quantity = sum(slice_result["quantity"] for slice_result in entry_slices if slice_result["status"] == "success")
+        exits: Optional[dict[str, Any]] = None
+        if entered_quantity > 0:
+            exit_transaction_type = "SELL" if transaction_type == "BUY" else "BUY"
+            exits = await self.attach_gtt_exits(
+                access_token,
+                instrument_key=instrument_key,
+                quantity=entered_quantity,
+                product=product,
+                exit_transaction_type=exit_transaction_type,
+                target_trigger_price=target_trigger_price,
+                stoploss_trigger_price=stoploss_trigger_price,
+                slice_quantity=slice_quantity,
+            )
+
+        entry_all_succeeded = all(slice_result["status"] == "success" for slice_result in entry_slices)
+        exits_succeeded = exits is None or exits["status"] == "success"
+        if entered_quantity == 0:
+            overall_status = "error"
+        elif entry_all_succeeded and exits_succeeded:
+            overall_status = "success"
+        else:
+            overall_status = "partial_success"
+
+        return {
+            "status": overall_status,
+            "source": "upstox_market_with_gtt_exits",
+            "total_quantity": quantity,
+            "entered_quantity": entered_quantity,
+            "slice_quantity": slice_quantity,
+            "slice_count": len(slices),
+            "entry_slices": entry_slices,
+            "exits": exits,
+        }
+
     async def attach_gtt_exits(
         self,
         access_token: str,

@@ -2084,6 +2084,92 @@ def test_attach_gtt_exits_rejects_invalid_tick_size() -> None:
     assert response.status_code == 400
 
 
+def test_place_market_bracket_order_enters_at_market_then_attaches_exits() -> None:
+    """The entry is a real MARKET order (FakeUpstoxService.place_market_order), not a GTT ENTRY
+    rule -- then target/stoploss GTT SINGLE legs are attached for the entered quantity, same as
+    attach-exits."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/market-bracket",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 75,
+                "product": "I",
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["source"] == "upstox_market_with_gtt_exits"
+    assert payload["total_quantity"] == 75
+    assert payload["entered_quantity"] == 75
+    assert payload["entry_slices"][0]["status"] == "success"
+    assert payload["entry_slices"][0]["upstox_response"]["data"] == {"order_ids": ["MKT-NSE_FO|111"]}
+    # Exit legs must flatten the opposite side of a BUY entry.
+    assert payload["exits"]["status"] == "success"
+    assert payload["exits"]["slices"][0]["target"]["submitted_order"]["transaction_type"] == "SELL"
+    assert payload["exits"]["slices"][0]["stoploss"]["submitted_order"]["transaction_type"] == "SELL"
+
+
+def test_place_market_bracket_order_slices_large_quantity() -> None:
+    """A quantity over the instrument's freeze quantity is sliced into multiple market entry
+    orders, same as smart-bracket's own entry slicing."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/market-bracket",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 3750,
+                "product": "I",
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["slice_quantity"] == 1800
+    assert payload["slice_count"] == 3
+    assert [item["quantity"] for item in payload["entry_slices"]] == [1800, 1800, 150]
+    assert payload["entered_quantity"] == 3750
+    assert payload["exits"]["slice_count"] == 3
+
+
+def test_place_market_bracket_order_rejects_invalid_tick_size() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/market-bracket",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 75,
+                "product": "I",
+                "target_trigger_price": 140.03,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+
+
 def test_place_smart_bracket_order_slices_large_quantity() -> None:
     """Split large quantities so the client does not handle freeze slicing."""
     client = _client(FakeTokenStore(token="stored-token"))

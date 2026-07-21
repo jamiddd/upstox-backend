@@ -134,6 +134,93 @@ TARGET and STOPLOSS trigger_type are always IMMEDIATE as required by Upstox.
 Normal Upstox v3 place-order supports slice=true, but GTT place order does not document slice=true, so the backend handles slicing for smart bracket orders.
 ```
 
+## Market Bracket Order
+
+```http
+POST /api/orders/market-bracket
+```
+
+Places a real immediate-fill MARKET order for entry, then attaches target/stoploss GTT exits
+(same mechanism as Attach GTT Exits below) once entry is submitted. Use this instead of Smart
+Bracket Order when the entry must actually fill at market -- **a Smart Bracket Order's GTT ENTRY
+leg is always executed by Upstox as a LIMIT order at `entry_trigger_price`, even with
+`entry_trigger_type=IMMEDIATE`** (a GTT order is always placed as a LIMIT order on execution, per
+Upstox's own docs), so it can silently behave like a limit order when the caller actually wanted
+a market fill.
+
+Request:
+
+```json
+{
+  "instrument_key": "NSE_FO|111",
+  "transaction_type": "BUY",
+  "quantity": 75,
+  "product": "I",
+  "target_trigger_price": 140.0,
+  "stoploss_trigger_price": 118.0
+}
+```
+
+Fields:
+
+```text
+instrument_key required
+transaction_type required, BUY|SELL
+quantity required, positive integer
+product optional, I|D|MTF, default I
+target_trigger_price required, positive number
+stoploss_trigger_price required, positive number
+slice_quantity optional, positive integer
+```
+
+No `entry_trigger_price`/`entry_trigger_type` -- there's nothing to submit for a real market
+entry, it fills at whatever the market gives. Same tick-size/lot-size validation and
+freeze-quantity slicing as Smart Bracket Order applies to `quantity`/`target_trigger_price`/
+`stoploss_trigger_price`.
+
+Only the quantity that was actually submitted successfully as a market entry gets exits attached
+-- a slice that fails to enter does not end up with a stray target/stoploss bracket for shares
+that were never bought.
+
+Response:
+
+```json
+{
+  "status": "success",
+  "source": "upstox_market_with_gtt_exits",
+  "total_quantity": 75,
+  "entered_quantity": 75,
+  "slice_quantity": 75,
+  "slice_count": 1,
+  "entry_slices": [
+    {
+      "slice_number": 1,
+      "quantity": 75,
+      "status": "success",
+      "upstox_response": { "status": "success", "data": { "order_ids": ["..."] } }
+    }
+  ],
+  "exits": {
+    "status": "success",
+    "total_quantity": 75,
+    "slice_quantity": 75,
+    "slice_count": 1,
+    "slices": [
+      {
+        "slice_number": 1,
+        "quantity": 75,
+        "target": { "status": "success", "submitted_order": {}, "upstox_response": {} },
+        "stoploss": { "status": "success", "submitted_order": {}, "upstox_response": {} }
+      }
+    ]
+  }
+}
+```
+
+`status` is `"success"` (every entry slice and every exit leg placed), `"partial_success"` (some
+entered but not all, or entry succeeded but an exit leg failed), or `"error"` (nothing entered --
+`exits` is `null` in that case, since there's no position to attach exits to).
+
 ## List GTT Orders
 
 ```http
