@@ -26,6 +26,11 @@ The same database stores the five-minute ATR, VWAP/level distance, PCR, support/
 ATM-straddle history used by underlying-signal deltas. This makes those deltas restart-safe and
 allows authenticated clients to retrieve the history later.
 
+`GET /api/main/oi-snapshots/history` provides a lightweight summary-only listing of retained OI
+slots for clients that need to choose time points without downloading raw or per-strike data.
+`GET /api/main/oi-snapshots/diff` compares aggregate and per-strike current OI between two exact
+slots selected from that listing.
+
 Expiry-day OI and signal data remains available through the full session. Shortly after midnight
 IST, snapshots with an earlier expiry date are deleted; startup performs the same cleanup if the
 service was offline overnight. Set `OI_DATABASE_PATH` to override the database location.

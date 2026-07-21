@@ -9,6 +9,7 @@ import anyio
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import (
+    get_oi_snapshot_store,
     get_signal_snapshot_store,
     get_token_store,
     get_tracked_instruments_store,
@@ -21,6 +22,7 @@ from app.services import instrument_rules_service
 from app.services.instrument_rules_service import _MasterCache
 from app.services.main_screen_service import MainScreenService, _CACHE
 from app.services import oi_analysis_service
+from app.services.oi_snapshot_store import OiStrikeDiff, OiStrikesDiff, SnapshotNotFoundError
 from app.services.search_screen_service import _SEARCH_CACHE
 from app.services import underlying_signals_service
 
@@ -1402,6 +1404,144 @@ def test_main_underlying_signals_history_is_available_without_upstox_token() -> 
                 "pcr": 1.2,
             },
         ],
+    }
+
+
+def test_main_oi_snapshot_history_is_lightweight_and_available_without_upstox_token() -> None:
+    class _OISnapshotStore:
+        def list_snapshots(self, **kwargs):
+            assert kwargs == {
+                "underlying_key": "NSE_INDEX|Nifty 50",
+                "expiry_date": "2026-07-23",
+                "limit": 25,
+            }
+            return [
+                {
+                    "expiry_date": "2026-07-23",
+                    "trading_date": "2026-07-23",
+                    "slot_start": "2026-07-23T04:00:00+00:00",
+                    "observed_at": "2026-07-23T04:00:04+00:00",
+                    "total_call_oi": 48512300.0,
+                    "total_put_oi": 39882100.0,
+                    "pcr": 0.82,
+                    "max_pain": 25000.0,
+                },
+            ]
+
+    client = _client(FakeTokenStore(token=None))
+    app.dependency_overrides[get_oi_snapshot_store] = _OISnapshotStore
+    try:
+        response = client.get(
+            "/api/main/oi-snapshots/history"
+            "?underlying_key=NSE_INDEX|Nifty 50&expiry_date=2026-07-23&limit=25",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "underlying_key": "NSE_INDEX|Nifty 50",
+        "expiry_date": "2026-07-23",
+        "snapshots": [
+            {
+                "trading_date": "2026-07-23",
+                "slot_start": "2026-07-23T04:00:00+00:00",
+                "observed_at": "2026-07-23T04:00:04+00:00",
+                "total_call_oi": 48512300.0,
+                "total_put_oi": 39882100.0,
+                "pcr": 0.82,
+                "max_pain": 25000.0,
+            },
+        ],
+    }
+
+
+def test_main_oi_snapshot_diff_returns_exact_slot_changes_without_upstox_token() -> None:
+    class _OISnapshotStore:
+        def diff_strikes(self, **kwargs):
+            assert kwargs["underlying_key"] == "NSE_INDEX|Nifty 50"
+            assert kwargs["expiry_date"] == "2026-07-23"
+            assert kwargs["from_slot"] == datetime.fromisoformat("2026-07-23T09:30:00+00:00")
+            assert kwargs["to_slot"] == datetime.fromisoformat("2026-07-23T10:15:00+00:00")
+            return OiStrikesDiff(
+                underlying_symbol="NIFTY",
+                total_call_oi_change=1245000.0,
+                total_put_oi_change=-382000.0,
+                strikes=[OiStrikeDiff(25000.0, 412000.0, -95000.0)],
+            )
+
+    client = _client(FakeTokenStore(token=None))
+    app.dependency_overrides[get_oi_snapshot_store] = _OISnapshotStore
+    try:
+        response = client.get(
+            "/api/main/oi-snapshots/diff?underlying_key=NSE_INDEX|Nifty 50"
+            "&expiry_date=2026-07-23&from_slot=2026-07-23T09:30:00%2B00:00"
+            "&to_slot=2026-07-23T10:15:00%2B00:00",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "underlying_key": "NSE_INDEX|Nifty 50",
+        "underlying_symbol": "NIFTY",
+        "expiry_date": "2026-07-23",
+        "from_slot": "2026-07-23T09:30:00+00:00",
+        "to_slot": "2026-07-23T10:15:00+00:00",
+        "total_call_oi_change": 1245000.0,
+        "total_put_oi_change": -382000.0,
+        "strikes": [
+            {
+                "strike_price": 25000.0,
+                "call_oi_change": 412000.0,
+                "put_oi_change": -95000.0,
+            },
+        ],
+    }
+
+
+def test_main_oi_snapshot_diff_rejects_non_increasing_slots() -> None:
+    client = _client(FakeTokenStore(token=None))
+    app.dependency_overrides[get_oi_snapshot_store] = lambda: object()
+    try:
+        response = client.get(
+            "/api/main/oi-snapshots/diff?underlying_key=NSE_INDEX|Nifty 50"
+            "&expiry_date=2026-07-23&from_slot=2026-07-23T10:15:00%2B00:00"
+            "&to_slot=2026-07-23T09:30:00%2B00:00",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json() == {"status": "error", "message": "to_slot must be strictly after from_slot"}
+
+
+def test_main_oi_snapshot_diff_names_the_missing_slot() -> None:
+    missing = datetime.fromisoformat("2026-07-23T10:15:00+00:00")
+
+    class _OISnapshotStore:
+        def diff_strikes(self, **kwargs):
+            raise SnapshotNotFoundError(slot=missing, which="to_slot")
+
+    client = _client(FakeTokenStore(token=None))
+    app.dependency_overrides[get_oi_snapshot_store] = _OISnapshotStore
+    try:
+        response = client.get(
+            "/api/main/oi-snapshots/diff?underlying_key=NSE_INDEX|Nifty 50"
+            "&expiry_date=2026-07-23&from_slot=2026-07-23T09:30:00%2B00:00"
+            "&to_slot=2026-07-23T10:15:00%2B00:00",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "status": "error",
+        "message": "to_slot snapshot was not found for slot 2026-07-23T10:15:00+00:00",
     }
 
 

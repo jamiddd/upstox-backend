@@ -6,8 +6,15 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from app.core.config import Settings
-from app.services.oi_snapshot_store import OISnapshotStore
+from app.services.oi_snapshot_store import (
+    OISnapshotStore,
+    OiStrikeDiff,
+    OiStrikesDiff,
+    SnapshotNotFoundError,
+)
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -118,3 +125,96 @@ def test_overnight_cleanup_deletes_only_earlier_expiries_and_cascades(tmp_path: 
 
     assert expiries == [("2026-07-30",)]
     assert strike_count == 2
+
+
+def test_lists_lightweight_snapshot_summaries_newest_first(tmp_path: Path) -> None:
+    store = OISnapshotStore(_settings(tmp_path))
+    for day, hour in ((23, 9), (30, 10)):
+        slot = datetime(2026, 7, day, hour, 15, tzinfo=_IST)
+        store.save_snapshot(
+            underlying_key="NSE_INDEX|Nifty 50",
+            underlying_symbol="NIFTY",
+            expiry_date=f"2026-07-{day}",
+            slot_start=slot,
+            observed_at=slot,
+            analysis=_analysis(f"2026-07-{day}"),
+        )
+
+    across_expiries = store.list_snapshots(
+        underlying_key="NSE_INDEX|Nifty 50",
+        limit=1,
+    )
+    assert across_expiries == [
+        {
+            "expiry_date": "2026-07-30",
+            "trading_date": "2026-07-30",
+            "slot_start": "2026-07-30T04:45:00+00:00",
+            "observed_at": "2026-07-30T04:45:00+00:00",
+            "total_call_oi": 1000.0,
+            "total_put_oi": 1250.0,
+            "pcr": 1.25,
+            "max_pain": 25000.0,
+        },
+    ]
+    filtered = store.list_snapshots(
+        underlying_key="NSE_INDEX|Nifty 50",
+        expiry_date="2026-07-23",
+    )
+    assert len(filtered) == 1
+    assert filtered[0]["expiry_date"] == "2026-07-23"
+
+
+def test_diffs_totals_and_matching_strikes_between_exact_slots(tmp_path: Path) -> None:
+    store = OISnapshotStore(_settings(tmp_path))
+    before_slot = datetime(2026, 7, 23, 9, 30, tzinfo=_IST)
+    after_slot = datetime(2026, 7, 23, 10, 15, tzinfo=_IST)
+    before = _analysis()
+    after = _analysis()
+    after["oi"] = {
+        "total_calls": 1500,
+        "total_puts": 1100,
+        "call_put_oi_data_list": [
+            {"strike_price": 25000, "call_oi": 750, "put_oi": 650},
+            {"strike_price": 25100, "call_oi": 450, "put_oi": 700},
+            # A strike appearing in only one snapshot cannot be compared and is omitted.
+            {"strike_price": 25200, "call_oi": 300, "put_oi": 100},
+        ],
+    }
+    for slot, analysis in ((before_slot, before), (after_slot, after)):
+        store.save_snapshot(
+            underlying_key="NSE_INDEX|Nifty 50",
+            underlying_symbol="NIFTY",
+            expiry_date="2026-07-23",
+            slot_start=slot,
+            observed_at=slot,
+            analysis=analysis,
+        )
+
+    result = store.diff_strikes(
+        underlying_key="NSE_INDEX|Nifty 50",
+        expiry_date="2026-07-23",
+        from_slot=before_slot,
+        to_slot=after_slot,
+    )
+
+    assert result == OiStrikesDiff(
+        underlying_symbol="NIFTY",
+        total_call_oi_change=500.0,
+        total_put_oi_change=-150.0,
+        strikes=[
+            OiStrikeDiff(25000.0, 150.0, -50.0),
+            OiStrikeDiff(25100.0, 50.0, 150.0),
+            # Missing from the earlier snapshot means a zero baseline, not an omitted strike.
+            OiStrikeDiff(25200.0, 300.0, 100.0),
+        ],
+    )
+    missing_slot = after_slot.replace(minute=20)
+    with pytest.raises(SnapshotNotFoundError) as captured:
+        store.diff_strikes(
+            underlying_key="NSE_INDEX|Nifty 50",
+            expiry_date="2026-07-23",
+            from_slot=before_slot,
+            to_slot=missing_slot,
+        )
+    assert captured.value.which == "to_slot"
+    assert captured.value.slot == missing_slot

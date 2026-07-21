@@ -4,6 +4,7 @@ from fastapi import Depends, HTTPException, status
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import TokenStoreError
+from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.token_store import EncryptedTokenStore
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
@@ -30,6 +31,11 @@ def get_tracked_instruments_store(settings: Settings = Depends(get_settings)) ->
 def get_signal_snapshot_store(settings: Settings = Depends(get_settings)) -> SignalSnapshotStore:
     """Create the SQLite-backed underlying-signal history store for a request."""
     return SignalSnapshotStore(settings)
+
+
+def get_oi_snapshot_store(settings: Settings = Depends(get_settings)) -> OISnapshotStore:
+    """Create the SQLite-backed per-strike OI snapshot store for a request."""
+    return OISnapshotStore(settings)
 
 
 def get_upstox_service(settings: Settings = Depends(get_settings)) -> UpstoxService:

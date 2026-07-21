@@ -517,6 +517,73 @@ Candle-derived values (the EMAs, ATR, opening range, previous-day/pivots, round 
 `ltp` and everything computed relative to it (`position` fields, `nearest_level`) are read fresh
 on every call.
 
+### OI Snapshot History
+
+```http
+GET /api/main/oi-snapshots/history?underlying_key=NSE_INDEX%7CNifty%2050&expiry_date=2026-07-23&limit=200
+```
+
+Returns a lightweight newest-first list of available OI snapshot slots for time-point pickers.
+It reads only snapshot summary columns: raw analytics JSON and per-strike rows are not loaded.
+`underlying_key` is required; `expiry_date` is optional; `limit` defaults to 200 and is capped at
+1000. The route requires the mobile API key but not a current Upstox token.
+
+```json
+{
+  "underlying_key": "NSE_INDEX|Nifty 50",
+  "expiry_date": "2026-07-23",
+  "snapshots": [
+    {
+      "trading_date": "2026-07-23",
+      "slot_start": "2026-07-23T04:00:00+00:00",
+      "observed_at": "2026-07-23T04:00:04+00:00",
+      "total_call_oi": 48512300.0,
+      "total_put_oi": 39882100.0,
+      "pcr": 0.82,
+      "max_pain": 25000.0
+    }
+  ]
+}
+```
+
+When `expiry_date` is omitted, slots across all retained expiries are returned and each snapshot
+also includes its own `expiry_date` so the client can distinguish them.
+
+To compare two slots selected from that list:
+
+```http
+GET /api/main/oi-snapshots/diff?underlying_key=NSE_INDEX%7CNifty%2050&expiry_date=2026-07-23&from_slot=2026-07-23T09%3A30%3A00%2B00%3A00&to_slot=2026-07-23T10%3A15%3A00%2B00%3A00
+```
+
+`underlying_key`, `expiry_date`, `from_slot`, and `to_slot` are required. Both timestamps must be
+timezone-aware and exactly match `slot_start` values returned by the history route; `to_slot` must
+be strictly later. The route returns 404 if either slot is absent and, like history, needs no
+Upstox token.
+
+```json
+{
+  "underlying_key": "NSE_INDEX|Nifty 50",
+  "underlying_symbol": "NIFTY",
+  "expiry_date": "2026-07-23",
+  "from_slot": "2026-07-23T09:30:00+00:00",
+  "to_slot": "2026-07-23T10:15:00+00:00",
+  "total_call_oi_change": 1245000.0,
+  "total_put_oi_change": -382000.0,
+  "strikes": [
+    {
+      "strike_price": 25000.0,
+      "call_oi_change": 412000.0,
+      "put_oi_change": -95000.0
+    }
+  ]
+}
+```
+
+Changes are `to - from` over the union of strikes in both snapshots. A strike or call/put value
+missing from either snapshot is treated as zero, matching the Android option-chain/GEX convention;
+therefore a newly appearing strike contributes its full current OI and a disappearing strike
+contributes the negative of its earlier OI.
+
 ### Tracked Instruments (background-warmed 5-minute-change history)
 
 ```http

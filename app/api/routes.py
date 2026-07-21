@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date
+from dataclasses import asdict
+from datetime import date, datetime, timezone
 import logging
 from typing import Any, Literal, Optional
 from urllib.parse import quote
@@ -10,6 +11,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import (
+    get_oi_snapshot_store,
     get_signal_snapshot_store,
     get_token_store,
     get_tracked_instruments_store,
@@ -40,6 +42,7 @@ from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
 from app.services.pending_oco_pairs_store import PendingOcoPairsStore
 from app.services.oi_analysis_service import OIAnalysisService
+from app.services.oi_snapshot_store import OISnapshotStore, SnapshotNotFoundError
 from app.services.search_screen_service import SearchScreenService
 from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.smart_order_service import SmartOrderService
@@ -531,6 +534,85 @@ async def main_underlying_signals_history(
             limit=limit,
         ),
     }
+
+
+@protected_router.get("/main/oi-snapshots/history")
+async def main_oi_snapshots_history(
+    underlying_key: str = Query(min_length=1),
+    expiry_date: Optional[str] = None,
+    limit: int = Query(default=200, ge=1, le=1000),
+    snapshot_store: OISnapshotStore = Depends(get_oi_snapshot_store),
+) -> dict[str, Any]:
+    """Return five-minute OI slot metadata for a picker before requesting a diff.
+
+    Requires no live Upstox token, like ``/main/underlying-signals/history``.
+    """
+    snapshots = snapshot_store.list_snapshots(
+        underlying_key=underlying_key,
+        expiry_date=expiry_date,
+        limit=limit,
+    )
+    if expiry_date is not None:
+        # The requested expiry is already present at the response root. Keep filtered rows as
+        # lightweight as the client contract; cross-expiry rows retain this field for identity.
+        snapshots = [
+            {key: value for key, value in snapshot.items() if key != "expiry_date"}
+            for snapshot in snapshots
+        ]
+    return {
+        "underlying_key": underlying_key,
+        "expiry_date": expiry_date,
+        "snapshots": snapshots,
+    }
+
+
+@protected_router.get("/main/oi-snapshots/diff")
+async def main_oi_snapshots_diff(
+    underlying_key: str = Query(min_length=1),
+    expiry_date: str = Query(min_length=1),
+    from_slot: datetime = Query(...),
+    to_slot: datetime = Query(...),
+    snapshot_store: OISnapshotStore = Depends(get_oi_snapshot_store),
+) -> dict[str, Any]:
+    """Return per-strike call/put OI changes between two previously stored slots."""
+    if from_slot.tzinfo is None or from_slot.utcoffset() is None:
+        raise _snapshot_diff_validation_error("from_slot must include a timezone offset")
+    if to_slot.tzinfo is None or to_slot.utcoffset() is None:
+        raise _snapshot_diff_validation_error("to_slot must include a timezone offset")
+    if from_slot.microsecond or to_slot.microsecond:
+        raise _snapshot_diff_validation_error("Snapshot slots cannot include fractional seconds")
+    if to_slot <= from_slot:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"status": "error", "message": "to_slot must be strictly after from_slot"},
+        )
+
+    try:
+        diff = snapshot_store.diff_strikes(
+            underlying_key=underlying_key,
+            expiry_date=expiry_date,
+            from_slot=from_slot,
+            to_slot=to_slot,
+        )
+    except SnapshotNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"status": "error", "message": str(exc)},
+        ) from exc
+    return {
+        "underlying_key": underlying_key,
+        "expiry_date": expiry_date,
+        "from_slot": from_slot.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        "to_slot": to_slot.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        **asdict(diff),
+    }
+
+
+def _snapshot_diff_validation_error(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"status": "error", "message": message},
+    )
 
 
 @protected_router.get("/user/tracked-instruments")

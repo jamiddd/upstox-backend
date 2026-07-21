@@ -2,11 +2,36 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from app.core.config import Settings
+
+
+@dataclass(frozen=True)
+class OiStrikeDiff:
+    strike_price: float
+    call_oi_change: float
+    put_oi_change: float
+
+
+@dataclass(frozen=True)
+class OiStrikesDiff:
+    underlying_symbol: str
+    total_call_oi_change: float
+    total_put_oi_change: float
+    strikes: list[OiStrikeDiff]
+
+
+class SnapshotNotFoundError(Exception):
+    """Raised when one side of an exact-slot OI comparison is unavailable."""
+
+    def __init__(self, *, slot: datetime, which: str) -> None:
+        self.slot = slot
+        self.which = which
+        super().__init__(f"{which} snapshot was not found for slot {_timestamp(slot)}")
 
 
 class OISnapshotStore:
@@ -24,6 +49,7 @@ class OISnapshotStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10.0)
+        connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
@@ -151,6 +177,118 @@ class OISnapshotStore:
             )
         return cursor.rowcount
 
+    def list_snapshots(
+        self,
+        *,
+        underlying_key: str,
+        expiry_date: Optional[str] = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return stored slot metadata (no per-strike rows), newest-first.
+
+        A plain query over ``oi_snapshots`` keeps time-point pickers from loading ``oi_strikes``
+        or ``payload_json`` for every candidate slot.
+        """
+        filters = ["underlying_key = ?"]
+        values: list[Any] = [underlying_key]
+        if expiry_date is not None:
+            filters.append("expiry_date = ?")
+            values.append(expiry_date)
+        values.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT expiry_date, trading_date, slot_start, observed_at,
+                       total_call_oi, total_put_oi, pcr, max_pain
+                FROM oi_snapshots
+                WHERE {" AND ".join(filters)}
+                ORDER BY slot_start DESC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def diff_strikes(
+        self,
+        *,
+        underlying_key: str,
+        expiry_date: str,
+        from_slot: datetime,
+        to_slot: datetime,
+    ) -> OiStrikesDiff:
+        """Compute per-strike call/put OI changes between two exact stored slots.
+
+        A strike or call/put value missing from either snapshot is treated as zero, matching the
+        mobile option-chain/GEX convention. Raises ``SnapshotNotFoundError`` for the first missing
+        snapshot, naming whether it was ``from_slot`` or ``to_slot``.
+        """
+        from_key = _timestamp(from_slot)
+        to_key = _timestamp(to_slot)
+        with self._connect() as connection:
+            # Pin both metadata and strike reads to one consistent SQLite snapshot. Rows are
+            # immutable after insertion, but overnight expiry cleanup may run concurrently.
+            connection.execute("BEGIN")
+            snapshot_rows = connection.execute(
+                """
+                SELECT id, underlying_symbol, slot_start, total_call_oi, total_put_oi
+                FROM oi_snapshots
+                WHERE underlying_key = ? AND expiry_date = ?
+                  AND slot_start IN (?, ?)
+                """,
+                (underlying_key, expiry_date, from_key, to_key),
+            ).fetchall()
+            by_slot = {row["slot_start"]: row for row in snapshot_rows}
+            if from_key not in by_slot:
+                raise SnapshotNotFoundError(slot=from_slot, which="from_slot")
+            if to_key not in by_slot:
+                raise SnapshotNotFoundError(slot=to_slot, which="to_slot")
+            before = by_slot[from_key]
+            after = by_slot[to_key]
+            strike_rows = connection.execute(
+                """
+                SELECT snapshot_id, strike_price, call_oi, put_oi
+                FROM oi_strikes
+                WHERE snapshot_id IN (?, ?)
+                """,
+                (before["id"], after["id"]),
+            ).fetchall()
+
+        before_strikes = {
+            float(row["strike_price"]): row for row in strike_rows if row["snapshot_id"] == before["id"]
+        }
+        after_strikes = {
+            float(row["strike_price"]): row for row in strike_rows if row["snapshot_id"] == after["id"]
+        }
+        strikes: list[OiStrikeDiff] = []
+        for strike_price in sorted(before_strikes.keys() | after_strikes.keys()):
+            before_row = before_strikes.get(strike_price)
+            after_row = after_strikes.get(strike_price)
+            strikes.append(
+                OiStrikeDiff(
+                    strike_price=strike_price,
+                    call_oi_change=(
+                        _number_or_zero(after_row["call_oi"] if after_row is not None else None)
+                        - _number_or_zero(before_row["call_oi"] if before_row is not None else None)
+                    ),
+                    put_oi_change=(
+                        _number_or_zero(after_row["put_oi"] if after_row is not None else None)
+                        - _number_or_zero(before_row["put_oi"] if before_row is not None else None)
+                    ),
+                ),
+            )
+
+        return OiStrikesDiff(
+            underlying_symbol=str(after["underlying_symbol"]),
+            total_call_oi_change=(
+                _number_or_zero(after["total_call_oi"]) - _number_or_zero(before["total_call_oi"])
+            ),
+            total_put_oi_change=(
+                _number_or_zero(after["total_put_oi"]) - _number_or_zero(before["total_put_oi"])
+            ),
+            strikes=strikes,
+        )
+
 
 def _strike_values(analysis: dict[str, Any]) -> dict[float, dict[str, float | None]]:
     combined: dict[float, dict[str, float | None]] = {}
@@ -179,6 +317,10 @@ def _object(value: Any) -> dict[str, Any]:
 
 def _number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _number_or_zero(value: Any) -> float:
+    return _number(value) or 0.0
 
 
 def _timestamp(value: datetime) -> str:
