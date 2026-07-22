@@ -827,6 +827,10 @@ def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     # Existing route tests exercise the legacy pure in-memory delta helper. Durable-store behavior
     # and the history route have focused tests of their own.
     app.dependency_overrides[get_signal_snapshot_store] = lambda: None
+    # Same reasoning -- /main/underlying-signals also depends on this now (for OI(S)/OI(R)'s own
+    # delta lookup, see UnderlyingSignalsService._oi_analysis), and the real dependency tries to
+    # create Settings.oi_database_path's parent directory, which doesn't exist in this sandbox.
+    app.dependency_overrides[get_oi_snapshot_store] = lambda: None
     return TestClient(app)
 
 
@@ -1563,6 +1567,7 @@ def test_main_underlying_signals_flags_no_trade_zone_near_days_open() -> None:
     app.dependency_overrides[get_upstox_service] = _NearDayOpenFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
     app.dependency_overrides[get_signal_snapshot_store] = lambda: None
+    app.dependency_overrides[get_oi_snapshot_store] = lambda: None
     _CACHE.clear()
     _SEARCH_CACHE.clear()
     oi_analysis_service._CACHE = {}

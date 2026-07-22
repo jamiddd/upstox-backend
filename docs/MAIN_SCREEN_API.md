@@ -499,12 +499,26 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
     places below a full lakh so a sub-lakh change still carries useful precision (e.g. `+0.81L`
     for a change of 81,000), **one** decimal place at/above a full lakh (e.g. `+4.1L`), `Cr`
     (crore, 1,00,00,000) above that -- e.g. `"OI(S) 24900 (C/+4.1L, P/+1.2L)"`,
-    `"OI(R) 25200 (C/-0.50L, P/-1.1L)"`. Either side missing
-    (no in-band history yet) drops just that side, not the whole suffix. Both sides reset to
-    omitted for one poll whenever the support/resistance **strike itself** changes (a different
-    strike takes over the highest OI) -- comparing OI across two different strikes wouldn't mean
-    anything. `STR(ATM)` has **no** such reset: its delta is tracked across whatever strike happens
-    to be ATM at each sample, since the ATM strike is expected to roll continuously as price moves.
+    `"OI(R) 25200 (C/-0.50L, P/-1.1L)"`. Either side missing (no in-band history yet) drops just
+    that side, not the whole suffix.
+
+    Unlike every other 5-minute-change figure above (which compare the *same* underlying's own
+    metric between two poll snapshots), OI(S)/OI(R)'s delta is looked up in the full per-strike OI
+    history `OISnapshotStore` already keeps for the Open Interest chart (`GET /api/main/oi-
+    snapshots/history`/`/diff`, and `oi_snapshot_collector`'s background poller) -- reusing that
+    one canonical per-strike-OI-over-time store rather than a second one just for this tag. Every
+    live call to this endpoint (for *any* underlying being viewed, not just ones opted into
+    Delta Tracking) also opportunistically writes the current chain into that same store, subject
+    to the same 5-minute-slot idempotency the background poller uses. Concretely: it looks up
+    whatever strike is *support*/*resistance* **right now** in whichever snapshot is 4-6 minutes
+    old, regardless of whether that strike was already support/resistance back then -- so a strike
+    handoff (a different strike taking over the highest OI since the last poll) no longer resets
+    the delta to omitted the way it used to; the delta only goes missing if that specific strike
+    genuinely has no OI recorded in the matched snapshot's chain (rare -- it only needs to have been
+    a listed strike in Upstox's own response, not the support/resistance one). `STR(ATM)` has **no**
+    such gating either, for the same underlying reason: the ATM strike is expected to roll
+    continuously as price moves, so "ATM straddle" is read as a rolling index, not one fixed
+    strike's own price history.
 
   **Ticker-only tags**: `PCR`, `MP`, `OI(S)`, `OI(R)`, and `STR(ATM)` are all shown by the Android
   client only in the sticky action panel's scrolling ticker (`isOiTag`, despite the name, now also

@@ -218,3 +218,81 @@ def test_diffs_totals_and_matching_strikes_between_exact_slots(tmp_path: Path) -
         )
     assert captured.value.which == "to_slot"
     assert captured.value.slot == missing_slot
+
+
+def test_find_snapshot_strikes_in_band_returns_the_closest_in_band_snapshot(tmp_path: Path) -> None:
+    store = OISnapshotStore(_settings(tmp_path))
+    now = datetime(2026, 7, 23, 9, 45, tzinfo=_IST)
+    # Too recent (2 minutes) -- outside the 4-6 minute band, must not be picked.
+    store.save_snapshot(
+        underlying_key="NSE_INDEX|Nifty 50", underlying_symbol="NIFTY", expiry_date="2026-07-23",
+        slot_start=now.replace(minute=43), observed_at=now.replace(minute=43), analysis=_analysis(),
+    )
+    # 5 minutes old -- squarely in-band, this is the one that should be returned.
+    in_band_analysis = _analysis()
+    in_band_analysis["oi"]["call_put_oi_data_list"] = [
+        {"strike_price": 25000, "call_oi": 500, "put_oi": 900},
+        {"strike_price": 25100, "call_oi": 400, "put_oi": 550},
+    ]
+    store.save_snapshot(
+        underlying_key="NSE_INDEX|Nifty 50", underlying_symbol="NIFTY", expiry_date="2026-07-23",
+        slot_start=now.replace(minute=40), observed_at=now.replace(minute=40), analysis=in_band_analysis,
+    )
+    # 9 minutes old -- outside the band on the far side, must not be picked either.
+    store.save_snapshot(
+        underlying_key="NSE_INDEX|Nifty 50", underlying_symbol="NIFTY", expiry_date="2026-07-23",
+        slot_start=now.replace(minute=36), observed_at=now.replace(minute=36), analysis=_analysis(),
+    )
+
+    strikes = store.find_snapshot_strikes_in_band(
+        underlying_key="NSE_INDEX|Nifty 50",
+        expiry_date="2026-07-23",
+        now=now,
+        minimum_age_seconds=240.0,
+        maximum_age_seconds=360.0,
+        target_age_seconds=300.0,
+    )
+
+    assert strikes == {25000.0: (500.0, 900.0), 25100.0: (400.0, 550.0)}
+
+
+def test_find_snapshot_strikes_in_band_is_none_with_nothing_in_band(tmp_path: Path) -> None:
+    store = OISnapshotStore(_settings(tmp_path))
+    now = datetime(2026, 7, 23, 9, 45, tzinfo=_IST)
+    store.save_snapshot(
+        underlying_key="NSE_INDEX|Nifty 50", underlying_symbol="NIFTY", expiry_date="2026-07-23",
+        slot_start=now.replace(minute=43), observed_at=now.replace(minute=43), analysis=_analysis(),
+    )
+
+    strikes = store.find_snapshot_strikes_in_band(
+        underlying_key="NSE_INDEX|Nifty 50",
+        expiry_date="2026-07-23",
+        now=now,
+        minimum_age_seconds=240.0,
+        maximum_age_seconds=360.0,
+        target_age_seconds=300.0,
+    )
+
+    assert strikes is None
+
+
+def test_find_snapshot_strikes_in_band_strike_not_in_the_matched_snapshot_is_absent(tmp_path: Path) -> None:
+    store = OISnapshotStore(_settings(tmp_path))
+    now = datetime(2026, 7, 23, 9, 45, tzinfo=_IST)
+    store.save_snapshot(
+        underlying_key="NSE_INDEX|Nifty 50", underlying_symbol="NIFTY", expiry_date="2026-07-23",
+        slot_start=now.replace(minute=40), observed_at=now.replace(minute=40), analysis=_analysis(),
+    )
+
+    strikes = store.find_snapshot_strikes_in_band(
+        underlying_key="NSE_INDEX|Nifty 50",
+        expiry_date="2026-07-23",
+        now=now,
+        minimum_age_seconds=240.0,
+        maximum_age_seconds=360.0,
+        target_age_seconds=300.0,
+    )
+
+    # 25200 was never in the stored chain at all -- a caller looking that strike up gets a plain
+    # dict miss (None per side), same as any other strike not present in the window.
+    assert 25200.0 not in strikes

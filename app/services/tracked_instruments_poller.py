@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequiredError
 from app.core.market_hours import is_market_open
 from app.services.main_screen_service import MainScreenService
+from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.token_store import EncryptedTokenStore
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
@@ -51,7 +52,10 @@ async def run_tracked_instruments_poller(settings: Settings) -> None:
     upstox = UpstoxService(settings)
     main_screen = MainScreenService(upstox)
     snapshot_store = SignalSnapshotStore(settings)
-    signals_service = UnderlyingSignalsService(upstox, snapshot_store=snapshot_store)
+    oi_snapshot_store = OISnapshotStore(settings)
+    signals_service = UnderlyingSignalsService(
+        upstox, snapshot_store=snapshot_store, oi_snapshot_store=oi_snapshot_store,
+    )
     last_polled: dict[str, float] = {}
     cleanup_completed_for: date | None = None
 

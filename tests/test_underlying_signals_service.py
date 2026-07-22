@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import anyio
 import pytest
 
+from app.core.config import Settings
 from app.services import underlying_signals_service as signals
+from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.underlying_signals_service import Candle, UnderlyingSignalsService
 
 
@@ -229,7 +232,14 @@ def test_record_and_diff_one_metric_missing_does_not_affect_the_others() -> None
     assert deltas.pcr is None  # no PCR 5 minutes ago to compare against
 
 
-def test_record_and_diff_oi_support_resistance_require_the_same_strike() -> None:
+def test_record_and_diff_no_longer_computes_oi_support_resistance_deltas() -> None:
+    """OI(S)/OI(R)'s 5-minute deltas moved out of this same-snapshot-pair comparison entirely --
+    see UnderlyingSignalsService._oi_analysis's doc comment for why (the old same-strike-gated
+    version here was the actual cause of the delta only showing up inconsistently: even a
+    perfectly in-band snapshot was discarded the moment the support/resistance strike itself
+    rolled). They're now computed via OISnapshotStore.find_snapshot_strikes_in_band instead -- see
+    that method's own tests in test_oi_snapshot_store.py. _history_deltas leaves all four fields
+    at their None default regardless of whether the strikes matched or the OI numbers exist."""
     key = ("NSE_INDEX|Nifty 50", "2026-07-23")
     _record(
         key, now=1000.0,
@@ -237,17 +247,14 @@ def test_record_and_diff_oi_support_resistance_require_the_same_strike() -> None
         resistance_strike=25200.0, resistance_oi=800_000.0, resistance_put_oi=200_000.0,
     )
 
-    # Support strike unchanged -> real deltas on both sides. Resistance strike moved to a
-    # different strike -> no apples-to-apples comparison, so both its deltas stay None even
-    # though all the OI numbers exist.
     deltas = _record(
         key, now=1000.0 + 300.0,
         support_strike=24900.0, support_oi=1_200_000.0, support_call_oi=350_000.0,
-        resistance_strike=25300.0, resistance_oi=900_000.0, resistance_put_oi=250_000.0,
+        resistance_strike=25200.0, resistance_oi=900_000.0, resistance_put_oi=250_000.0,
     )
 
-    assert deltas.support_oi == pytest.approx(200_000.0)
-    assert deltas.support_call_oi == pytest.approx(50_000.0)
+    assert deltas.support_oi is None
+    assert deltas.support_call_oi is None
     assert deltas.resistance_oi is None
     assert deltas.resistance_put_oi is None
 
@@ -1255,6 +1262,85 @@ def test_get_signals_wires_everything_into_tags() -> None:
     # it, so no caution.
     assert result["today_open"] == 100.0
     assert result["no_trade_zone"] is False
+
+
+def _oi_snapshot_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        upstox_api_key="",
+        upstox_api_secret="",
+        upstox_redirect_url="",
+        upstox_environment="sandbox",
+        mobile_api_key="",
+        token_encryption_key="",
+        token_store_path=tmp_path / "token.enc",
+        oi_database_path=tmp_path / "oi.sqlite3",
+    )
+
+
+def test_oi_support_resistance_deltas_survive_a_strike_handoff(tmp_path: Path) -> None:
+    """The actual bug this whole OISnapshotStore-backed lookup was built to fix: OI(S)/OI(R)'s
+    delta used to reset to None the moment a *different* strike took over as support/resistance,
+    even with a perfectly in-band snapshot available -- see UnderlyingSignalsService._oi_analysis's
+    doc comment. Seeding the store with the whole chain (not just whichever strike was support/
+    resistance 5 minutes ago) means a strike that only just took over still has a real prior OI
+    value to diff against.
+    """
+    # A distinct underlying_key from every other test in this file -- OIAnalysisService's own
+    # module-level 60s cache is keyed by (instrument_key, expiry, date, ...), independent of which
+    # fake service instance is used, so reusing another test's (underlying_key, expiry_date) pair
+    # here would leak this test's fake OI data into that other test (or vice versa) if they happen
+    # to run within the same 60-second window.
+    oi_store = OISnapshotStore(_oi_snapshot_settings(tmp_path))
+    five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
+    oi_store.save_snapshot(
+        underlying_key="NSE_INDEX|Nifty Bank",
+        underlying_symbol="BANKNIFTY",
+        expiry_date="2026-07-23",
+        slot_start=five_minutes_ago.replace(second=0, microsecond=0),
+        observed_at=five_minutes_ago,
+        analysis={
+            "oi": {
+                "total_calls": 0,
+                "total_puts": 0,
+                "call_put_oi_data_list": [
+                    {"strike_price": 24900, "call_oi": 300_000, "put_oi": 1_000_000},
+                    # Not the resistance strike 5 minutes ago (call OI here is well below what
+                    # made 24900 look "special" back then), but its own OI was still recorded --
+                    # this is exactly what lets the delta below survive the handoff.
+                    {"strike_price": 25200, "call_oi": 800_000, "put_oi": 200_000},
+                ],
+            },
+            "change_oi": {"call_put_oi_data_list": []},
+        },
+    )
+
+    service = UnderlyingSignalsService(
+        _FakeUpstoxService(
+            minute_candles=[],
+            daily_candles=[],
+            strikes=[],
+            ltp=25100.0,
+            oi_strike_rows=[
+                {"strike_price": 24900, "call_oi": 350_000, "put_oi": 1_200_000},
+                # Now the single highest call OI in the near-ATM window -- i.e. the resistance
+                # strike -- for the first time.
+                {"strike_price": 25200, "call_oi": 900_000, "put_oi": 250_000},
+            ],
+        ),
+        oi_snapshot_store=oi_store,
+    )
+
+    result = anyio.run(
+        lambda: service.get_signals(
+            "upstox-token", underlying_key="NSE_INDEX|Nifty Bank", expiry_date="2026-07-23",
+        ),
+    )
+
+    assert result["oi_resistance"]["value"] == 25200.0
+    resistance_tag = next(tag for tag in result["tags"] if tag.startswith("OI(R)"))
+    # 900,000 - 800,000 = +1.0L -- a real delta despite this being the first time 25200 has ever
+    # been the resistance strike.
+    assert "C/+1.0L" in resistance_tag
 
 
 def test_get_signals_flags_no_trade_zone_when_ltp_is_near_todays_open() -> None:

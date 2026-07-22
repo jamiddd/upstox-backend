@@ -289,6 +289,53 @@ class OISnapshotStore:
             strikes=strikes,
         )
 
+    def find_snapshot_strikes_in_band(
+        self,
+        *,
+        underlying_key: str,
+        expiry_date: str,
+        now: datetime,
+        minimum_age_seconds: float,
+        maximum_age_seconds: float,
+        target_age_seconds: float,
+    ) -> Optional[dict[float, tuple[Optional[float], Optional[float]]]]:
+        """Return ``{strike_price: (call_oi, put_oi)}`` for whichever persisted snapshot (see
+        ``save_snapshot``) is closest to ``target_age_seconds`` old, within
+        ``[minimum_age_seconds, maximum_age_seconds]`` of ``now`` -- ``None`` if nothing was
+        recorded in that window.
+
+        This is the same per-strike history ``GET /api/main/oi-snapshots/history``/``/diff``
+        read (see ``list_snapshots``/``diff_strikes`` above) -- reused by
+        ``UnderlyingSignalsService``'s OI(S)/OI(R) 5-minute-change tags so that lookup can ask
+        "what was *this* strike's OI ~5 minutes ago" for whichever strike is support/resistance
+        *right now*, rather than requiring the same strike to have already been support/
+        resistance back then. One canonical per-strike-OI-over-time store, not two.
+        """
+        now_key = _timestamp(now)
+        with self._connect() as connection:
+            snapshot = connection.execute(
+                """
+                SELECT id
+                FROM oi_snapshots
+                WHERE underlying_key = ? AND expiry_date = ?
+                  AND (julianday(?) - julianday(observed_at)) * 86400.0 BETWEEN ? AND ?
+                ORDER BY ABS((julianday(?) - julianday(observed_at)) * 86400.0 - ?) ASC
+                LIMIT 1
+                """,
+                (
+                    underlying_key, expiry_date,
+                    now_key, minimum_age_seconds, maximum_age_seconds,
+                    now_key, target_age_seconds,
+                ),
+            ).fetchone()
+            if snapshot is None:
+                return None
+            strike_rows = connection.execute(
+                "SELECT strike_price, call_oi, put_oi FROM oi_strikes WHERE snapshot_id = ?",
+                (snapshot["id"],),
+            ).fetchall()
+        return {float(row["strike_price"]): (row["call_oi"], row["put_oi"]) for row in strike_rows}
+
 
 def _strike_values(analysis: dict[str, Any]) -> dict[float, dict[str, float | None]]:
     combined: dict[float, dict[str, float | None]] = {}

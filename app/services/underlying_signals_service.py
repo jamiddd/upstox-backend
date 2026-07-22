@@ -6,11 +6,16 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from time import monotonic
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from app.core.exceptions import UpstoxApiError
+from app.core.market_hours import is_market_open
 from app.services.oi_analysis_service import OIAnalysisService
+from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.upstox_service import UpstoxService
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 # How far apart LTP has to be from a candidate level for it to still count as "near" it -- see
 # _nearest_level. Expressed as a percent of LTP so it scales sensibly across very different
@@ -109,6 +114,17 @@ class _OiSummary:
     # The *put* OI at that same resistance strike -- the mirror of support_call_oi.
     resistance_put_oi: Optional[float] = None
 
+    # OI(S)/OI(R)'s own 5-minute-change figures -- computed here (against OISnapshotStore's full
+    # per-strike history), not via _record_and_diff/_history_deltas' same-strike-gated comparison
+    # like every other metric. See _oi_analysis's own doc comment for why: that gate reset the
+    # delta to None on every strike handoff, which is exactly the "sometimes it shows, sometimes
+    # it doesn't" inconsistency this was built to fix -- looking a *specific* strike's OI up in a
+    # wider stored window survives the handoff as long as that strike was already listed.
+    support_oi_delta: Optional[float] = None
+    support_call_oi_delta: Optional[float] = None
+    resistance_oi_delta: Optional[float] = None
+    resistance_put_oi_delta: Optional[float] = None
+
 
 @dataclass
 class _HistorySnapshot:
@@ -177,9 +193,11 @@ class UnderlyingSignalsService:
         upstox_service: UpstoxService,
         *,
         snapshot_store: SignalSnapshotStore | None = None,
+        oi_snapshot_store: OISnapshotStore | None = None,
     ) -> None:
         self.upstox = upstox_service
         self.snapshot_store = snapshot_store
+        self.oi_snapshot_store = oi_snapshot_store
 
     async def get_signals(
         self,
@@ -256,7 +274,9 @@ class UnderlyingSignalsService:
             tolerance_percent=_NEAREST_LEVEL_TOLERANCE_PERCENT,
         )
 
-        oi_summary = await self._oi_analysis(access_token, underlying_key, expiry_date, today, ltp)
+        oi_summary = await self._oi_analysis(
+            access_token, underlying_key, expiry_date, underlying_symbol, today, ltp,
+        )
         pcr_bias = _pcr_bias(oi_summary.pcr)
         max_pain_pull = _max_pain_pull(ltp, oi_summary.max_pain)
 
@@ -267,10 +287,12 @@ class UnderlyingSignalsService:
 
         atm_straddle = await self._fetch_atm_straddle(access_token, underlying_key, expiry_date, ltp)
 
-        # 5-minute-change tracking for ATR/VWAP-distance/level-distance/PCR/OI-support/
-        # OI-resistance/ATM-straddle -- see _record_and_diff's doc comment for exactly what each
-        # one measures (VWAP/level track the *distance* closing in or pulling away, not their own
-        # value; OI support/resistance are strike-matched, ATM straddle deliberately isn't).
+        # 5-minute-change tracking for ATR/VWAP-distance/level-distance/PCR/ATM-straddle -- see
+        # _record_and_diff's doc comment for exactly what each one measures (VWAP/level track the
+        # *distance* closing in or pulling away, not their own value). OI support/resistance's own
+        # deltas are computed separately, inside _oi_analysis -- see that method's doc comment for
+        # why (a strike-lookup against OISnapshotStore's full per-strike history, not a comparison
+        # gated on the matched snapshot's own support/resistance strike).
         level_distance = abs(ltp - nearest_level["value"]) if nearest_level else None
         vwap_distance = abs(ltp - vwap) if vwap is not None else None
         history_values = dict(
@@ -314,6 +336,13 @@ class UnderlyingSignalsService:
                     **previous,
                 )
             deltas = _history_deltas(current_snapshot, previous_snapshot)
+
+        # See _oi_analysis's own doc comment -- these four come from its OISnapshotStore-backed
+        # strike lookup, not from `deltas` above (which leaves them at their None default).
+        deltas.support_oi = oi_summary.support_oi_delta
+        deltas.support_call_oi = oi_summary.support_call_oi_delta
+        deltas.resistance_oi = oi_summary.resistance_oi_delta
+        deltas.resistance_put_oi = oi_summary.resistance_put_oi_delta
 
         tags = _build_tags(
             ltp=ltp,
@@ -397,6 +426,7 @@ class UnderlyingSignalsService:
         access_token: str,
         underlying_key: str,
         expiry_date: Optional[str],
+        underlying_symbol: Optional[str],
         today: date,
         ltp: float,
     ) -> "_OiSummary":
@@ -413,6 +443,23 @@ class UnderlyingSignalsService:
         "max pain" is inherently a whole-chain concept (the strike that minimizes aggregate option
         writer payout across every strike), so narrowing its inputs would just make it a different,
         wrong number rather than a more scalping-relevant one.
+
+        **OI(S)/OI(R) 5-minute deltas**: when [self.oi_snapshot_store] is available, this call also
+        (a) persists the current full chain into it (the exact same `oi_snapshots`/`oi_strikes`
+        tables the Open Interest chart's `GET /api/main/oi-snapshots/history`/`/diff` routes read
+        and `oi_snapshot_collector`'s background poller already writes -- one canonical per-strike-
+        OI-over-time store, not a second one just for this) and (b) looks up whatever strike is
+        *currently* support/resistance in the closest in-band (4-6 minute) prior snapshot. This
+        deliberately does **not** require that earlier snapshot's own support/resistance to have
+        been the same strike -- unlike the old `_history_deltas`-based comparison it replaces, a
+        strike handoff (a different strike taking over as support/resistance since the last poll)
+        no longer resets the delta to `None`, it just looks that new strike up instead. That
+        old gate was the actual root cause of OI(S)/OI(R)'s delta only showing up inconsistently:
+        even a perfectly-timed in-band snapshot was thrown away the moment the strike itself
+        rolled. The write is skipped while the market is closed (the shared `oi_snapshot_collector`
+        poller and this call would otherwise race to write the same 5-minute slot for no benefit)
+        -- the read is not, since a delta against whatever's already stored is still meaningful
+        right after close. See `_oi_support_resistance_deltas`'s own doc comment for why.
         """
         if not expiry_date:
             return _OiSummary()
@@ -443,6 +490,22 @@ class UnderlyingSignalsService:
             resistance_strike, resistance_oi, resistance_put_oi,
         ) = _oi_support_resistance(near_atm_rows)
 
+        (
+            support_oi_delta, support_call_oi_delta,
+            resistance_oi_delta, resistance_put_oi_delta,
+        ) = await self._oi_support_resistance_deltas(
+            underlying_key=underlying_key,
+            underlying_symbol=underlying_symbol,
+            expiry_date=expiry_date,
+            analysis=analysis,
+            support_strike=support_strike,
+            support_oi=support_oi,
+            support_call_oi=support_call_oi,
+            resistance_strike=resistance_strike,
+            resistance_oi=resistance_oi,
+            resistance_put_oi=resistance_put_oi,
+        )
+
         return _OiSummary(
             pcr=pcr,
             max_pain=max_pain,
@@ -452,7 +515,81 @@ class UnderlyingSignalsService:
             resistance_strike=resistance_strike,
             resistance_oi=resistance_oi,
             resistance_put_oi=resistance_put_oi,
+            support_oi_delta=support_oi_delta,
+            support_call_oi_delta=support_call_oi_delta,
+            resistance_oi_delta=resistance_oi_delta,
+            resistance_put_oi_delta=resistance_put_oi_delta,
         )
+
+    async def _oi_support_resistance_deltas(
+        self,
+        *,
+        underlying_key: str,
+        underlying_symbol: Optional[str],
+        expiry_date: str,
+        analysis: dict[str, Any],
+        support_strike: Optional[float],
+        support_oi: Optional[float],
+        support_call_oi: Optional[float],
+        resistance_strike: Optional[float],
+        resistance_oi: Optional[float],
+        resistance_put_oi: Optional[float],
+    ) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """`(support_oi_delta, support_call_oi_delta, resistance_oi_delta, resistance_put_oi_delta)`
+        -- see `_oi_analysis`'s own doc comment for the full reasoning. All `None` if
+        [self.oi_snapshot_store] wasn't injected, or there's no in-band snapshot to compare
+        against yet (right after this underlying/expiry was first viewed).
+
+        Persisting the current chain (see `_oi_snapshot_slot`) only happens during market hours --
+        writing a slot outside market hours would either be rejected by `save_snapshot`'s own
+        5-minute-aligned slot convention or race pointlessly against `oi_snapshot_collector`'s
+        equivalent gate for no benefit. The *lookup* below is deliberately **not** gated on market
+        hours the same way, though -- a delta against whatever's already stored (e.g. from just
+        before close) is still meaningful, and gating it too would make this non-deterministic
+        for a caller running right at the market-hours boundary.
+        """
+        no_deltas = (None, None, None, None)
+        if self.oi_snapshot_store is None:
+            return no_deltas
+
+        now = datetime.now(timezone.utc)
+        slot_start = _oi_snapshot_slot(now)
+        if slot_start is not None:
+            await asyncio.to_thread(
+                self.oi_snapshot_store.save_snapshot,
+                underlying_key=underlying_key,
+                underlying_symbol=underlying_symbol or "",
+                expiry_date=expiry_date,
+                slot_start=slot_start,
+                observed_at=now,
+                analysis=analysis,
+            )
+
+        historical_strikes = await asyncio.to_thread(
+            self.oi_snapshot_store.find_snapshot_strikes_in_band,
+            underlying_key=underlying_key,
+            expiry_date=expiry_date,
+            now=now,
+            minimum_age_seconds=_FIVE_MIN_MIN_SECONDS,
+            maximum_age_seconds=_FIVE_MIN_MAX_SECONDS,
+            target_age_seconds=300.0,
+        )
+        if historical_strikes is None:
+            return no_deltas
+
+        support_oi_delta = support_call_oi_delta = None
+        if support_strike is not None and support_strike in historical_strikes:
+            historical_call_oi, historical_put_oi = historical_strikes[support_strike]
+            support_oi_delta = _oi_delta(support_oi, historical_put_oi)
+            support_call_oi_delta = _oi_delta(support_call_oi, historical_call_oi)
+
+        resistance_oi_delta = resistance_put_oi_delta = None
+        if resistance_strike is not None and resistance_strike in historical_strikes:
+            historical_call_oi, historical_put_oi = historical_strikes[resistance_strike]
+            resistance_oi_delta = _oi_delta(resistance_oi, historical_call_oi)
+            resistance_put_oi_delta = _oi_delta(resistance_put_oi, historical_put_oi)
+
+        return support_oi_delta, support_call_oi_delta, resistance_oi_delta, resistance_put_oi_delta
 
     async def _minute_series(
         self,
@@ -792,16 +929,16 @@ def _record_and_diff(
     here means the distance shrank (price closing in), positive means it grew (pulling away) --
     the sign is about the distance, not VWAP/the level's own direction.
 
-    `support_oi`/`support_call_oi`/`resistance_oi`/`resistance_put_oi`: only diffed when the
-    matched snapshot's own `support_strike`/`resistance_strike` equals the *current* one -- if a
-    different strike has taken over as support/resistance since then, comparing their OI numbers
-    wouldn't mean anything (not the same thing being measured), so the delta is `None` rather than
-    a misleading number. Both sides at a given strike (put and call) share that strike's own gate,
-    since a strike handoff invalidates both at once.
+    `support_oi`/`support_call_oi`/`resistance_oi`/`resistance_put_oi` are *not* diffed here at
+    all -- they're recorded (for the durable history endpoint) but their actual 5-minute-change
+    figures come from `UnderlyingSignalsService._oi_analysis`'s own OISnapshotStore-backed lookup
+    instead, which can look a strike up in a wider per-strike window regardless of whether it was
+    already support/resistance at the matched snapshot. See that method's doc comment for why.
 
-    `atm_straddle`: deliberately has **no** such strike-matching gate, unlike support/resistance --
-    the ATM strike is *expected* to roll as price moves, and "ATM straddle" is conventionally read
-    as a rolling index (whatever's ATM right now), not one fixed strike's own price history.
+    `atm_straddle`: unlike the old support/resistance approach this replaces, has never needed a
+    strike-matching gate -- the ATM strike is *expected* to roll as price moves, and "ATM
+    straddle" is conventionally read as a rolling index (whatever's ATM right now), not one fixed
+    strike's own price history.
     """
     history = _HISTORY.setdefault(key, [])
     history[:] = [snapshot for snapshot in history if now - snapshot.timestamp <= _HISTORY_WINDOW_SECONDS]
@@ -834,7 +971,13 @@ def _history_deltas(
     current: _HistorySnapshot,
     previous: Optional[_HistorySnapshot],
 ) -> _HistoryDeltas:
-    """Compute the existing delta semantics from a current and optional prior snapshot."""
+    """Compute the existing delta semantics from a current and optional prior snapshot.
+
+    Leaves `support_oi`/`support_call_oi`/`resistance_oi`/`resistance_put_oi` at their `_HistoryDeltas`
+    default (`None`) -- those come from `UnderlyingSignalsService._oi_analysis`'s own
+    OISnapshotStore-backed lookup instead, not from this same-snapshot-pair comparison. See
+    `_record_and_diff`'s doc comment for why.
+    """
     def diff(current_value: Optional[float], previous_value: Optional[float]) -> Optional[float]:
         if current_value is None or previous_value is None:
             return None
@@ -847,12 +990,6 @@ def _history_deltas(
         deltas.level_distance = diff(current.level_distance, previous.level_distance)
         deltas.pcr = diff(current.pcr, previous.pcr)
         deltas.atm_straddle = diff(current.atm_straddle, previous.atm_straddle)
-        if current.support_strike is not None and previous.support_strike == current.support_strike:
-            deltas.support_oi = diff(current.support_oi, previous.support_oi)
-            deltas.support_call_oi = diff(current.support_call_oi, previous.support_call_oi)
-        if current.resistance_strike is not None and previous.resistance_strike == current.resistance_strike:
-            deltas.resistance_oi = diff(current.resistance_oi, previous.resistance_oi)
-            deltas.resistance_put_oi = diff(current.resistance_put_oi, previous.resistance_put_oi)
     return deltas
 
 
@@ -1043,6 +1180,23 @@ def _max_pain_pull(ltp: float, max_pain: Optional[float]) -> Optional[str]:
     if ltp > max_pain:
         return "bearish"
     return "neutral"
+
+
+def _oi_snapshot_slot(now: datetime) -> Optional[datetime]:
+    """The current wall-clock-aligned five-minute NSE slot for OISnapshotStore, if the market is
+    open -- same convention `oi_snapshot_collector._market_slot` uses, duplicated here rather than
+    imported since that module's version is private and this is a two-line function, not worth an
+    extra cross-module dependency for."""
+    local = now.astimezone(_IST)
+    if not is_market_open(local):
+        return None
+    return local.replace(minute=local.minute - local.minute % 5, second=0, microsecond=0)
+
+
+def _oi_delta(current_value: Optional[float], previous_value: Optional[float]) -> Optional[float]:
+    if current_value is None or previous_value is None:
+        return None
+    return current_value - previous_value
 
 
 def _near_atm_strikes(strike_rows: list[dict[str, Any]], ltp: float, *, count: int) -> list[dict[str, Any]]:

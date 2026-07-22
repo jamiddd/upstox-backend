@@ -495,6 +495,7 @@ async def main_underlying_signals(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     snapshot_store: SignalSnapshotStore = Depends(get_signal_snapshot_store),
+    oi_snapshot_store: OISnapshotStore = Depends(get_oi_snapshot_store),
 ) -> dict[str, Any]:
     """Return 9 EMA (5m/15m)/ATR(14)/opening-range/crucial-level/PCR/max-pain/VWAP tags for the
     underlying -- shown to the user just before they place a strike order. See
@@ -504,10 +505,18 @@ async def main_underlying_signals(
     still works. `underlying_symbol` is likewise optional -- omitting it just skips the VWAP tag
     (computed from the underlying's own futures contract, resolved by a symbol-text search since
     Upstox has no search-by-instrument_key mode), everything else still works.
+
+    `oi_snapshot_store` lets OI(S)/OI(R)'s 5-minute-change figures use the same per-strike history
+    the Open Interest chart and `oi_snapshot_collector`'s background poller already read/write --
+    see `UnderlyingSignalsService._oi_analysis`'s doc comment. This means every live call here
+    (for *any* underlying being viewed, tracked or not) also opportunistically contributes to that
+    shared history, not just the background poller's tracked instruments.
     """
     access_token = _load_access_token(token_store)
     try:
-        return await UnderlyingSignalsService(service, snapshot_store=snapshot_store).get_signals(
+        return await UnderlyingSignalsService(
+            service, snapshot_store=snapshot_store, oi_snapshot_store=oi_snapshot_store,
+        ).get_signals(
             access_token,
             underlying_key=underlying_key,
             expiry_date=expiry_date,
