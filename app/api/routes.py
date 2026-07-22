@@ -939,7 +939,9 @@ async def exit_all_positions(
     access_token = _load_access_token(token_store)
     try:
         return await SmartOrderService(service).exit_all_positions(
-            access_token, instrument_rules_service=InstrumentRulesService(settings)
+            access_token,
+            instrument_rules_service=InstrumentRulesService(settings),
+            pending_oco_store=PendingOcoPairsStore(settings),
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
@@ -962,6 +964,7 @@ async def exit_positions(
             access_token,
             instrument_keys=request.instrument_keys,
             instrument_rules_service=InstrumentRulesService(settings),
+            pending_oco_store=PendingOcoPairsStore(settings),
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Optional
 
 from app.core.exceptions import AppConfigError, UpstoxApiError
@@ -430,12 +431,20 @@ class SmartOrderService:
         return await self.upstox.modify_gtt_order(access_token, upstox_order)
 
     async def exit_all_positions(
-        self, access_token: str, *, instrument_rules_service: InstrumentRulesService
+        self,
+        access_token: str,
+        *,
+        instrument_rules_service: InstrumentRulesService,
+        pending_oco_store: PendingOcoPairsStore,
     ) -> dict[str, Any]:
         """Flattens every currently open position -- backs the app's max-loss auto square-off
         (see MainViewModel.watchMaxLoss). Thin wrapper over exit_positions with no filter.
         """
-        return await self.exit_positions(access_token, instrument_rules_service=instrument_rules_service)
+        return await self.exit_positions(
+            access_token,
+            instrument_rules_service=instrument_rules_service,
+            pending_oco_store=pending_oco_store,
+        )
 
     async def exit_positions(
         self,
@@ -443,6 +452,7 @@ class SmartOrderService:
         *,
         instrument_keys: Optional[list[str]] = None,
         instrument_rules_service: InstrumentRulesService,
+        pending_oco_store: PendingOcoPairsStore,
     ) -> dict[str, Any]:
         """Flattens open positions (quantity != 0) with an immediate market order in the opposite
         direction. [instrument_keys] is None means every open position (exit_all_positions above);
@@ -472,6 +482,22 @@ class SmartOrderService:
                 for item in open_positions
                 if _string_value(item, "instrument_token", "instrument_key") in wanted
             ]
+
+        # A still-active plain stoploss order (see attach_gtt_exits) reserves exit-side quantity
+        # against its position -- flattening with a *fresh* market order on top of that makes
+        # Upstox see more pending exposure than the position actually holds and reject it demanding
+        # margin for a "naked" excess (the same rejection OrderPlacementViewModel.
+        # cancelExistingExitOrdersIfNeeded exists to prevent for a manual single-position close).
+        # Best-effort and never blocks flattening below: a failed lookup/cancel here just means
+        # the market order that follows fails exactly the way it did before this existed.
+        target_instrument_keys = {
+            _string_value(item, "instrument_token", "instrument_key") for item in open_positions
+        }
+        await self._cancel_resting_stoploss_orders(
+            access_token,
+            instrument_keys=target_instrument_keys,
+            pending_oco_store=pending_oco_store,
+        )
 
         results: list[dict[str, Any]] = []
         for position in open_positions:
@@ -531,6 +557,55 @@ class SmartOrderService:
             "results": results,
         }
 
+    async def _cancel_resting_stoploss_orders(
+        self,
+        access_token: str,
+        *,
+        instrument_keys: set[Optional[str]],
+        pending_oco_store: PendingOcoPairsStore,
+    ) -> None:
+        """Cancels whichever plain (non-GTT) stoploss orders -- see [PendingExit]/attach_gtt_exits
+        -- are still resting for [instrument_keys] before [exit_positions] flattens them. Only the
+        plain-order mechanism is handled: a real GTT bracket has no equivalent standalone stoploss
+        order to cancel, and Upstox itself cleans up a GTT bracket's remaining legs once the
+        position it was watching is actually flattened.
+
+        A cancelled stoploss's own paired pending target is cleaned up server-side by
+        `oco_watcher` on its own next tick, nothing to do here beyond the cancel itself.
+        """
+        pending_exits = [
+            pending_exit
+            for pending_exit in pending_oco_store.load()
+            if pending_exit.instrument_key in instrument_keys
+        ]
+        if not pending_exits:
+            return
+
+        order_book_payload = await self.upstox.get_order_book(access_token)
+        orders_by_id = index_orders_by_id(order_book_payload)
+
+        cancelled_any = False
+        for pending_exit in pending_exits:
+            stoploss_order = orders_by_id.get(pending_exit.stoploss_order_id)
+            if stoploss_order is None or order_status(stoploss_order) in TERMINAL_ORDER_STATUSES:
+                continue
+            try:
+                await self.upstox.cancel_order(access_token, pending_exit.stoploss_order_id)
+                cancelled_any = True
+            except UpstoxApiError:
+                continue
+
+        if cancelled_any:
+            # Gives Upstox a moment to actually release the quantity/margin the cancelled
+            # order(s) were holding before the flattening market order below asks for it -- see
+            # OrderPlacementViewModel.cancelExistingExitOrdersIfNeeded's own doc comment for why
+            # this delay matters, not just the cancel itself.
+            await asyncio.sleep(_EXIT_ORDER_CANCEL_SETTLE_SECONDS)
+
+
+# How long to wait after cancelling a resting stoploss order before submitting the flattening
+# market order that follows -- see _cancel_resting_stoploss_orders's own doc comment.
+_EXIT_ORDER_CANCEL_SETTLE_SECONDS = 0.8
 
 # Terminal GTT statuses -- anything else (e.g. a still-pending/triggered rule) is treated as
 # active. See SmartOrderService.get_gtt_orders_for_instrument.
