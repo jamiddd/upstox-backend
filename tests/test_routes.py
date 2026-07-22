@@ -23,6 +23,7 @@ from app.services.instrument_rules_service import _MasterCache
 from app.services.main_screen_service import MainScreenService, _CACHE
 from app.services import oi_analysis_service
 from app.services.oi_snapshot_store import OiStrikeDiff, OiStrikesDiff, SnapshotNotFoundError
+from app.services import search_screen_service
 from app.services.search_screen_service import _SEARCH_CACHE
 from app.services import underlying_signals_service
 
@@ -806,6 +807,7 @@ def _settings() -> Settings:
 def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     _CACHE.clear()
     _SEARCH_CACHE.clear()
+    search_screen_service._SENSEX_ENTRY_CACHE = None
     oi_analysis_service._CACHE = {}
     underlying_signals_service._CACHE = {}
     underlying_signals_service._HISTORY = {}
@@ -1572,6 +1574,7 @@ def test_main_underlying_signals_flags_no_trade_zone_near_days_open() -> None:
     app.dependency_overrides[get_oi_snapshot_store] = lambda: None
     _CACHE.clear()
     _SEARCH_CACHE.clear()
+    search_screen_service._SENSEX_ENTRY_CACHE = None
     oi_analysis_service._CACHE = {}
     underlying_signals_service._CACHE = {}
     underlying_signals_service._HISTORY = {}
@@ -1926,6 +1929,105 @@ def test_search_underlyings_empty_query_returns_default_option_indices() -> None
             "total_pages": 3,
         },
     }
+
+
+class _SensexFakeUpstoxService(FakeUpstoxService):
+    """Returns a real SENSEX CE/PE pair for any instrument search -- used to verify the blank-
+    query default list merges in a live-looked-up SENSEX entry (see
+    SearchScreenService._sensex_default_entry) rather than a hardcoded guess."""
+
+    async def search_instruments(
+        self,
+        access_token: str,
+        *,
+        query: str,
+        exchanges: str = "NSE,BSE",
+        segments: str = "FO",
+        instrument_types: str = "CE,PE",
+        expiry: str = "current_month",
+        atm_offset: int = 0,
+        page_number: int = 1,
+        records: int = 30,
+    ) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "name": "SENSEX",
+                    "exchange": "BSE",
+                    "instrument_type": "CE",
+                    "underlying_key": "BSE_INDEX|SENSEX",
+                    "underlying_type": "INDEX",
+                    "underlying_symbol": "SENSEX",
+                    "lot_size": 10,
+                    "freeze_quantity": 4200.0,
+                    "tick_size": 0.05,
+                },
+            ],
+        }
+
+
+def test_search_underlyings_empty_query_merges_in_a_live_looked_up_sensex_entry() -> None:
+    """SENSEX has no NSE F&O contracts under its own symbol, so it isn't in the hardcoded
+    DEFAULT_OPTION_INDICES list -- it's looked up live and appended right after it instead."""
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = _SensexFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    _SEARCH_CACHE.clear()
+    search_screen_service._SENSEX_ENTRY_CACHE = None
+    client = TestClient(app)
+    try:
+        response = client.get(
+            "/api/search/underlyings?limit=10",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    symbols = [item["symbol"] for item in payload["results"]]
+    assert symbols == ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "INDIA VIX"]
+    sensex = next(item for item in payload["results"] if item["symbol"] == "SENSEX")
+    assert sensex == {
+        "instrument_key": "BSE_INDEX|SENSEX",
+        "symbol": "SENSEX",
+        "name": "SENSEX",
+        "underlying_type": "INDEX",
+        "exchange": "BSE",
+        "lot_size": 10.0,
+        "freeze_quantity": 4200.0,
+        "tick_size": 0.05,
+        "is_optionable": True,
+    }
+
+
+def test_search_underlyings_empty_query_omits_sensex_when_lookup_fails() -> None:
+    """A failed SENSEX lookup is best-effort -- the rest of the default list still comes back."""
+
+    class _FailingSearchFakeUpstoxService(FakeUpstoxService):
+        async def search_instruments(self, access_token: str, *, query: str, **kwargs: Any) -> dict[str, Any]:
+            from app.core.exceptions import UpstoxApiError
+
+            raise UpstoxApiError("Search unavailable", status_code=502)
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = _FailingSearchFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    _SEARCH_CACHE.clear()
+    search_screen_service._SENSEX_ENTRY_CACHE = None
+    client = TestClient(app)
+    try:
+        response = client.get(
+            "/api/search/underlyings?limit=10",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["symbol"] for item in payload["results"]] == ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "INDIA VIX"]
 
 
 def test_search_underlyings_query_matches_non_optionable_index() -> None:

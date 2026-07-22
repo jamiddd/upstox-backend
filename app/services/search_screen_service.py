@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Optional
 
+from app.core.exceptions import UpstoxApiError
 from app.services.upstox_service import UpstoxService
 
 
@@ -81,6 +82,16 @@ DEFAULT_OPTION_INDICES = [
 # instruments that exist but aren't reachable through the normal option-search path.
 # `is_optionable: False` is what lets the app show these as reference-only, non-selectable
 # entries instead of handing a non-optionable instrument key to the Main screen's bootstrap call.
+# SENSEX has no NSE F&O option contracts listed under its own symbol (it's a BSE index) -- it can
+# never come back from _shape_underlyings's segments="FO" scoped search the way NIFTY/BANKNIFTY/
+# FINNIFTY/MIDCPNIFTY do, so it isn't in DEFAULT_OPTION_INDICES above. Rather than hardcoding a
+# guessed lot_size/freeze_quantity/tick_size for it here (numbers real money depends on getting
+# right -- order-slicing, quantity validation), it's looked up live via Upstox's own instrument
+# search and merged into the default (blank-query) list -- see
+# SearchScreenService._sensex_default_entry.
+_SENSEX_ENTRY_CACHE: Optional[_SearchCacheEntry] = None
+_SENSEX_ENTRY_TTL_SECONDS = 3600.0  # lot size/tick size/freeze quantity don't move intraday
+
 NON_OPTIONABLE_INDICES = [
     {
         "instrument_key": "NSE_INDEX|India VIX",
@@ -123,7 +134,7 @@ class SearchScreenService:
         safe_limit = min(max(limit, 1), 30)
         safe_page = max(page_number, 1)
         if not normalized_query:
-            return _default_indices(limit=safe_limit, page_number=safe_page)
+            return await self._default_indices(access_token, limit=safe_limit, page_number=safe_page)
 
         cache_key = (normalized_query.upper(), safe_limit, safe_page, include_futures)
         cached = _cache_get(cache_key)
@@ -172,6 +183,58 @@ class SearchScreenService:
         _cache_set(cache_key, response, ttl_seconds=60.0)
         return response
 
+    async def _default_indices(self, access_token: str, *, limit: int, page_number: int) -> dict[str, Any]:
+        """The blank-query (on-open) result set: DEFAULT_OPTION_INDICES plus a live-looked-up
+        SENSEX entry (see _sensex_default_entry) plus NON_OPTIONABLE_INDICES, in that order --
+        NIFTY-family indices first (matches the app's own "NIFTY/SENSEX" default view ordering),
+        SENSEX appended right after them rather than mixed in, reference-only entries last.
+        """
+        sensex = await self._sensex_default_entry(access_token)
+        all_indices = DEFAULT_OPTION_INDICES + ([sensex] if sensex else []) + NON_OPTIONABLE_INDICES
+        start = (page_number - 1) * limit
+        end = start + limit
+        total_records = len(all_indices)
+        total_pages = (total_records + limit - 1) // limit
+        return {
+            "query": "",
+            "results": all_indices[start:end],
+            "page": {
+                "page_number": page_number,
+                "records": limit,
+                "total_records": total_records,
+                "total_pages": total_pages,
+            },
+        }
+
+    async def _sensex_default_entry(self, access_token: str) -> Optional[dict[str, Any]]:
+        """Looks up SENSEX's real lot_size/freeze_quantity/tick_size via Upstox's own instrument
+        search (see _SENSEX_ENTRY_CACHE's own doc comment for why this isn't hardcoded), cached
+        for _SENSEX_ENTRY_TTL_SECONDS. Best-effort: a lookup failure just means SENSEX is missing
+        from this one response (retried on the next blank-query load) rather than breaking the
+        rest of the default list, since NIFTY/BANKNIFTY/etc don't depend on it.
+        """
+        global _SENSEX_ENTRY_CACHE
+        cached = _SENSEX_ENTRY_CACHE
+        if cached is not None and cached.expires_at > monotonic():
+            return cached.value.get("entry")
+
+        try:
+            payload = await self.upstox.search_instruments(access_token, query="SENSEX", records=5)
+        except UpstoxApiError:
+            return cached.value.get("entry") if cached is not None else None
+
+        matches = [
+            item
+            for item in _shape_underlyings(payload, limit=5)
+            if item["symbol"].upper() == "SENSEX"
+        ]
+        entry = matches[0] if matches else None
+        _SENSEX_ENTRY_CACHE = _SearchCacheEntry(
+            expires_at=monotonic() + _SENSEX_ENTRY_TTL_SECONDS,
+            value={"entry": entry},
+        )
+        return entry
+
 
 def _matching_non_optionable_indices(query: str) -> list[dict[str, Any]]:
     normalized = query.upper()
@@ -180,24 +243,6 @@ def _matching_non_optionable_indices(query: str) -> list[dict[str, Any]]:
         for item in NON_OPTIONABLE_INDICES
         if normalized in item["symbol"].upper() or normalized in item["name"].upper()
     ]
-
-
-def _default_indices(*, limit: int, page_number: int) -> dict[str, Any]:
-    all_indices = DEFAULT_OPTION_INDICES + NON_OPTIONABLE_INDICES
-    start = (page_number - 1) * limit
-    end = start + limit
-    total_records = len(all_indices)
-    total_pages = (total_records + limit - 1) // limit
-    return {
-        "query": "",
-        "results": all_indices[start:end],
-        "page": {
-            "page_number": page_number,
-            "records": limit,
-            "total_records": total_records,
-            "total_pages": total_pages,
-        },
-    }
 
 
 def _shape_underlyings(payload: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
