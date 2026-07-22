@@ -587,7 +587,9 @@ Upstox token.
     {
       "strike_price": 25000.0,
       "call_oi_change": 412000.0,
-      "put_oi_change": -95000.0
+      "put_oi_change": -95000.0,
+      "call_oi": 4700000.0,
+      "put_oi": 1650000.0
     }
   ]
 }
@@ -597,6 +599,12 @@ Changes are `to - from` over the union of strikes in both snapshots. A strike or
 missing from either snapshot is treated as zero, matching the Android option-chain/GEX convention;
 therefore a newly appearing strike contributes its full current OI and a disappearing strike
 contributes the negative of its earlier OI.
+
+`call_oi`/`put_oi` on each strike are that strike's *absolute* OI as of `to_slot`, not diffed --
+lets a client render this the same way as its own default (non-range) OI chart (bar height =
+current level, a capped segment on top of it for the change), with the FROM/TO range standing in
+for "yesterday's close -> now", rather than needing a second, delta-only chart shape just for
+this view. 0 if the strike wasn't listed in `to_slot`'s own snapshot.
 
 ### Tracked Instruments (background-warmed 5-minute-change history)
 

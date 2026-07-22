@@ -1472,7 +1472,7 @@ def test_main_oi_snapshot_diff_returns_exact_slot_changes_without_upstox_token()
                 underlying_symbol="NIFTY",
                 total_call_oi_change=1245000.0,
                 total_put_oi_change=-382000.0,
-                strikes=[OiStrikeDiff(25000.0, 412000.0, -95000.0)],
+                strikes=[OiStrikeDiff(25000.0, 412000.0, -95000.0, 4700000.0, 1650000.0)],
             )
 
     client = _client(FakeTokenStore(token=None))
@@ -1501,6 +1501,8 @@ def test_main_oi_snapshot_diff_returns_exact_slot_changes_without_upstox_token()
                 "strike_price": 25000.0,
                 "call_oi_change": 412000.0,
                 "put_oi_change": -95000.0,
+                "call_oi": 4700000.0,
+                "put_oi": 1650000.0,
             },
         ],
     }

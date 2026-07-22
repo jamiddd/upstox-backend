@@ -583,7 +583,10 @@ async def main_oi_snapshots_diff(
     to_slot: datetime = Query(...),
     snapshot_store: OISnapshotStore = Depends(get_oi_snapshot_store),
 ) -> dict[str, Any]:
-    """Return per-strike call/put OI changes between two previously stored slots."""
+    """Return per-strike call/put OI changes between two previously stored slots, plus each
+    strike's absolute call/put OI as of `to_slot` (see `OiStrikeDiff.call_oi`/`put_oi`) -- lets a
+    caller render this the same way as a plain snapshot (bar height = current level, capped change
+    on top of it), not just as a delta-only view."""
     if from_slot.tzinfo is None or from_slot.utcoffset() is None:
         raise _snapshot_diff_validation_error("from_slot must include a timezone offset")
     if to_slot.tzinfo is None or to_slot.utcoffset() is None:

@@ -15,6 +15,14 @@ class OiStrikeDiff:
     strike_price: float
     call_oi_change: float
     put_oi_change: float
+    # The strike's *absolute* OI as of the later (``to_slot``) snapshot -- not diffed, the actual
+    # level. Lets a caller (the Android OI chart) render this exactly like its own default
+    # since-yesterday's-close view (bar height = current level, capped change on top of it) with
+    # the FROM/TO range standing in for "yesterday's close -> now", rather than needing a second,
+    # delta-only chart shape just for this view. 0.0 if the strike wasn't listed in ``to_slot``'s
+    # own snapshot (matches call_oi_change/put_oi_change's own zero-baseline convention).
+    call_oi: float
+    put_oi: float
 
 
 @dataclass(frozen=True)
@@ -217,7 +225,8 @@ class OISnapshotStore:
         from_slot: datetime,
         to_slot: datetime,
     ) -> OiStrikesDiff:
-        """Compute per-strike call/put OI changes between two exact stored slots.
+        """Compute per-strike call/put OI changes between two exact stored slots, plus each
+        strike's absolute OI as of ``to_slot`` (see ``OiStrikeDiff.call_oi``/``put_oi``).
 
         A strike or call/put value missing from either snapshot is treated as zero, matching the
         mobile option-chain/GEX convention. Raises ``SnapshotNotFoundError`` for the first missing
@@ -264,17 +273,21 @@ class OISnapshotStore:
         for strike_price in sorted(before_strikes.keys() | after_strikes.keys()):
             before_row = before_strikes.get(strike_price)
             after_row = after_strikes.get(strike_price)
+            after_call_oi = _number_or_zero(after_row["call_oi"] if after_row is not None else None)
+            after_put_oi = _number_or_zero(after_row["put_oi"] if after_row is not None else None)
             strikes.append(
                 OiStrikeDiff(
                     strike_price=strike_price,
                     call_oi_change=(
-                        _number_or_zero(after_row["call_oi"] if after_row is not None else None)
+                        after_call_oi
                         - _number_or_zero(before_row["call_oi"] if before_row is not None else None)
                     ),
                     put_oi_change=(
-                        _number_or_zero(after_row["put_oi"] if after_row is not None else None)
+                        after_put_oi
                         - _number_or_zero(before_row["put_oi"] if before_row is not None else None)
                     ),
+                    call_oi=after_call_oi,
+                    put_oi=after_put_oi,
                 ),
             )
 

@@ -202,10 +202,12 @@ def test_diffs_totals_and_matching_strikes_between_exact_slots(tmp_path: Path) -
         total_call_oi_change=500.0,
         total_put_oi_change=-150.0,
         strikes=[
-            OiStrikeDiff(25000.0, 150.0, -50.0),
-            OiStrikeDiff(25100.0, 50.0, 150.0),
+            # (strike_price, call_oi_change, put_oi_change, call_oi, put_oi) -- the last two are
+            # each strike's *absolute* OI as of the later (to_slot) snapshot, not diffed.
+            OiStrikeDiff(25000.0, 150.0, -50.0, 750.0, 650.0),
+            OiStrikeDiff(25100.0, 50.0, 150.0, 450.0, 700.0),
             # Missing from the earlier snapshot means a zero baseline, not an omitted strike.
-            OiStrikeDiff(25200.0, 300.0, 100.0),
+            OiStrikeDiff(25200.0, 300.0, 100.0, 300.0, 100.0),
         ],
     )
     missing_slot = after_slot.replace(minute=20)
