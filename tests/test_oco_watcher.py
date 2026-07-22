@@ -226,10 +226,13 @@ def test_fires_target_when_price_crosses_for_a_short_exit() -> None:
     assert pending_store.removed == [pending_exit]
 
 
-def test_removes_pending_exit_before_placing_the_market_order() -> None:
-    """Crash-safety ordering: if this process died between remove() and place_order(), the worst
-    case must be a missed target fire, never a double-placed one. Simulated here by making
-    place_order raise and asserting the pending exit was already gone from the store regardless."""
+def test_cancels_stoploss_before_removing_pending_exit_and_placing_the_market_order() -> None:
+    """Ordering: cancel the resting stoploss first (otherwise the market order below competes
+    with it for the same exit-side exposure and gets rejected for margin), *then* remove from the
+    store right before place_order -- so a crash between remove() and place_order() leaves the
+    worst case as "a missed target fire" (next tick sees the now-cancelled stoploss and drops the
+    pending exit as resolved), never a double-placed market order. Simulated here by making
+    place_order raise and asserting the cancel had already happened but the store removal had too."""
     pending_exit = _pending_exit(stoploss_order_id="S-1", target_trigger_price=140.0)
     pending_store = _FakePendingStore([pending_exit])
     upstox = _FakeUpstox({"S-1": "open"}, {"NSE_FO|111": 145.0})
@@ -237,12 +240,16 @@ def test_removes_pending_exit_before_placing_the_market_order() -> None:
 
     _run(token_store=_FakeTokenStore(), pending_store=pending_store, upstox=upstox)
 
+    assert upstox.cancelled_order_ids == ["S-1"]
     assert pending_store.removed == [pending_exit]
     assert upstox.placed_orders == []
-    assert upstox.cancelled_order_ids == []
 
 
-def test_target_fire_is_best_effort_when_cancelling_the_stoploss_fails() -> None:
+def test_target_fire_is_skipped_this_tick_when_cancelling_the_stoploss_fails() -> None:
+    """If the stoploss can't be cancelled (including a race where it just filled/went terminal),
+    the market order must not fire on top of it -- skip this tick, leave the pending exit tracked
+    so the next tick re-evaluates it (and correctly drops it once the order book reflects
+    whatever the stoploss's new status actually is) instead of firing a now-wrong order."""
     pending_exit = _pending_exit(stoploss_order_id="S-1", target_trigger_price=140.0)
     pending_store = _FakePendingStore([pending_exit])
     upstox = _FakeUpstox({"S-1": "open"}, {"NSE_FO|111": 145.0})
@@ -250,8 +257,8 @@ def test_target_fire_is_best_effort_when_cancelling_the_stoploss_fails() -> None
 
     _run(token_store=_FakeTokenStore(), pending_store=pending_store, upstox=upstox)
 
-    assert len(upstox.placed_orders) == 1
-    assert pending_store.removed == [pending_exit]
+    assert upstox.placed_orders == []
+    assert pending_store.removed == []
 
 
 def test_one_pending_exit_failing_does_not_stop_the_others() -> None:

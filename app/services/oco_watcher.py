@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 # instruments with something genuinely pending.
 _LOOP_INTERVAL_SECONDS = 5.0
 
+# How long to wait after cancelling a resting stoploss order before firing the target's own
+# market order -- see _fire_target's own doc comment.
+_STOPLOSS_CANCEL_SETTLE_SECONDS = 0.8
+
 
 async def run_oco_watcher(settings: Settings) -> None:
     """Background loop (started from `app.main`'s lifespan, same as
@@ -136,13 +140,48 @@ async def _fire_target(
     pending_store: PendingOcoPairsStore,
     pending_exit: PendingExit,
 ) -> None:
-    """Drops [pending_exit] from [pending_store] *before* placing the market order, not after --
-    if this process crashes partway through, the worst case must be "the target was never placed"
-    (the stoploss is still live and still protective), never "the target got placed twice" (a real
-    double-sell). Missing a target fire on a crash is a lost profit opportunity; double-firing one
-    is a correctness bug with real money attached, so this is deliberately biased toward the
-    former.
+    """Cancels [pending_exit]'s still-resting stoploss leg *first*, then drops it from
+    [pending_store] right before placing the target's own market order -- in that order, for two
+    different reasons that would otherwise fight each other:
+
+    1. The stoploss is a real resting order reserving exit-side quantity/margin. Firing the
+       target's market order while it's still live makes Upstox see more pending exposure than
+       the position actually holds and reject it for margin (a "naked" excess) -- the exact same
+       failure the app's manual/bulk exit paths were fixed for (see
+       OrderPlacementViewModel.cancelExistingExitOrdersIfNeeded and
+       SmartOrderService._cancel_resting_stoploss_orders). The market order below must never be
+       the first exit-side order in flight.
+    2. [pending_store] is only dropped right before that market order goes out (not any earlier),
+       so a crash between the cancel and the placement leaves this pending_exit still tracked --
+       the next tick sees the stoploss now cancelled/terminal and simply resolves/drops it as
+       "protective leg gone" (see `_reconcile_pending_exits`), rather than silently losing the
+       fact that a target was actually reached. Missing a target fire this way is a lost profit
+       opportunity, not a double-sell, so it's the safe side to lean on -- same bias the previous
+       version of this function already had, just re-pointed at the new first step.
+
+    If the cancel itself fails (including the stoploss having just filled/gone terminal in the
+    race between this tick's order-book snapshot and now), the target isn't fired this tick --
+    [pending_exit] stays tracked so the next tick re-evaluates it from scratch, which correctly
+    drops it once the order book reflects that terminal status instead of firing a now-wrong
+    market order on top of it.
     """
+    try:
+        await upstox.cancel_order(access_token, pending_exit.stoploss_order_id)
+    except UpstoxApiError:
+        logger.warning(
+            "OCO watcher failed to cancel stoploss %s before firing target for %s -- retrying next tick",
+            pending_exit.stoploss_order_id,
+            pending_exit.instrument_key,
+            exc_info=True,
+        )
+        return
+
+    # Gives Upstox a moment to actually release the quantity/margin the cancelled stoploss was
+    # holding before the market order below asks for it -- same settle delay as the app's own
+    # cancel-then-exit fixes, for the same reason (a cancel-then-immediately-place sequence can
+    # still race and hit the same rejection the cancel was meant to prevent).
+    await asyncio.sleep(_STOPLOSS_CANCEL_SETTLE_SECONDS)
+
     pending_store.remove([pending_exit])
     try:
         await upstox.place_order(
@@ -154,27 +193,13 @@ async def _fire_target(
             order_type="MARKET",
         )
     except UpstoxApiError:
-        # The pending exit is already dropped -- a failure here just means the target opportunity
-        # was missed this tick (the stoploss, if still live, remains the position's protection).
-        # Not retried automatically: retrying a possibly-already-placed order blindly risks the
-        # exact double-sell this function's ordering exists to avoid.
+        # The stoploss is already cancelled and the pending exit already dropped -- this position
+        # is genuinely unprotected until a human notices (Order History/Main still show it as an
+        # open position with no S/L, same as any other position with no bracket). Not retried
+        # automatically: retrying a possibly-already-placed order blindly risks a real double-sell.
         logger.warning(
             "OCO watcher failed to fire target MARKET order for %s", pending_exit.instrument_key, exc_info=True
         )
-        return
-
-    await _cancel_leg(upstox, access_token, pending_exit.stoploss_order_id)
-
-
-async def _cancel_leg(upstox: UpstoxService, access_token: str, order_id: str) -> None:
-    try:
-        await upstox.cancel_order(access_token, order_id)
-    except UpstoxApiError:
-        # Best-effort -- the order may have already been cancelled/filled/rejected between this
-        # tick's order-book fetch and now. Logged, not retried -- see this function's callers for
-        # why a stray still-live stoploss after a target fire isn't something this loop force-
-        # cancels at any cost.
-        logger.warning("OCO watcher failed to cancel order %s", order_id, exc_info=True)
 
 
 def _index_last_prices(quotes_payload: dict[str, Any]) -> dict[str, float]:
