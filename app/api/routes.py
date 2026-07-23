@@ -663,12 +663,16 @@ async def market_candles(
     """Return a normalized historical-plus-intraday candle series for the mobile chart."""
     if from_date > to_date:
         raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "from_date must not be after to_date")
-    if (to_date - from_date).days > 31:
-        raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "Candle ranges are limited to 31 days")
     if unit == "hours" and interval > 5:
         raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "Hour intervals must be between 1 and 5")
     if unit == "days" and interval != 1:
         raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "Day interval must be 1")
+    max_range_days = 730 if unit == "days" else 90 if unit == "hours" or interval > 15 else 31
+    if (to_date - from_date).days > max_range_days:
+        raise _http_error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{unit.capitalize()} candle ranges are limited to {max_range_days} days",
+        )
 
     access_token = _load_access_token(token_store)
     try:

@@ -1131,6 +1131,50 @@ def test_market_candles_rejects_inverted_date_range() -> None:
     assert response.status_code == 422
 
 
+def test_market_candles_applies_timeframe_specific_range_limits() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    cases = [
+        ("minutes", 5, "2026-01-01", "2026-02-02", "31 days"),
+        ("minutes", 30, "2026-01-01", "2026-04-02", "90 days"),
+        ("hours", 1, "2026-01-01", "2026-04-02", "90 days"),
+        ("days", 1, "2024-01-01", "2026-01-02", "730 days"),
+    ]
+
+    for unit, interval, from_date, to_date, expected_limit in cases:
+        response = client.get(
+            "/api/market/candles",
+            params={
+                "instrument_key": "NSE_INDEX|Nifty 50",
+                "unit": unit,
+                "interval": interval,
+                "from_date": from_date,
+                "to_date": to_date,
+            },
+            headers={"X-API-Key": "mobile-secret"},
+        )
+
+        assert response.status_code == 422
+        assert expected_limit in response.json()["message"]
+
+
+def test_market_candles_accepts_two_year_daily_range() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+
+    response = client.get(
+        "/api/market/candles",
+        params={
+            "instrument_key": "NSE_INDEX|Nifty 50",
+            "unit": "days",
+            "interval": 1,
+            "from_date": "2024-07-23",
+            "to_date": "2026-07-23",
+        },
+        headers={"X-API-Key": "mobile-secret"},
+    )
+
+    assert response.status_code == 200
+
+
 def test_main_bootstrap_reflects_a_real_gap_down_correctly() -> None:
     client = _client(FakeTokenStore(token="stored-token"))
     app.dependency_overrides[get_upstox_service] = _GapDownFakeUpstoxService

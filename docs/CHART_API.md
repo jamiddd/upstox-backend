@@ -21,7 +21,12 @@ Protected with the standard `X-API-Key` header and the stored Upstox OAuth token
 - `from_date`: required ISO date, inclusive.
 - `to_date`: required ISO date, inclusive.
 
-The requested range must not exceed 31 days and `from_date` must not be after `to_date`.
+`from_date` must not be after `to_date`. Maximum ranges follow the chart's supported
+timeframes while staying within Upstox V3 retrieval limits:
+
+- Minute intervals from 1 through 15: 31 days.
+- Minute intervals above 15 and all hourly intervals: 90 days.
+- Daily candles: 730 days (two years).
 
 ### Response
 
