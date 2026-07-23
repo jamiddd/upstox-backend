@@ -9,7 +9,9 @@ with target/stoploss GTT exits attached after) plus `GET /api/orders/pending-exi
 Smart Bracket Order below, a real Upstox GTT bracket. `POST /api/orders/gtt/attach-exits` (see
 below) is unrelated to that retired flow -- it's a still-live fallback for attaching protection to
 a position that has no GTT bracket at all (e.g. opened outside the app), and keeps using the same
-underlying pending-exit/`oco_watcher` mechanism.
+underlying pending-exit/`oco_watcher` mechanism -- as does `POST /api/orders/cancel-resting-exit`
+(also below), which replaced the old pending-exits lookup for the one thing that still needed it:
+clearing a resting plain stoploss order before the app manually closes such a position.
 
 All endpoints require:
 
@@ -219,7 +221,9 @@ it overrides the instrument freeze quantity.
 
 There's no dedicated endpoint to view or edit a pending exit once armed -- the stoploss leg's own
 price can still be re-pointed through the ordinary `PUT /orders/modify` below (a real order), but
-the watched target price itself isn't currently exposed for editing after the fact.
+the watched target price itself isn't currently exposed for editing after the fact. When the
+client is about to manually close a position that might be protected this way (rather than by a
+real GTT bracket), see `POST /orders/cancel-resting-exit` below.
 
 Request:
 
@@ -435,3 +439,34 @@ Response:
 The top-level status is `success`, `partial_success`, or `error`. A failed item does
 not roll back successful modifications because Upstox processes them as independent
 orders.
+
+## Cancel Resting Exit
+
+```http
+POST /api/orders/cancel-resting-exit
+```
+
+Best-effort cancels a still-resting plain (non-GTT) stoploss order for one instrument -- see
+Attach GTT Exits above -- before the client submits a fresh opposite-side Smart Bracket Order to
+manually close that position from the sticky action panel. Without this, Upstox can see more
+pending exit exposure than the position actually holds and reject the fresh order for margin (a
+"naked excess"), since the resting stoploss already reserves the full quantity.
+
+A position protected by a real GTT bracket needs no equivalent call -- Upstox cleans up its own
+bracket legs once the position is flattened. This only matters for a position whose protection
+came from `POST /orders/gtt/attach-exits` instead, which is what `PendingOcoPairsStore` tracks.
+Bulk/max-loss flattening (`POST /orders/exit-positions`/`exit-all`) already does this same
+cancellation internally for every position being closed; this endpoint exposes the same
+mechanism for a single manual close.
+
+Request:
+
+```json
+{
+  "instrument_key": "NSE_FO|111"
+}
+```
+
+Response: always `{"status": "success"}`, whether or not anything was actually cancelled -- a
+failed lookup/cancel here just means the order that follows fails exactly the way it would have
+without this call.

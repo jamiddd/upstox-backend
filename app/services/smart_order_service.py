@@ -317,14 +317,14 @@ class SmartOrderService:
         # A still-active plain stoploss order (see attach_gtt_exits) reserves exit-side quantity
         # against its position -- flattening with a *fresh* market order on top of that makes
         # Upstox see more pending exposure than the position actually holds and reject it demanding
-        # margin for a "naked" excess (the same rejection OrderPlacementViewModel.
-        # cancelExistingExitOrdersIfNeeded exists to prevent for a manual single-position close).
+        # margin for a "naked" excess (the same rejection the app's own `POST
+        # /orders/cancel-resting-exit` route exists to prevent for a manual single-position close).
         # Best-effort and never blocks flattening below: a failed lookup/cancel here just means
         # the market order that follows fails exactly the way it did before this existed.
         target_instrument_keys = {
             _string_value(item, "instrument_token", "instrument_key") for item in open_positions
         }
-        await self._cancel_resting_stoploss_orders(
+        await self.cancel_resting_stoploss_orders(
             access_token,
             instrument_keys=target_instrument_keys,
             pending_oco_store=pending_oco_store,
@@ -388,7 +388,7 @@ class SmartOrderService:
             "results": results,
         }
 
-    async def _cancel_resting_stoploss_orders(
+    async def cancel_resting_stoploss_orders(
         self,
         access_token: str,
         *,
@@ -396,10 +396,16 @@ class SmartOrderService:
         pending_oco_store: PendingOcoPairsStore,
     ) -> None:
         """Cancels whichever plain (non-GTT) stoploss orders -- see [PendingExit]/attach_gtt_exits
-        -- are still resting for [instrument_keys] before [exit_positions] flattens them. Only the
-        plain-order mechanism is handled: a real GTT bracket has no equivalent standalone stoploss
-        order to cancel, and Upstox itself cleans up a GTT bracket's remaining legs once the
-        position it was watching is actually flattened.
+        -- are still resting for [instrument_keys], before a fresh opposite-side order is about to
+        be submitted against the same instrument(s). Only the plain-order mechanism is handled: a
+        real GTT bracket has no equivalent standalone stoploss order to cancel, and Upstox itself
+        cleans up a GTT bracket's remaining legs once the position it was watching is actually
+        flattened.
+
+        Two callers: [exit_positions] (bulk/max-loss flattening, [instrument_keys] is every
+        position being closed) and the app's own `POST /orders/cancel-resting-exit` route (a
+        single position the user is manually closing via a fresh opposite-side smart-bracket
+        order -- see that route's own doc comment for why it needs this too).
 
         A cancelled stoploss's own paired pending target is cleaned up server-side by
         `oco_watcher` on its own next tick, nothing to do here beyond the cancel itself.
@@ -428,14 +434,15 @@ class SmartOrderService:
 
         if cancelled_any:
             # Gives Upstox a moment to actually release the quantity/margin the cancelled
-            # order(s) were holding before the flattening market order below asks for it -- see
-            # OrderPlacementViewModel.cancelExistingExitOrdersIfNeeded's own doc comment for why
-            # this delay matters, not just the cancel itself.
+            # order(s) were holding before the order that follows (a flattening market order, or
+            # the app's own fresh smart-bracket close order) asks for it -- without this, a
+            # cancel-then-immediately-place sequence can still race and hit the same rejection the
+            # cancel was meant to prevent.
             await asyncio.sleep(_EXIT_ORDER_CANCEL_SETTLE_SECONDS)
 
 
-# How long to wait after cancelling a resting stoploss order before submitting the flattening
-# market order that follows -- see _cancel_resting_stoploss_orders's own doc comment.
+# How long to wait after cancelling a resting stoploss order before submitting whatever order
+# follows -- see cancel_resting_stoploss_orders's own doc comment.
 _EXIT_ORDER_CANCEL_SETTLE_SECONDS = 0.8
 
 # Terminal GTT statuses -- anything else (e.g. a still-pending/triggered rule) is treated as

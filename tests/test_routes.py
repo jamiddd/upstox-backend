@@ -2754,6 +2754,96 @@ def test_exit_positions_does_not_cancel_a_stoploss_on_an_untouched_instrument(tm
     assert fake_service.cancelled_order_ids == []
 
 
+class _CancelRestingExitFakeUpstoxService(FakeUpstoxService):
+    """A still-resting SL-M order on NSE_FO|111 -- what `POST /orders/cancel-resting-exit` must
+    cancel before the app submits a fresh opposite-side smart-bracket order to manually close
+    that position (same margin-rejection risk `exit_positions` already guards against for bulk/
+    max-loss flattening -- see cancel_resting_stoploss_orders's own doc comment)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled_order_ids: list[str] = []
+
+    async def get_order_book(self, access_token: str) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "order_id": "SL-1",
+                    "instrument_token": "NSE_FO|111",
+                    "status": "open",
+                    "order_type": "SL-M",
+                    "trigger_price": 115.0,
+                },
+            ],
+        }
+
+    async def cancel_order(self, access_token: str, order_id: str) -> dict[str, Any]:
+        self.cancelled_order_ids.append(order_id)
+        return {"status": "success", "data": {"order_id": order_id}}
+
+
+def test_cancel_resting_exit_cancels_the_registered_stoploss(tmp_path: Path) -> None:
+    from app.services.pending_oco_pairs_store import PendingExit, PendingOcoPairsStore
+
+    pairs_path = tmp_path / "pairs.json"
+    settings = replace(_settings(), pending_oco_pairs_path=pairs_path)
+    PendingOcoPairsStore(settings).add(
+        PendingExit(
+            stoploss_order_id="SL-1",
+            instrument_key="NSE_FO|111",
+            exit_transaction_type="SELL",
+            quantity=75,
+            product="I",
+            target_trigger_price=140.0,
+        ),
+    )
+
+    fake_service = _CancelRestingExitFakeUpstoxService()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_upstox_service] = lambda: fake_service
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/orders/cancel-resting-exit",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"instrument_key": "NSE_FO|111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+    assert fake_service.cancelled_order_ids == ["SL-1"]
+
+
+def test_cancel_resting_exit_is_a_noop_when_nothing_is_pending(tmp_path: Path) -> None:
+    """No registered pending exit for this instrument -- e.g. the position was entered via a real
+    GTT bracket, which needs no cancellation here at all -- so nothing is cancelled, and the route
+    still reports success."""
+    pairs_path = tmp_path / "pairs.json"
+    settings = replace(_settings(), pending_oco_pairs_path=pairs_path)
+
+    fake_service = _CancelRestingExitFakeUpstoxService()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_upstox_service] = lambda: fake_service
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/orders/cancel-resting-exit",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"instrument_key": "NSE_FO|111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+    assert fake_service.cancelled_order_ids == []
+
+
 class _LargePositionFakeUpstoxService(FakeUpstoxService):
     """One position sized over NSE_FO|111's freeze quantity (1800) -- to verify exit_positions
     slices its flattening order instead of submitting a single oversized one."""

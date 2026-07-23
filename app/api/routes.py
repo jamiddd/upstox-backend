@@ -148,6 +148,12 @@ class CancelOrdersRequest(BaseModel):
     order_ids: list[str] = Field(min_length=1)
 
 
+class CancelRestingExitRequest(BaseModel):
+    """See `cancel_resting_exit` below."""
+
+    instrument_key: str = Field(min_length=1)
+
+
 @protected_router.get("/status")
 def get_status() -> dict[str, str]:
     """Return a basic API status payload for the mobile client."""
@@ -888,6 +894,35 @@ async def cancel_orders(
     """
     access_token = _load_access_token(token_store)
     return await OrderCancellationService(service).cancel_orders(access_token, request.order_ids)
+
+
+@protected_router.post("/orders/cancel-resting-exit")
+async def cancel_resting_exit(
+    request: CancelRestingExitRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Best-effort cancels a still-resting plain (non-GTT) stoploss order -- see
+    SmartOrderService.cancel_resting_stoploss_orders -- for one instrument, before the app submits
+    a fresh opposite-side smart-bracket order to manually close that position from the sticky
+    action panel. A position protected by a real GTT bracket needs no equivalent call (Upstox
+    cleans up its own bracket legs once flattened); this only matters for a position whose
+    protection came from `POST /orders/gtt/attach-exits` instead. Always reports success -- same
+    best-effort posture as the internal call `exit_positions` already makes for bulk/max-loss
+    flattening: a failed lookup/cancel here just means the order that follows fails exactly the
+    way it would have without this call.
+    """
+    access_token = _load_access_token(token_store)
+    try:
+        await SmartOrderService(service).cancel_resting_stoploss_orders(
+            access_token,
+            instrument_keys={request.instrument_key},
+            pending_oco_store=PendingOcoPairsStore(settings),
+        )
+    except UpstoxApiError:
+        pass
+    return {"status": "success"}
 
 
 def _load_access_token(token_store: EncryptedTokenStore) -> str:
