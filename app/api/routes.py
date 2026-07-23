@@ -27,6 +27,7 @@ from app.core.exceptions import (
     UpstoxAuthRequiredError,
 )
 from app.services.token_store import EncryptedTokenStore
+from app.services.candle_service import CandleService
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_service import UpstoxService
 from app.core.security import require_mobile_api_key
@@ -645,6 +646,40 @@ async def authorize_market_feed(
     access_token = _load_access_token(token_store)
     try:
         return await service.get_market_feed_authorize(access_token)
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.get("/market/candles")
+async def market_candles(
+    instrument_key: str = Query(min_length=1),
+    unit: Literal["minutes", "hours", "days"] = "minutes",
+    interval: int = Query(default=5, ge=1, le=300),
+    from_date: date = Query(),
+    to_date: date = Query(),
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return a normalized historical-plus-intraday candle series for the mobile chart."""
+    if from_date > to_date:
+        raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "from_date must not be after to_date")
+    if (to_date - from_date).days > 31:
+        raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "Candle ranges are limited to 31 days")
+    if unit == "hours" and interval > 5:
+        raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "Hour intervals must be between 1 and 5")
+    if unit == "days" and interval != 1:
+        raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "Day interval must be 1")
+
+    access_token = _load_access_token(token_store)
+    try:
+        return await CandleService(service).get_candles(
+            access_token,
+            instrument_key=instrument_key,
+            unit=unit,
+            interval=interval,
+            from_date=from_date,
+            to_date=to_date,
+        )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

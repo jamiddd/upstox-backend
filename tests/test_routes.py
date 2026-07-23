@@ -1093,6 +1093,44 @@ class _GapDownFakeUpstoxService(FakeUpstoxService):
         )
 
 
+def test_market_candles_returns_normalized_chronological_rows() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+
+    response = client.get(
+        "/api/market/candles",
+        params={
+            "instrument_key": "NSE_INDEX|Nifty 50",
+            "unit": "minutes",
+            "interval": 5,
+            "from_date": "2026-07-16",
+            "to_date": "2026-07-17",
+        },
+        headers={"X-API-Key": "mobile-secret"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["instrument_key"] == "NSE_INDEX|Nifty 50"
+    assert body["candles"][0]["timestamp"] < body["candles"][-1]["timestamp"]
+    assert body["candles"][0]["open"] == 24900.0
+
+
+def test_market_candles_rejects_inverted_date_range() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+
+    response = client.get(
+        "/api/market/candles",
+        params={
+            "instrument_key": "NSE_INDEX|Nifty 50",
+            "from_date": "2026-07-18",
+            "to_date": "2026-07-17",
+        },
+        headers={"X-API-Key": "mobile-secret"},
+    )
+
+    assert response.status_code == 422
+
+
 def test_main_bootstrap_reflects_a_real_gap_down_correctly() -> None:
     client = _client(FakeTokenStore(token="stored-token"))
     app.dependency_overrides[get_upstox_service] = _GapDownFakeUpstoxService
