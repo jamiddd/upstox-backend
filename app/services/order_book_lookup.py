@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Any, Optional
 
 # Terminal statuses that mean an order is done moving -- shared by oco_watcher (decides whether a
-# leg has filled/died) and SmartOrderService.get_pending_exit_orders (excludes a pair whose leg
-# has already gone terminal but oco_watcher hasn't reconciled it yet this tick).
+# leg has filled/died) and SmartOrderService._cancel_resting_stoploss_orders (skips a stoploss
+# that's already gone terminal but oco_watcher hasn't reconciled it yet this tick).
 TERMINAL_ORDER_STATUSES = {"complete", "cancelled", "rejected"}
 
 

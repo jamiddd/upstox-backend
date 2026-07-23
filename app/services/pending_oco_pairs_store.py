@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from app.core.config import Settings
@@ -114,22 +114,3 @@ class PendingOcoPairsStore:
         ]
         self.save(remaining)
 
-    def update_target_trigger_price(self, *, stoploss_order_id: str, target_trigger_price: float) -> bool:
-        """Re-points the stored target price for the pending exit identified by
-        [stoploss_order_id] -- the target itself is never a live Upstox order (see [PendingExit]'s
-        own doc comment), so "modifying" it is purely a local store update, unlike the stoploss
-        leg (a real order, modified via the ordinary `PUT /orders/modify` endpoint instead).
-        Returns whether a matching entry was actually found and updated.
-        """
-        pending_exits = self.load()
-        updated = False
-        result: list[PendingExit] = []
-        for pending_exit in pending_exits:
-            if pending_exit.stoploss_order_id == stoploss_order_id:
-                result.append(replace(pending_exit, target_trigger_price=target_trigger_price))
-                updated = True
-            else:
-                result.append(pending_exit)
-        if updated:
-            self.save(result)
-        return updated

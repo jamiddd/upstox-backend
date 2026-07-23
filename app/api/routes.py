@@ -71,23 +71,6 @@ class SmartBracketOrderRequest(BaseModel):
     slice_quantity: Optional[int] = Field(default=None, gt=0)
 
 
-class MarketBracketOrderRequest(BaseModel):
-    """Places a true immediate-fill MARKET entry, then attaches target/stoploss GTT exits.
-    Unlike SmartBracketOrderRequest, whose GTT ENTRY leg Upstox always executes as a LIMIT order
-    even with trigger_type=IMMEDIATE (a GTT order is always a LIMIT order on execution -- see
-    SmartOrderService.place_market_bracket_order), this has no entry_trigger_price/trigger_type
-    at all -- there's nothing to submit, the entry just fills at whatever the market gives.
-    """
-
-    instrument_key: str = Field(min_length=1)
-    transaction_type: Literal["BUY", "SELL"]
-    quantity: int = Field(gt=0)
-    product: Literal["I", "D", "MTF"] = "I"
-    target_trigger_price: float = Field(gt=0)
-    stoploss_trigger_price: float = Field(gt=0)
-    slice_quantity: Optional[int] = Field(default=None, gt=0)
-
-
 class ModifyGttOrderRequest(BaseModel):
     """Re-points an existing GTT bracket's target/stoploss trigger prices. The entry fields are
     resent unchanged by the client (it already has them from GET /orders/gtt) -- Upstox's GTT
@@ -136,16 +119,6 @@ class AttachGttExitsRequest(BaseModel):
     # Overrides the instrument's freeze-quantity-based auto-slicing when set -- same convention
     # as SmartBracketOrderRequest.slice_quantity.
     slice_quantity: Optional[int] = Field(default=None, gt=0)
-
-
-class UpdatePendingExitTargetPriceRequest(BaseModel):
-    """Re-points one pending exit's stored target price. See
-    SmartOrderService.update_pending_exit_target_price.
-    """
-
-    instrument_key: str = Field(min_length=1)
-    stoploss_order_id: str = Field(min_length=1)
-    target_trigger_price: float = Field(gt=0)
 
 
 class ModifyOrderRequest(BaseModel):
@@ -764,40 +737,6 @@ async def place_smart_bracket_order(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.post("/orders/market-bracket")
-async def place_market_bracket_order(
-    order: MarketBracketOrderRequest,
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-) -> dict[str, Any]:
-    """Place a true market-filled entry with target/stoploss GTT exits attached after. See
-    SmartOrderService.place_market_bracket_order.
-    """
-    access_token = _load_access_token(token_store)
-    try:
-        rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
-        validate_quantity(order.quantity, rules)
-        validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
-        validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
-        slice_quantity = order.slice_quantity or slice_quantity_for_freeze(order.quantity, rules)
-        return await SmartOrderService(service).place_market_bracket_order(
-            access_token,
-            instrument_key=order.instrument_key,
-            transaction_type=order.transaction_type,
-            quantity=order.quantity,
-            product=order.product,
-            target_trigger_price=order.target_trigger_price,
-            stoploss_trigger_price=order.stoploss_trigger_price,
-            slice_quantity=slice_quantity,
-            pending_oco_store=PendingOcoPairsStore(settings),
-        )
-    except AppConfigError as exc:
-        raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
-
-
 @protected_router.get("/orders/gtt")
 async def get_gtt_orders(
     instrument_key: str = Query(..., min_length=1),
@@ -817,50 +756,6 @@ async def get_gtt_orders(
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
-
-
-@protected_router.get("/orders/pending-exits")
-async def get_pending_exit_orders(
-    instrument_key: str = Query(..., min_length=1),
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-) -> list[dict[str, Any]]:
-    """Pending exits (attach_gtt_exits, no GTT bracket) for one instrument -- the plain-order
-    counterpart of GET /orders/gtt, so the app can find and edit the exit behind a position that
-    has no GTT bracket instead of only ever finding "nothing" and attaching a redundant second
-    one. See SmartOrderService.get_pending_exit_orders.
-    """
-    access_token = _load_access_token(token_store)
-    try:
-        return await SmartOrderService(service).get_pending_exit_orders(
-            access_token,
-            instrument_key=instrument_key,
-            pending_oco_store=PendingOcoPairsStore(settings),
-        )
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
-
-
-@protected_router.put("/orders/pending-exits/target-price")
-async def update_pending_exit_target_price(
-    request: UpdatePendingExitTargetPriceRequest,
-    settings: Settings = Depends(get_settings),
-) -> dict[str, Any]:
-    """Re-points a pending exit's stored target price -- doesn't touch Upstox at all, since the
-    target was never a live order (see PendingExit's own doc comment). The stoploss leg's price
-    is still modified through the ordinary PUT /orders/modify (a real order). See
-    SmartOrderService.update_pending_exit_target_price.
-    """
-    found = SmartOrderService.update_pending_exit_target_price(
-        instrument_key=request.instrument_key,
-        stoploss_order_id=request.stoploss_order_id,
-        target_trigger_price=request.target_trigger_price,
-        pending_oco_store=PendingOcoPairsStore(settings),
-    )
-    if not found:
-        raise _http_error(status.HTTP_404_NOT_FOUND, "No pending exit found for that stoploss order id.")
-    return {"status": "success"}
 
 
 @protected_router.put("/orders/gtt/modify")

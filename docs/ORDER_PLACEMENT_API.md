@@ -2,6 +2,15 @@
 
 Backend contract for placing app smart orders.
 
+The app used to also have `POST /api/orders/market-bracket` (a real immediate-fill MARKET entry
+with target/stoploss GTT exits attached after) plus `GET /api/orders/pending-exits` and
+`PUT /api/orders/pending-exits/target-price` for viewing/editing those exits before they resolved
+-- retired for being unreliable in live trading. Every order the app places now goes through
+Smart Bracket Order below, a real Upstox GTT bracket. `POST /api/orders/gtt/attach-exits` (see
+below) is unrelated to that retired flow -- it's a still-live fallback for attaching protection to
+a position that has no GTT bracket at all (e.g. opened outside the app), and keeps using the same
+underlying pending-exit/`oco_watcher` mechanism.
+
 All endpoints require:
 
 ```text
@@ -134,93 +143,6 @@ TARGET and STOPLOSS trigger_type are always IMMEDIATE as required by Upstox.
 Normal Upstox v3 place-order supports slice=true, but GTT place order does not document slice=true, so the backend handles slicing for smart bracket orders.
 ```
 
-## Market Bracket Order
-
-```http
-POST /api/orders/market-bracket
-```
-
-Places a real immediate-fill MARKET order for entry, then attaches target/stoploss GTT exits
-(same mechanism as Attach GTT Exits below) once entry is submitted. Use this instead of Smart
-Bracket Order when the entry must actually fill at market -- **a Smart Bracket Order's GTT ENTRY
-leg is always executed by Upstox as a LIMIT order at `entry_trigger_price`, even with
-`entry_trigger_type=IMMEDIATE`** (a GTT order is always placed as a LIMIT order on execution, per
-Upstox's own docs), so it can silently behave like a limit order when the caller actually wanted
-a market fill.
-
-Request:
-
-```json
-{
-  "instrument_key": "NSE_FO|111",
-  "transaction_type": "BUY",
-  "quantity": 75,
-  "product": "I",
-  "target_trigger_price": 140.0,
-  "stoploss_trigger_price": 118.0
-}
-```
-
-Fields:
-
-```text
-instrument_key required
-transaction_type required, BUY|SELL
-quantity required, positive integer
-product optional, I|D|MTF, default I
-target_trigger_price required, positive number
-stoploss_trigger_price required, positive number
-slice_quantity optional, positive integer
-```
-
-No `entry_trigger_price`/`entry_trigger_type` -- there's nothing to submit for a real market
-entry, it fills at whatever the market gives. Same tick-size/lot-size validation and
-freeze-quantity slicing as Smart Bracket Order applies to `quantity`/`target_trigger_price`/
-`stoploss_trigger_price`.
-
-Only the quantity that was actually submitted successfully as a market entry gets exits attached
--- a slice that fails to enter does not end up with a stray target/stoploss bracket for shares
-that were never bought.
-
-Response:
-
-```json
-{
-  "status": "success",
-  "source": "upstox_market_with_gtt_exits",
-  "total_quantity": 75,
-  "entered_quantity": 75,
-  "slice_quantity": 75,
-  "slice_count": 1,
-  "entry_slices": [
-    {
-      "slice_number": 1,
-      "quantity": 75,
-      "status": "success",
-      "upstox_response": { "status": "success", "data": { "order_ids": ["..."] } }
-    }
-  ],
-  "exits": {
-    "status": "success",
-    "total_quantity": 75,
-    "slice_quantity": 75,
-    "slice_count": 1,
-    "slices": [
-      {
-        "slice_number": 1,
-        "quantity": 75,
-        "target": { "status": "success", "submitted_order": {}, "upstox_response": {} },
-        "stoploss": { "status": "success", "submitted_order": {}, "upstox_response": {} }
-      }
-    ]
-  }
-}
-```
-
-`status` is `"success"` (every entry slice and every exit leg placed), `"partial_success"` (some
-entered but not all, or entry succeeded but an exit leg failed), or `"error"` (nothing entered --
-`exits` is `null` in that case, since there's no position to attach exits to).
-
 ## List GTT Orders
 
 ```http
@@ -295,11 +217,9 @@ watched target) when it exceeds the instrument's `freeze_quantity` -- a position
 freeze quantity would otherwise be rejected outright by Upstox. If `slice_quantity` is provided,
 it overrides the instrument freeze quantity.
 
-To edit a pending exit later, `GET /api/orders/pending-exits?instrument_key=...` returns the
-still-live ones (stoploss trigger price read from the live order, target trigger price read back
-from the backend's own store); `PUT /api/orders/pending-exits/target-price` re-points the stored
-target (no Upstox call), and `PUT /api/orders/modify` (see below) re-points the stoploss order
-like any other regular order.
+There's no dedicated endpoint to view or edit a pending exit once armed -- the stoploss leg's own
+price can still be re-pointed through the ordinary `PUT /orders/modify` below (a real order), but
+the watched target price itself isn't currently exposed for editing after the fact.
 
 Request:
 
@@ -364,57 +284,6 @@ rest. Response:
 
 Top-level `status` is `success` (every slice's stoploss placed), `partial_success` (some placed),
 or `error` (none placed).
-
-## Get Pending Exits
-
-```http
-GET /api/orders/pending-exits?instrument_key=NSE_FO|111
-```
-
-The plain-order counterpart of `GET /api/orders/gtt` above -- pending exits (see Attach GTT
-Exits) still awaiting reconciliation for one instrument, so the client can find and edit the exit
-behind a position that has no GTT bracket instead of only ever finding nothing and attaching a
-redundant second one. `target_trigger_price` is read from the backend's own store (never a live
-order); `stoploss_trigger_price`/`quantity`/`product` are read from the live stoploss order. Only
-returns an entry whose stoploss is still confirmed live -- one that's already terminal
-(filled/cancelled/rejected) is about to be dropped by `oco_watcher`'s own next tick.
-
-Response:
-
-```json
-[
-  {
-    "stoploss_order_id": "260721000423257",
-    "quantity": 75,
-    "product": "I",
-    "target_trigger_price": 140.0,
-    "stoploss_trigger_price": 115.0
-  }
-]
-```
-
-## Update Pending Exit Target Price
-
-```http
-PUT /api/orders/pending-exits/target-price
-```
-
-Re-points a pending exit's stored target price. Doesn't touch Upstox at all -- the target is
-never a live order (see Attach GTT Exits above). To change the stoploss price instead, use the
-ordinary `PUT /orders/modify` below against `stoploss_order_id` (a real order).
-
-Request:
-
-```json
-{
-  "instrument_key": "NSE_FO|111",
-  "stoploss_order_id": "260721000423257",
-  "target_trigger_price": 150.0
-}
-```
-
-Response: `{"status": "success"}`, or `404` if no pending exit matches that
-`instrument_key`/`stoploss_order_id` pair.
 
 ## Modify GTT Order
 

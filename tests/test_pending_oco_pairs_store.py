@@ -86,26 +86,6 @@ def test_remove_ignores_a_pending_exit_not_actually_present(tmp_path: Path) -> N
     assert store.load() == [keep]
 
 
-def test_update_target_trigger_price_repoints_the_matching_entry(tmp_path: Path) -> None:
-    store = PendingOcoPairsStore(_settings(tmp_path / "pairs.json"))
-    store.add(_pending_exit(stoploss_order_id="S-1", target_trigger_price=140.0))
-
-    updated = store.update_target_trigger_price(stoploss_order_id="S-1", target_trigger_price=150.0)
-
-    assert updated is True
-    assert store.load()[0].target_trigger_price == 150.0
-
-
-def test_update_target_trigger_price_returns_false_when_not_found(tmp_path: Path) -> None:
-    store = PendingOcoPairsStore(_settings(tmp_path / "pairs.json"))
-    store.add(_pending_exit(stoploss_order_id="S-1"))
-
-    updated = store.update_target_trigger_price(stoploss_order_id="S-does-not-exist", target_trigger_price=150.0)
-
-    assert updated is False
-    assert store.load()[0].target_trigger_price == 140.0
-
-
 def test_load_tolerates_a_corrupt_file(tmp_path: Path) -> None:
     path = tmp_path / "pairs.json"
     path.write_text("not valid json", encoding="utf-8")
