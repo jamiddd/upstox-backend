@@ -784,14 +784,14 @@ async def place_smart_bracket_order(
 
 @protected_router.get("/orders/gtt")
 async def get_gtt_orders(
-    instrument_key: str = Query(..., min_length=1),
+    instrument_key: Optional[str] = Query(None, min_length=1),
     include_history: bool = Query(False),
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> list[dict[str, Any]]:
-    """GTT orders for one instrument -- lets the app find the bracket order behind an open
-    position so its target/stoploss can be shown and edited, or (with include_history=true) find
-    the bracket a now-closed order had by matching created_at against the order's own fill time.
+    """Active GTT orders, optionally filtered to one instrument. The unfiltered form powers the
+    Main screen's GTT Open Orders section; the filtered form lets the app find the bracket behind
+    a position, or (with include_history=true) its historical bracket.
     See SmartOrderService.get_gtt_orders_for_instrument.
     """
     access_token = _load_access_token(token_store)

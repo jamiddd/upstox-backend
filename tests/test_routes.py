@@ -2278,6 +2278,22 @@ def test_get_gtt_orders_filters_by_instrument_and_active_status() -> None:
     assert [order["gtt_order_id"] for order in payload] == ["GTT-111"]
 
 
+def test_get_gtt_orders_without_instrument_returns_all_active_orders() -> None:
+    """The Main screen can request the complete active GTT order book."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/orders/gtt",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert {order["gtt_order_id"] for order in payload} == {"GTT-111", "GTT-other"}
+
+
 def test_get_gtt_orders_with_history_includes_completed_but_not_cancelled() -> None:
     """include_history=true also returns COMPLETED brackets (so a closed order's historical
     target/stoploss can be recovered), but still excludes CANCELLED/REJECTED -- those never

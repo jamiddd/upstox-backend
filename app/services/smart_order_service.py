@@ -202,9 +202,9 @@ class SmartOrderService:
         }
 
     async def get_gtt_orders_for_instrument(
-        self, access_token: str, *, instrument_key: str, include_history: bool = False
+        self, access_token: str, *, instrument_key: str | None = None, include_history: bool = False
     ) -> list[dict[str, Any]]:
-        """GTT orders for one instrument.
+        """GTT orders, optionally filtered to one instrument.
 
         By default, "active" only -- excludes terminal statuses (cancelled/rejected/completed);
         anything else is treated as still-live so an unfamiliar status fails open rather than
@@ -224,7 +224,7 @@ class SmartOrderService:
             order
             for order in orders
             if isinstance(order, dict)
-            and order.get("instrument_token") == instrument_key
+            and (instrument_key is None or order.get("instrument_token") == instrument_key)
             and str(order.get("status", "")).upper() not in excluded_statuses
         ]
 
