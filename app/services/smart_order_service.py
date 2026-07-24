@@ -220,11 +220,15 @@ class SmartOrderService:
         data = payload.get("data")
         orders = data if isinstance(data, list) else []
         excluded_statuses = _TERMINAL_GTT_STATUSES if not include_history else _NEVER_FIRED_GTT_STATUSES
-        return [
-            order
+        normalized_orders = [
+            {**order, "status": _gtt_order_status(order)}
             for order in orders
             if isinstance(order, dict)
-            and (instrument_key is None or order.get("instrument_token") == instrument_key)
+        ]
+        return [
+            order
+            for order in normalized_orders
+            if (instrument_key is None or order.get("instrument_token") == instrument_key)
             and str(order.get("status", "")).upper() not in excluded_statuses
         ]
 
@@ -447,12 +451,44 @@ _EXIT_ORDER_CANCEL_SETTLE_SECONDS = 0.8
 
 # Terminal GTT statuses -- anything else (e.g. a still-pending/triggered rule) is treated as
 # active. See SmartOrderService.get_gtt_orders_for_instrument.
-_TERMINAL_GTT_STATUSES = {"CANCELLED", "REJECTED", "COMPLETED"}
+_TERMINAL_GTT_STATUSES = {"CANCELLED", "REJECTED", "COMPLETED", "EXPIRED"}
 
 # Statuses that mean the bracket's rules never actually fired -- excluded even from history
 # lookups since they don't represent real target/stoploss levels a position ever had. COMPLETED
 # is kept for history since it means a rule genuinely triggered.
 _NEVER_FIRED_GTT_STATUSES = {"CANCELLED", "REJECTED"}
+
+_ACTIVE_GTT_RULE_STATUSES = {"SCHEDULED", "TRIGGERED", "OPEN", "PENDING"}
+
+
+def _gtt_order_status(order: dict[str, Any]) -> str:
+    """Normalizes Upstox's rule-level GTT lifecycle into one order status.
+
+    The V3 response documents status on each rule, not on the containing GTT. Older fixtures and
+    some responses do include a top-level status, so preserve it when present. Otherwise any live
+    rule keeps the bracket ACTIVE; a cancelled ENTRY with only inactive siblings is CANCELLED.
+    Unknown combinations fail open as ACTIVE so a genuinely live order is never silently hidden.
+    """
+    explicit = str(order.get("status") or "").upper()
+    if explicit:
+        return explicit
+
+    rules = order.get("rules")
+    rule_statuses = [
+        str(rule.get("status") or "").upper()
+        for rule in rules if isinstance(rule, dict)
+    ] if isinstance(rules, list) else []
+    if any(status in _ACTIVE_GTT_RULE_STATUSES for status in rule_statuses):
+        return "ACTIVE"
+    if "CANCELLED" in rule_statuses:
+        return "CANCELLED"
+    if "FAILED" in rule_statuses or "REJECTED" in rule_statuses:
+        return "REJECTED"
+    if "EXPIRED" in rule_statuses:
+        return "EXPIRED"
+    if rule_statuses and all(status in {"COMPLETED", "INACTIVE"} for status in rule_statuses):
+        return "COMPLETED"
+    return "ACTIVE"
 
 
 def _build_gtt_rules(

@@ -325,11 +325,30 @@ class FakeUpstoxService:
                     "instrument_token": "NSE_FO|111",
                     "quantity": 75,
                     "product": "I",
-                    "status": "ACTIVE",
                     "rules": [
-                        {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": 125.5},
-                        {"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": 140.0},
-                        {"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 118.0},
+                        {
+                            "strategy": "ENTRY", "status": "SCHEDULED",
+                            "trigger_type": "IMMEDIATE", "trigger_price": 125.5,
+                        },
+                        {
+                            "strategy": "TARGET", "status": "INACTIVE",
+                            "trigger_type": "IMMEDIATE", "trigger_price": 140.0,
+                        },
+                        {
+                            "strategy": "STOPLOSS", "status": "INACTIVE",
+                            "trigger_type": "IMMEDIATE", "trigger_price": 118.0,
+                        },
+                    ],
+                },
+                {
+                    "gtt_order_id": "GTT-rule-cancelled",
+                    "instrument_token": "NSE_FO|111",
+                    "quantity": 75,
+                    "product": "I",
+                    "rules": [
+                        {"strategy": "ENTRY", "status": "CANCELLED", "trigger_price": 223.2},
+                        {"strategy": "TARGET", "status": "INACTIVE", "trigger_price": 234.35},
+                        {"strategy": "STOPLOSS", "status": "INACTIVE", "trigger_price": 212.05},
                     ],
                 },
                 {
@@ -381,6 +400,20 @@ class FakeUpstoxService:
             "status": "success",
             "data": {"gtt_order_id": order["gtt_order_id"]},
             "echo": order,
+        }
+
+    async def cancel_gtt_order(
+        self,
+        access_token: str,
+        gtt_order_id: str,
+    ) -> dict[str, Any]:
+        if gtt_order_id == "GTT-fail":
+            from app.core.exceptions import UpstoxApiError
+
+            raise UpstoxApiError("GTT order cannot be cancelled", status_code=400)
+        return {
+            "status": "success",
+            "data": {"gtt_order_ids": [gtt_order_id]},
         }
 
     async def place_market_order(
@@ -2276,6 +2309,7 @@ def test_get_gtt_orders_filters_by_instrument_and_active_status() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert [order["gtt_order_id"] for order in payload] == ["GTT-111"]
+    assert payload[0]["status"] == "ACTIVE"
 
 
 def test_get_gtt_orders_without_instrument_returns_all_active_orders() -> None:
@@ -2348,6 +2382,22 @@ def test_modify_gtt_order_resends_full_rule_set() -> None:
             {"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": 115.0},
         ],
     }
+
+
+def test_cancel_gtt_order_cancels_the_complete_order() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.request(
+            "DELETE",
+            "/api/orders/gtt/cancel",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"gtt_order_id": "GTT-111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["data"]["gtt_order_ids"] == ["GTT-111"]
 
 
 def test_modify_gtt_order_rejects_invalid_tick_size() -> None:

@@ -89,6 +89,12 @@ class ModifyGttOrderRequest(BaseModel):
     trailing_gap: Optional[float] = Field(default=None, gt=0)
 
 
+class CancelGttOrderRequest(BaseModel):
+    """Identifies the complete GTT order whose remaining rules should be cancelled."""
+
+    gtt_order_id: str = Field(min_length=1)
+
+
 class TrackedInstrumentsRequest(BaseModel):
     """Replaces the whole persisted set of underlying_keys the background poller keeps
     5-minute-change history warm for -- see TrackedInstrumentsStore. Always the client's full
@@ -814,6 +820,8 @@ async def modify_gtt_order(
     access_token = _load_access_token(token_store)
     try:
         rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
+        validate_quantity(order.quantity, rules)
+        validate_price(order.entry_trigger_price, rules, field_name="entry_trigger_price")
         validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
         validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
         return await SmartOrderService(service).modify_gtt_bracket(
@@ -829,6 +837,20 @@ async def modify_gtt_order(
         )
     except AppConfigError as exc:
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.delete("/orders/gtt/cancel")
+async def cancel_gtt_order(
+    order: CancelGttOrderRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Cancels an untriggered GTT order and all associated rules."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await service.cancel_gtt_order(access_token, order.gtt_order_id)
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

@@ -157,6 +157,11 @@ By default, returns active (not `CANCELLED`/`REJECTED`/`COMPLETED`) GTT orders. 
 `instrument_key` to restrict the result to one instrument (used for position bracket editing);
 omit it to populate the Main screen's separate GTT Open Orders section.
 
+Upstox reports lifecycle status on each `rules[].status` and can omit a top-level order status.
+The backend normalizes those rule states into a top-level `status` and filters terminal brackets;
+for example, an ENTRY rule marked `CANCELLED` with inactive TARGET/STOPLOSS siblings is excluded,
+while any `SCHEDULED`/`OPEN`/`PENDING` rule keeps the bracket active.
+
 With `include_history=true`, also returns `COMPLETED` brackets (still excludes
 `CANCELLED`/`REJECTED`, which never actually fired) -- lets the client recover the
 target/stoploss a now-closed position had, by matching a specific order's own fill timestamp
@@ -296,9 +301,9 @@ or `error` (none placed).
 PUT /api/orders/gtt/modify
 ```
 
-Re-points an existing GTT bracket's target/stoploss trigger prices (e.g. after the client fetched
-its current rules from `GET /api/orders/gtt` above). The entry fields must be resent unchanged --
-Upstox's GTT modify contract expects the full rule set, not a partial patch.
+Updates an existing GTT bracket's entry, quantity, target, and stoploss values. Upstox's GTT
+modify contract expects the full rule set, not a partial patch, so all rules are resent together.
+The backend validates the edited quantity and every edited price against the instrument rules.
 
 Request:
 
@@ -330,6 +335,23 @@ trailing_gap optional, positive number
 ```
 
 Response: the raw Upstox GTT modify response.
+
+## Cancel GTT Order
+
+```text
+DELETE /api/orders/gtt/cancel
+```
+
+Cancels one untriggered GTT order and all of its remaining rules. The Android client asks for
+confirmation before calling this endpoint.
+
+```json
+{
+  "gtt_order_id": "GTT-111"
+}
+```
+
+Response: the raw Upstox GTT cancel response.
 
 ## Exit Positions
 

@@ -199,6 +199,27 @@ class UpstoxService:
             raise UpstoxApiError("Unexpected Upstox GTT modify response")
         return payload
 
+    async def cancel_gtt_order(
+        self,
+        access_token: str,
+        gtt_order_id: str,
+    ) -> dict[str, Any]:
+        """Cancel an untriggered V3 GTT order and all of its remaining rules."""
+        response = await self._request(
+            "DELETE",
+            f"{self.settings.upstox_api_v3_base_url}/order/gtt/cancel",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+            json={"gtt_order_id": gtt_order_id},
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox GTT cancel response")
+        return payload
+
     async def place_order(
         self,
         access_token: str,
