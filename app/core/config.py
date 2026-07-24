@@ -25,6 +25,7 @@ class Settings:
     token_store_path: Path
     tracked_instruments_path: Path = Path("/data/tracked_instruments.json")
     pending_oco_pairs_path: Path = Path("/data/pending_oco_pairs.json")
+    account_snapshot_path: Path = Path("/data/account_snapshot.json")
     oi_database_path: Path = Path("/data/oi_snapshots.sqlite3")
     upstox_api_base_url: str = "https://api.upstox.com/v2"
     upstox_api_v3_base_url: str = "https://api.upstox.com/v3"
@@ -60,6 +61,9 @@ class Settings:
             ),
             pending_oco_pairs_path=Path(
                 os.getenv("PENDING_OCO_PAIRS_PATH", "/data/pending_oco_pairs.json"),
+            ),
+            account_snapshot_path=Path(
+                os.getenv("ACCOUNT_SNAPSHOT_PATH", "/data/account_snapshot.json"),
             ),
             oi_database_path=Path(
                 os.getenv("OI_DATABASE_PATH", "/data/oi_snapshots.sqlite3"),

@@ -293,6 +293,26 @@ All six fields' source paths are confirmed against a real `GET /v3/user/get-fund
 - `payin_amount` is `cash.added_today + cash.withdrawn_today` (the latter already negative) -- net cash movement today.
 - `closing_balance` = `opening_balance + payin_amount + profit_loss` -- includes today's net cash movement (not just `opening_balance + profit_loss` as before), since a mid-day deposit is real money added to the account, not "profit".
 
+### Overnight estimate
+
+The backend scheduler captures one account snapshot after 23:00 IST each day, using
+`available_margin + margin_used` so the estimate reflects the broker's net account state after
+realized P&L and deducted charges. It persists the result independently of the Android app.
+
+If the funds endpoint is unavailable during nightly maintenance, or after that day's 23:00
+snapshot has been captured, the response uses the persisted value for `opening_balance`,
+`closing_balance`, and `available_margin`, resets P&L/margin/payin to zero, and adds:
+
+```json
+{
+  "is_overnight_estimate": true,
+  "overnight_estimate_captured_at": "2026-07-24T23:00:05+05:30"
+}
+```
+
+Snapshots older than seven days are ignored. The default persistent path is
+`/data/account_snapshot.json`; override it with `ACCOUNT_SNAPSHOT_PATH`.
+
 ## Underlying Signals
 
 ```http

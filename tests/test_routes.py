@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,6 +22,7 @@ from app.main import app
 from app.services import instrument_rules_service
 from app.services.instrument_rules_service import _MasterCache
 from app.services.main_screen_service import MainScreenService, _CACHE
+from app.services.account_snapshot_store import AccountSnapshot, AccountSnapshotStore
 from app.services import oi_analysis_service
 from app.services.oi_snapshot_store import OiStrikeDiff, OiStrikesDiff, SnapshotNotFoundError
 from app.services import search_screen_service
@@ -1096,6 +1098,29 @@ def test_main_bootstrap_degrades_gracefully_when_funds_service_unavailable() -> 
         "The Funds service is accessible from 5:30 AM to 12:00 AM IST daily. Please try again "
         "during these service hours."
     )
+
+
+def test_main_summary_uses_persisted_snapshot_when_funds_are_unavailable(tmp_path: Path) -> None:
+    _CACHE.clear()
+    store = AccountSnapshotStore(_settings())
+    store.path = tmp_path / "account_snapshot.json"
+    captured_at = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
+    store.save(AccountSnapshot(estimated_balance=101_234.50, captured_at=captured_at))
+    service = MainScreenService(FakeUpstoxService(), store)
+
+    summary = anyio.run(lambda: service.summary("funds-unavailable-token"))
+
+    assert summary == {
+        "opening_balance": 101_234.50,
+        "profit_loss": 0.0,
+        "closing_balance": 101_234.50,
+        "available_margin": 101_234.50,
+        "margin_used": 0.0,
+        "payin_amount": 0.0,
+        "funds_unavailable_note": None,
+        "is_overnight_estimate": True,
+        "overnight_estimate_captured_at": captured_at,
+    }
 
 
 class _GapDownFakeUpstoxService(FakeUpstoxService):

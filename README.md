@@ -35,6 +35,15 @@ Expiry-day OI and signal data remains available through the full session. Shortl
 IST, snapshots with an earlier expiry date are deleted; startup performs the same cleanup if the
 service was offline overnight. Set `OI_DATABASE_PATH` to override the database location.
 
+## Overnight account snapshot
+
+At 23:00 IST the backend fetches the authenticated account summary and persists an estimated net
+balance. This runs independently of the mobile app, so the snapshot is still captured when the app
+is closed or its screen is off. During Upstox's nightly funds-maintenance window,
+`GET /api/main/summary` serves the latest snapshot (up to seven days old) instead of returning
+unhelpful zero balances. The file defaults to `/data/account_snapshot.json`, which is covered by
+the Docker volume; set `ACCOUNT_SNAPSHOT_PATH` to override it.
+
 ## Development
 Create a virtualenv and install dependencies:
 

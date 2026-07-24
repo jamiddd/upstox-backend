@@ -42,6 +42,7 @@ from app.services.order_history_service import OrderHistoryService
 from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
 from app.services.pending_oco_pairs_store import PendingOcoPairsStore
+from app.services.account_snapshot_store import AccountSnapshotStore
 from app.services.oi_analysis_service import OIAnalysisService
 from app.services.oi_snapshot_store import OISnapshotStore, SnapshotNotFoundError
 from app.services.search_screen_service import SearchScreenService
@@ -386,11 +387,12 @@ async def main_bootstrap(
     expiry_date: Optional[str] = None,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
     """Return screen-ready initial data for the option trading main screen."""
     access_token = _load_access_token(token_store)
     try:
-        return await MainScreenService(service).bootstrap(
+        return await MainScreenService(service, AccountSnapshotStore(settings)).bootstrap(
             access_token,
             underlying_key=underlying_key,
             expiry_date=expiry_date,
@@ -464,11 +466,12 @@ async def main_position_quotes(
 async def main_summary(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
     """Return opening balance, current P&L, and closing balance."""
     access_token = _load_access_token(token_store)
     try:
-        return await MainScreenService(service).summary(access_token)
+        return await MainScreenService(service, AccountSnapshotStore(settings)).summary(access_token)
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

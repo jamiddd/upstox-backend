@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from time import monotonic
 from typing import Any, Optional
 
 from app.core.exceptions import UpstoxApiError
 from app.services.upstox_service import UpstoxService
+from app.services.account_snapshot_store import AccountSnapshotStore
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +30,13 @@ _CACHE: dict[tuple[Any, ...], _CacheEntry] = {}
 class MainScreenService:
     """Build screen-ready payloads for the option trading main screen."""
 
-    def __init__(self, upstox_service: UpstoxService) -> None:
+    def __init__(
+        self,
+        upstox_service: UpstoxService,
+        account_snapshot_store: AccountSnapshotStore | None = None,
+    ) -> None:
         self.upstox = upstox_service
+        self.account_snapshot_store = account_snapshot_store
 
     async def bootstrap(
         self,
@@ -291,7 +298,9 @@ class MainScreenService:
         all the way up as a 423. Now only the funds-derived fields degrade (to 0, with
         `funds_unavailable_note` explaining why) -- the rest of the screen still loads.
         """
-        cache_key = ("summary",)
+        # Snapshot-aware responses must not reuse the scheduler's raw broker-summary cache:
+        # after 23:00 the former may deliberately substitute the persisted estimate.
+        cache_key = ("summary", self.account_snapshot_store is not None)
         cached = _cache_get(cache_key)
         if cached is not None:
             return cached
@@ -324,6 +333,31 @@ class MainScreenService:
             "payin_amount": payin_amount,
             "funds_unavailable_note": funds_unavailable_note,
         }
+        snapshot = self.account_snapshot_store.load() if self.account_snapshot_store else None
+        if snapshot is not None:
+            now = datetime.now(ZoneInfo("Asia/Kolkata"))
+            try:
+                captured = datetime.fromisoformat(snapshot.captured_at)
+                if captured.tzinfo is None:
+                    captured = captured.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+                age = now.date() - captured.astimezone(ZoneInfo("Asia/Kolkata")).date()
+                fresh = 0 <= age.days <= 7
+                after_capture_today = age.days == 0 and now.hour >= 23
+                if fresh and (funds_unavailable_note is not None or after_capture_today):
+                    estimate = snapshot.estimated_balance
+                    summary = {
+                        "opening_balance": estimate,
+                        "profit_loss": 0.0,
+                        "closing_balance": estimate,
+                        "available_margin": estimate,
+                        "margin_used": 0.0,
+                        "payin_amount": 0.0,
+                        "funds_unavailable_note": None,
+                        "is_overnight_estimate": True,
+                        "overnight_estimate_captured_at": snapshot.captured_at,
+                    }
+            except (TypeError, ValueError):
+                pass
         _cache_set(cache_key, summary, ttl_seconds=5.0)
         return summary
 

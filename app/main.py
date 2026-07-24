@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from app.api.routes import router as api_router
 from app.core.config import get_settings
 from app.services.oco_watcher import run_oco_watcher
+from app.services.account_snapshot_scheduler import run_account_snapshot_scheduler
 from app.services.oi_snapshot_collector import run_oi_snapshot_collector
 from app.services.tracked_instruments_poller import run_tracked_instruments_poller
 
@@ -29,18 +30,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # above.
     oco_watcher_task = asyncio.create_task(run_oco_watcher(settings))
     oi_collector_task = asyncio.create_task(run_oi_snapshot_collector(settings))
+    account_snapshot_task = asyncio.create_task(run_account_snapshot_scheduler(settings))
     try:
         yield
     finally:
         poller_task.cancel()
         oco_watcher_task.cancel()
         oi_collector_task.cancel()
+        account_snapshot_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await poller_task
         with contextlib.suppress(asyncio.CancelledError):
             await oco_watcher_task
         with contextlib.suppress(asyncio.CancelledError):
             await oi_collector_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await account_snapshot_task
 
 
 app = FastAPI(title="Upstox Scalper Backend", version="0.1.0", lifespan=_lifespan)
