@@ -38,6 +38,7 @@ class UpstoxPortfolioFeedClient:
         upstox: UpstoxService,
         token_store: EncryptedTokenStore,
         on_order_update: Callable[[dict[str, Any]], None],
+        on_state_change: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._upstox = upstox
         self._token_store = token_store
@@ -46,6 +47,7 @@ class UpstoxPortfolioFeedClient:
             name="UpstoxPortfolioFeedClient",
             authorize=self._authorize,
             on_message=self._on_message,
+            on_state_change=on_state_change,
         )
 
     def start(self) -> None:

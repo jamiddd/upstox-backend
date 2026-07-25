@@ -11,6 +11,7 @@ from starlette.websockets import WebSocketState
 from app.core.config import Settings
 from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequiredError
 from app.services.feed_subscription_manager import FeedSubscriptionManager
+from app.services.notification_service import NotificationService
 from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.token_store import EncryptedTokenStore
@@ -27,6 +28,10 @@ logger = logging.getLogger(__name__)
 # computation) is a separate, larger piece of work, deliberately deferred.
 SIGNALS_PUSH_INTERVAL_SECONDS = 60.0
 
+# How many consecutive signals-push failures in a row before this is worth surfacing as a
+# notification -- a single blip (e.g. one slow Upstox response) isn't actionable.
+_SIGNALS_FAILURE_NOTIFY_THRESHOLD = 3
+
 
 class ClientSession:
     """One connected app session's own subscription/viewing state -- a session id is just the
@@ -42,6 +47,8 @@ class ClientSession:
         self.expiry_date: Optional[str] = None
         self.underlying_symbol: Optional[str] = None
         self.signals_task: Optional[asyncio.Task[None]] = None
+        self.consecutive_signal_failures = 0
+        self.signals_failure_notified = False
 
     async def send(self, message: dict[str, Any]) -> None:
         if self.websocket.application_state != WebSocketState.CONNECTED:
@@ -62,9 +69,16 @@ class StreamConnectionManager:
     connection must keep serving every still-connected session's needs, not just the newest).
     """
 
-    def __init__(self, *, settings: Settings, subscription_manager: FeedSubscriptionManager) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        subscription_manager: FeedSubscriptionManager,
+        notification_service: Optional[NotificationService] = None,
+    ) -> None:
         self._settings = settings
         self._subscription_manager = subscription_manager
+        self._notification_service = notification_service
         self._sessions: dict[str, ClientSession] = {}
 
     async def connect(self, websocket: WebSocket) -> ClientSession:
@@ -157,7 +171,25 @@ class StreamConnectionManager:
             logger.warning(
                 "Signals computation failed for session %s", session.session_id, exc_info=True,
             )
+            session.consecutive_signal_failures += 1
+            if (
+                session.consecutive_signal_failures >= _SIGNALS_FAILURE_NOTIFY_THRESHOLD
+                and not session.signals_failure_notified
+                and self._notification_service is not None
+            ):
+                session.signals_failure_notified = True
+                await self._notification_service.record(
+                    category="system",
+                    severity="warning",
+                    title="Signals computation repeatedly failing",
+                    message=(
+                        f"Underlying signals have failed {session.consecutive_signal_failures} "
+                        "times in a row for a connected session."
+                    ),
+                )
             return
+        session.consecutive_signal_failures = 0
+        session.signals_failure_notified = False
         await session.send({"type": "signals", "data": payload})
 
     async def dispatch_tick(self, tick: FeedTick) -> None:
@@ -195,3 +227,10 @@ class StreamConnectionManager:
         # session's lifetime, not just while a chart happened to be open).
         for session in list(self._sessions.values()):
             await session.send({"type": "order_update", "data": payload})
+
+    async def dispatch_notification(self, notification: dict[str, Any]) -> None:
+        # Unfiltered, same reasoning as dispatch_order_update -- every connected session sees
+        # every notification live; the in-app screen's severity/category filters are applied
+        # client-side over the full set, not by asking the backend to only push some of them.
+        for session in list(self._sessions.values()):
+            await session.send({"type": "notification", "data": notification})

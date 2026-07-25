@@ -138,6 +138,7 @@ class UpstoxMarketFeedClient:
         upstox: UpstoxService,
         token_store: EncryptedTokenStore,
         on_tick: Callable[[FeedTick], None],
+        on_state_change: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._upstox = upstox
         self._token_store = token_store
@@ -149,6 +150,7 @@ class UpstoxMarketFeedClient:
             authorize=self._authorize,
             on_message=self._on_message,
             desired_subscriptions=self._desired_subscription_messages,
+            on_state_change=on_state_change,
         )
 
     def start(self) -> None:

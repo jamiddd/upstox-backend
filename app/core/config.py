@@ -27,6 +27,10 @@ class Settings:
     pending_oco_pairs_path: Path = Path("/data/pending_oco_pairs.json")
     account_snapshot_path: Path = Path("/data/account_snapshot.json")
     oi_database_path: Path = Path("/data/oi_snapshots.sqlite3")
+    notification_database_path: Path = Path("/data/notifications.sqlite3")
+    device_token_path: Path = Path("/data/device_token.json")
+    notification_retention_days: int = 90
+    firebase_service_account_path: Path = Path("/data/firebase_service_account.json")
     upstox_api_base_url: str = "https://api.upstox.com/v2"
     upstox_api_v3_base_url: str = "https://api.upstox.com/v3"
     # Place Order V3 is only documented on this separate low-latency host, not api.upstox.com --
@@ -67,6 +71,18 @@ class Settings:
             ),
             oi_database_path=Path(
                 os.getenv("OI_DATABASE_PATH", "/data/oi_snapshots.sqlite3"),
+            ),
+            notification_database_path=Path(
+                os.getenv("NOTIFICATION_DATABASE_PATH", "/data/notifications.sqlite3"),
+            ),
+            device_token_path=Path(
+                os.getenv("DEVICE_TOKEN_PATH", "/data/device_token.json"),
+            ),
+            notification_retention_days=max(
+                1, int(os.getenv("NOTIFICATION_RETENTION_DAYS", "90")),
+            ),
+            firebase_service_account_path=Path(
+                os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "/data/firebase_service_account.json"),
             ),
             upstox_api_base_url=os.getenv("UPSTOX_API_BASE_URL", "https://api.upstox.com/v2"),
             upstox_api_v3_base_url=os.getenv(

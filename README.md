@@ -44,6 +44,14 @@ is closed or its screen is off. During Upstox's nightly funds-maintenance window
 unhelpful zero balances. The file defaults to `/data/account_snapshot.json`, which is covered by
 the Docker volume; set `ACCOUNT_SNAPSHOT_PATH` to override it.
 
+## Notifications
+
+Backend-generated auth, order, risk, feed, account, market, and system events are retained in
+`/data/notifications.sqlite3` and exposed through the authenticated `/api/notifications`
+endpoints. Unread state is durable and new records are also delivered over `/api/stream`.
+Rows older than 90 days are removed by a daily background cleanup; set
+`NOTIFICATION_DATABASE_PATH` or `NOTIFICATION_RETENTION_DAYS` to override those defaults.
+
 ## Development
 Create a virtualenv and install dependencies:
 

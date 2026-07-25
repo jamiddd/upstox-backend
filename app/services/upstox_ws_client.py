@@ -52,11 +52,18 @@ class UpstoxWebSocketClient:
         authorize: Callable[[], Awaitable[str]],
         on_message: Callable[[Any], None],
         desired_subscriptions: Optional[Callable[[], list[dict[str, Any]]]] = None,
+        on_state_change: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._name = name
         self._authorize = authorize
         self._on_message = on_message
         self._desired_subscriptions = desired_subscriptions or (lambda: [])
+        # One of "connected" / "disconnected" / "auth_pending" -- lets a caller (e.g. a
+        # notification on repeated feed instability) observe this connection's health without
+        # polling the `connected` property itself. Best-effort: exceptions from the callback are
+        # not caught here deliberately, same as `on_message`, since a broken callback is a bug the
+        # caller should see rather than one this class should paper over.
+        self._on_state_change = on_state_change or (lambda state: None)
         self._generation = 0
         self._connection: Any = None
         self._task: Optional[asyncio.Task[None]] = None
@@ -121,6 +128,7 @@ class UpstoxWebSocketClient:
                 auth_pending = False
             if self._stopped:
                 return
+            self._on_state_change("auth_pending" if auth_pending else "disconnected")
             delay = _AUTH_PENDING_RETRY_SECONDS if auth_pending else _RECONNECT_DELAY_SECONDS
             await asyncio.sleep(delay)
 
@@ -147,6 +155,7 @@ class UpstoxWebSocketClient:
                     return False
                 self._connection = connection
                 logger.info("%s: connected", self._name)
+                self._on_state_change("connected")
 
                 for message in self._desired_subscriptions():
                     await self.send_json(message)

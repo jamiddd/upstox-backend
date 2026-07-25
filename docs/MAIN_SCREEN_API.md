@@ -733,6 +733,83 @@ underlying-signals candle-derived values (EMAs/ATR/opening range/pivots): ~60 se
 
 For millisecond-level flashing values, the next backend step should be a market data WebSocket bridge or authorization endpoint.
 
+## Notifications
+
+All routes below require the normal `X-API-Key` header.
+
+```http
+GET /api/notifications?severity=critical&category=risk&unread_only=true&page_number=1&page_size=20
+```
+
+Every filter is optional. `severity` is `info`, `warning`, or `critical`; `category` is one of
+`auth`, `orders`, `risk`, `feed`, `account`, `system`, or `market`. Results are newest-first:
+
+```json
+{
+  "notifications": [{
+    "id": 42,
+    "category": "risk",
+    "severity": "critical",
+    "title": "Position exit failed",
+    "message": "One position could not be exited after all retries.",
+    "details": {"failed_instrument_keys": ["NSE_FO|111"]},
+    "created_at": "2026-07-25T09:03:16+00:00",
+    "read_at": null
+  }],
+  "page": {
+    "page_number": 1,
+    "page_size": 20,
+    "total_records": 1,
+    "total_pages": 1
+  },
+  "unread_count": 1
+}
+```
+
+Mark one or every notification read:
+
+```http
+POST /api/notifications/42/read
+POST /api/notifications/read-all
+```
+
+Register or update the single device used for future push delivery:
+
+```http
+POST /api/notifications/register-device
+Content-Type: application/json
+
+{"fcm_token": "<token-or-null>", "push_preference": "critical"}
+```
+
+`push_preference` is `off`, `critical`, or `everything`. Firebase delivery remains a separate,
+optional deployment capability; durable in-app storage and live stream delivery work without it.
+Notifications are retained for 90 days by default (`NOTIFICATION_RETENTION_DAYS`).
+
+### Firebase push delivery
+
+Set `FIREBASE_SERVICE_ACCOUNT_PATH` to a Firebase service-account JSON file to enable push; if
+unset (or the file doesn't exist), push is silently disabled and every other notification path
+above still works unchanged.
+
+Every push is a **data-only** FCM message -- there is no `notification` payload, so Firebase never
+renders anything on its own. The app builds its own system-tray notification (severity-appropriate
+channel, deep link back into the Notifications screen) from these string data fields:
+
+```json
+{
+  "title": "Position exit failed",
+  "body": "One position could not be exited after all retries.",
+  "notification_id": "42",
+  "category": "risk"
+}
+```
+
+A device only receives a push if its registered `push_preference` (see
+`POST /api/notifications/register-device` above) includes that notification's severity: `off`
+pushes nothing, `critical` only `critical`-severity notifications, `everything` all three
+severities.
+
 ## Live Data Stream
 
 The app no longer connects to Upstox directly. The backend owns two persistent Upstox WebSocket
@@ -800,6 +877,9 @@ against the right one:
 - `order_update` -- something in today's order book changed. The payload is Upstox's own portfolio-
   feed event shape (not yet fully verified against live Upstox docs -- treat it as a "something
   changed, go refresh" signal rather than a fully trusted schema).
+- `notification` -- a newly persisted notification, with the same object shape used in the
+  `notifications` array above. Unlike `order_update`, clients should decode and use this payload
+  directly for live unread badges and in-app presentation.
 
 When the selected strike changes, send a new `subscribe` replacing the full-mode set. When
 positions open or close, update the `ltpc` set the same way.

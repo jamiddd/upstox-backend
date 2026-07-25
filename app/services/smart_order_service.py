@@ -448,7 +448,7 @@ class SmartOrderService:
         *,
         instrument_keys: set[Optional[str]],
         pending_oco_store: PendingOcoPairsStore,
-    ) -> None:
+    ) -> dict[str, list[str]]:
         """Cancels whichever plain (non-GTT) stoploss orders -- see [PendingExit]/attach_gtt_exits
         -- are still resting for [instrument_keys], before a fresh opposite-side order is about to
         be submitted against the same instrument(s). Only the plain-order mechanism is handled: a
@@ -463,6 +463,12 @@ class SmartOrderService:
 
         A cancelled stoploss's own paired pending target is cleaned up server-side by
         `oco_watcher` on its own next tick, nothing to do here beyond the cancel itself.
+
+        Returns `{"cancelled": [order_id, ...], "failed": [order_id, ...]}` so a caller (the
+        standalone route) can tell the user when a still-live stoploss couldn't actually be
+        cancelled -- this used to be entirely silent (`cancelled_any: bool` didn't survive past
+        this function), which meant a manual close could proceed while a stale stoploss was still
+        resting behind it with no way for the app to know.
         """
         pending_exits = [
             pending_exit
@@ -470,34 +476,37 @@ class SmartOrderService:
             if pending_exit.instrument_key in instrument_keys
         ]
         if not pending_exits:
-            return
+            return {"cancelled": [], "failed": []}
 
         try:
             order_book_payload = await self.upstox.get_order_book(access_token)
         except UpstoxApiError:
             # Protective-order cleanup is best-effort. A temporary order-book failure must not
             # prevent the emergency market exit itself from being attempted.
-            return
+            return {"cancelled": [], "failed": [pending_exit.stoploss_order_id for pending_exit in pending_exits]}
         orders_by_id = index_orders_by_id(order_book_payload)
 
-        cancelled_any = False
+        cancelled: list[str] = []
+        failed: list[str] = []
         for pending_exit in pending_exits:
             stoploss_order = orders_by_id.get(pending_exit.stoploss_order_id)
             if stoploss_order is None or order_status(stoploss_order) in TERMINAL_ORDER_STATUSES:
                 continue
             try:
                 await self.upstox.cancel_order(access_token, pending_exit.stoploss_order_id)
-                cancelled_any = True
+                cancelled.append(pending_exit.stoploss_order_id)
             except UpstoxApiError:
-                continue
+                failed.append(pending_exit.stoploss_order_id)
 
-        if cancelled_any:
+        if cancelled:
             # Gives Upstox a moment to actually release the quantity/margin the cancelled
             # order(s) were holding before the order that follows (a flattening market order, or
             # the app's own fresh smart-bracket close order) asks for it -- without this, a
             # cancel-then-immediately-place sequence can still race and hit the same rejection the
             # cancel was meant to prevent.
             await asyncio.sleep(_EXIT_ORDER_CANCEL_SETTLE_SECONDS)
+
+        return {"cancelled": cancelled, "failed": failed}
 
 
 # How long to wait after cancelling a resting stoploss order before submitting whatever order

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.api.dependencies import (
     get_candle_cache_store,
+    get_notification_service,
     get_oi_snapshot_store,
     get_signal_snapshot_store,
     get_token_store,
@@ -29,6 +30,20 @@ from app.services.oi_snapshot_store import OiStrikeDiff, OiStrikesDiff, Snapshot
 from app.services import search_screen_service
 from app.services.search_screen_service import _SEARCH_CACHE
 from app.services import underlying_signals_service
+
+
+class FakeNotificationService:
+    """Stands in for `NotificationService` -- the real one tries to create
+    Settings.notification_database_path's parent directory, which doesn't exist in this sandbox
+    (same reasoning as get_signal_snapshot_store/get_oi_snapshot_store's own overrides below).
+    Records every call so a test can assert on what would have been notified."""
+
+    def __init__(self) -> None:
+        self.recorded: list[dict[str, Any]] = []
+
+    async def record(self, **kwargs: Any) -> dict[str, Any]:
+        self.recorded.append(kwargs)
+        return {"id": len(self.recorded), **kwargs}
 
 
 class FakeTokenStore:
@@ -870,6 +885,7 @@ def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     # create Settings.oi_database_path's parent directory, which doesn't exist in this sandbox.
     app.dependency_overrides[get_oi_snapshot_store] = lambda: None
     app.dependency_overrides[get_candle_cache_store] = lambda: None
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     return TestClient(app)
 
 
@@ -1712,6 +1728,7 @@ def test_main_underlying_signals_flags_no_trade_zone_near_days_open() -> None:
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _NearDayOpenFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     app.dependency_overrides[get_signal_snapshot_store] = lambda: None
     app.dependency_overrides[get_oi_snapshot_store] = lambda: None
     _CACHE.clear()
@@ -2115,6 +2132,7 @@ def test_search_underlyings_empty_query_merges_in_a_live_looked_up_sensex_entry(
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _SensexFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     _SEARCH_CACHE.clear()
     search_screen_service._SENSEX_ENTRY_CACHE = None
     client = TestClient(app)
@@ -2156,6 +2174,7 @@ def test_search_underlyings_empty_query_omits_sensex_when_lookup_fails() -> None
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _FailingSearchFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     _SEARCH_CACHE.clear()
     search_screen_service._SENSEX_ENTRY_CACHE = None
     client = TestClient(app)
@@ -2759,6 +2778,7 @@ def test_exit_all_positions_flattens_every_open_position() -> None:
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
@@ -2783,6 +2803,7 @@ def test_exit_positions_closes_every_open_position_when_unfiltered() -> None:
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post(
@@ -2807,6 +2828,7 @@ def test_exit_positions_closes_only_the_requested_subset() -> None:
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post(
@@ -2877,6 +2899,7 @@ def test_exit_positions_cancels_resting_stoploss_before_flattening(tmp_path: Pat
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_upstox_service] = lambda: fake_service
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
@@ -2890,6 +2913,28 @@ def test_exit_positions_cancels_resting_stoploss_before_flattening(tmp_path: Pat
         "NSE_FO|111": "success",
         "NSE_FO|222": "error",
     }
+
+
+def test_exit_all_positions_notifies_when_a_position_fails_to_flatten() -> None:
+    """A risk/critical notification is recorded when SmartOrderService.exit_positions returns any
+    position with status="error" -- covers both "max-loss result had failures" and "exit retries
+    exhausted", which are the same observable outcome from this route's own perspective."""
+    _set_exit_positions_instrument_rules_cache()
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    notification_service = FakeNotificationService()
+    app.dependency_overrides[get_notification_service] = lambda: notification_service
+    client = TestClient(app)
+    try:
+        response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert len(notification_service.recorded) == 1
+    assert notification_service.recorded[0]["category"] == "risk"
+    assert notification_service.recorded[0]["severity"] == "critical"
 
 
 def test_exit_positions_does_not_cancel_a_stoploss_on_an_untouched_instrument(tmp_path: Path) -> None:
@@ -2915,6 +2960,7 @@ def test_exit_positions_does_not_cancel_a_stoploss_on_an_untouched_instrument(tm
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_upstox_service] = lambda: fake_service
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post(
@@ -2978,6 +3024,7 @@ def test_cancel_resting_exit_cancels_the_registered_stoploss(tmp_path: Path) -> 
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_upstox_service] = lambda: fake_service
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post(
@@ -3004,6 +3051,7 @@ def test_cancel_resting_exit_is_a_noop_when_nothing_is_pending(tmp_path: Path) -
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_upstox_service] = lambda: fake_service
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post(
@@ -3071,6 +3119,7 @@ def test_exit_positions_slices_a_position_over_freeze_quantity() -> None:
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = lambda: fake_service
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
@@ -3093,6 +3142,7 @@ def test_exit_positions_retries_remaining_quantity_when_a_slice_fails_partway() 
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = lambda: fake_service
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
@@ -3115,6 +3165,7 @@ def test_exit_positions_reports_error_after_retry_limit() -> None:
     app.dependency_overrides[get_settings] = _settings
     app.dependency_overrides[get_upstox_service] = lambda: fake_service
     app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
     client = TestClient(app)
     try:
         response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})

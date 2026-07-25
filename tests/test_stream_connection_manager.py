@@ -9,11 +9,14 @@ import pytest
 from starlette.websockets import WebSocketState
 
 from app.core.config import Settings
+from app.core.exceptions import UpstoxApiError
+from app.services import stream_connection_manager as stream_connection_manager_module
 from app.services.stream_connection_manager import StreamConnectionManager
 from app.services.upstox_market_feed_client import FeedCandle, FeedTick
 
 
-def _settings() -> Settings:
+def _settings(tmp_path: Path | None = None) -> Settings:
+    base = tmp_path or Path("/tmp")
     return Settings(
         upstox_api_key="api-key",
         upstox_api_secret="api-secret",
@@ -21,7 +24,8 @@ def _settings() -> Settings:
         upstox_environment="sandbox",
         mobile_api_key="mobile-secret",
         token_encryption_key="",
-        token_store_path=Path("/tmp/stream_test_token.enc"),
+        token_store_path=base / "stream_test_token.enc",
+        oi_database_path=base / "oi.sqlite3",
     )
 
 
@@ -171,6 +175,76 @@ async def test_dispatch_order_update_reaches_every_connected_session() -> None:
 
     assert a.sent == [{"type": "order_update", "data": {"order_id": "O1", "status": "complete"}}]
     assert b.sent == a.sent
+
+
+@pytest.mark.anyio
+async def test_dispatch_notification_reaches_every_connected_session() -> None:
+    manager, _ = _manager()
+    a = _FakeWebSocket()
+    b = _FakeWebSocket()
+    await manager.connect(a)  # type: ignore[arg-type]
+    await manager.connect(b)  # type: ignore[arg-type]
+    notification = {"id": 1, "category": "auth", "severity": "critical", "title": "t", "message": "m"}
+
+    await manager.dispatch_notification(notification)
+
+    assert a.sent == [{"type": "notification", "data": notification}]
+    assert b.sent == a.sent
+
+
+class _FakeTokenStoreWithToken:
+    def __init__(self, settings: Settings) -> None:
+        pass
+
+    def load_access_token(self) -> str:
+        return "token"
+
+
+class _AlwaysFailingSignalsService:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    async def get_signals(self, *args: object, **kwargs: object) -> dict[str, object]:
+        raise UpstoxApiError("boom", status_code=500, upstox_code=None)
+
+
+class _FakeNotificationService:
+    def __init__(self) -> None:
+        self.recorded: list[dict[str, object]] = []
+
+    async def record(self, **kwargs: object) -> dict[str, object]:
+        self.recorded.append(kwargs)
+        return {"id": len(self.recorded), **kwargs}
+
+
+@pytest.mark.anyio
+async def test_push_signals_once_notifies_after_threshold_consecutive_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stream_connection_manager_module, "EncryptedTokenStore", _FakeTokenStoreWithToken)
+    monkeypatch.setattr(
+        stream_connection_manager_module, "UnderlyingSignalsService", _AlwaysFailingSignalsService,
+    )
+    notification_service = _FakeNotificationService()
+    fake_sub = _FakeSubscriptionManager()
+    manager = StreamConnectionManager(
+        settings=_settings(tmp_path), subscription_manager=fake_sub, notification_service=notification_service,
+    )
+    websocket = _FakeWebSocket()
+    session = await manager.connect(websocket)  # type: ignore[arg-type]
+    session.underlying_key = "NSE_INDEX|Nifty 50"
+
+    await manager._push_signals_once(session)
+    await manager._push_signals_once(session)
+    assert notification_service.recorded == []
+
+    await manager._push_signals_once(session)
+    assert len(notification_service.recorded) == 1
+    assert notification_service.recorded[0]["severity"] == "warning"
+
+    # Stays silent while still failing -- one notification per failure episode, not one per tick.
+    await manager._push_signals_once(session)
+    assert len(notification_service.recorded) == 1
 
 
 @pytest.mark.anyio

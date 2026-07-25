@@ -12,6 +12,9 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies import (
     get_candle_cache_store,
+    get_device_token_store,
+    get_notification_service,
+    get_notification_store,
     get_oi_snapshot_store,
     get_signal_snapshot_store,
     get_token_store,
@@ -39,7 +42,10 @@ from app.services.instrument_rules_service import (
     validate_price,
     validate_quantity,
 )
+from app.services.device_token_store import DeviceTokenStore
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
+from app.services.notification_service import NotificationService
+from app.services.notification_store import NotificationStore
 from app.services.order_history_service import OrderHistoryService
 from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
@@ -758,6 +764,69 @@ async def order_history(
         raise _upstox_http_error(exc) from exc
 
 
+class RegisterDeviceRequest(BaseModel):
+    fcm_token: Optional[str] = None
+    push_preference: str = Field(pattern="^(off|critical|everything)$")
+
+
+@protected_router.get("/notifications")
+async def list_notifications(
+    category: Optional[str] = None,
+    severity: Optional[str] = Query(default=None, pattern="^(info|warning|critical)$"),
+    unread_only: bool = False,
+    page_number: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    store: NotificationStore = Depends(get_notification_store),
+) -> dict[str, Any]:
+    """Return the paginated, filterable notification log (see `docs/MAIN_SCREEN_API.md`'s
+    Notifications section) -- every backend-generated alert/message the app's Notifications
+    screen shows."""
+    items, page = store.list_notifications(
+        category=category,
+        severity=severity,
+        unread_only=unread_only,
+        page_number=page_number,
+        page_size=page_size,
+    )
+    return {
+        "notifications": items,
+        "page": page,
+        "unread_count": store.unread_count(),
+    }
+
+
+@protected_router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: int,
+    store: NotificationStore = Depends(get_notification_store),
+) -> dict[str, Any]:
+    """Marks one notification read. Idempotent -- marking an already-read (or nonexistent)
+    notification read again just reports `updated: false`, not an error."""
+    updated = store.mark_read(notification_id)
+    return {"updated": updated, "unread_count": store.unread_count()}
+
+
+@protected_router.post("/notifications/read-all")
+async def mark_all_notifications_read(
+    store: NotificationStore = Depends(get_notification_store),
+) -> dict[str, Any]:
+    updated = store.mark_all_read()
+    return {"updated": updated, "unread_count": store.unread_count()}
+
+
+@protected_router.post("/notifications/register-device")
+async def register_device(
+    body: RegisterDeviceRequest,
+    device_token_store: DeviceTokenStore = Depends(get_device_token_store),
+) -> dict[str, Any]:
+    """Registers this device's FCM push token and push-severity preference -- called on app
+    start, on FCM token refresh, and whenever the user changes the preference in Settings. Always
+    sends both together (see `DeviceTokenStore.save`'s own doc comment for why this always
+    overwrites rather than merging)."""
+    device_token_store.save(fcm_token=body.fcm_token, push_preference=body.push_preference)
+    return {"status": "success"}
+
+
 @protected_router.post("/orders/smart-bracket")
 async def place_smart_bracket_order(
     order: SmartBracketOrderRequest,
@@ -867,6 +936,7 @@ async def attach_gtt_exits(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
+    notification_service: NotificationService = Depends(get_notification_service),
 ) -> dict[str, Any]:
     """Attaches a target/stoploss to a position with no existing GTT bracket. See
     SmartOrderService.attach_gtt_exits.
@@ -878,7 +948,7 @@ async def attach_gtt_exits(
         validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
         validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
         slice_quantity = order.slice_quantity or slice_quantity_for_freeze(order.quantity, rules)
-        return await SmartOrderService(service).attach_gtt_exits(
+        result = await SmartOrderService(service).attach_gtt_exits(
             access_token,
             instrument_key=order.instrument_key,
             quantity=order.quantity,
@@ -893,6 +963,15 @@ async def attach_gtt_exits(
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
+    if result.get("status") in ("partial_success", "error"):
+        await notification_service.record(
+            category="risk",
+            severity="critical",
+            title="GTT exit protection incomplete",
+            message=f"Attaching target/stoploss for {order.instrument_key} ended with status '{result.get('status')}'.",
+            details={"instrument_key": order.instrument_key, "slices": result.get("slices")},
+        )
+    return result
 
 
 @protected_router.post("/orders/exit-all")
@@ -900,19 +979,22 @@ async def exit_all_positions(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
+    notification_service: NotificationService = Depends(get_notification_service),
 ) -> dict[str, Any]:
     """Flattens every currently open position with an immediate market order -- backs the app's
     max-loss auto square-off. See SmartOrderService.exit_all_positions.
     """
     access_token = _load_access_token(token_store)
     try:
-        return await SmartOrderService(service).exit_all_positions(
+        result = await SmartOrderService(service).exit_all_positions(
             access_token,
             instrument_rules_service=InstrumentRulesService(settings),
             pending_oco_store=PendingOcoPairsStore(settings),
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
+    await _notify_if_exit_had_failures(notification_service, result)
+    return result
 
 
 @protected_router.post("/orders/exit-positions")
@@ -921,6 +1003,7 @@ async def exit_positions(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
+    notification_service: NotificationService = Depends(get_notification_service),
 ) -> dict[str, Any]:
     """Flattens open positions with an immediate market order, optionally scoped to
     [ExitPositionsRequest.instrument_keys] (e.g. "close only profitable positions", computed
@@ -928,7 +1011,7 @@ async def exit_positions(
     """
     access_token = _load_access_token(token_store)
     try:
-        return await SmartOrderService(service).exit_positions(
+        result = await SmartOrderService(service).exit_positions(
             access_token,
             instrument_keys=request.instrument_keys,
             instrument_rules_service=InstrumentRulesService(settings),
@@ -936,6 +1019,27 @@ async def exit_positions(
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
+    await _notify_if_exit_had_failures(notification_service, result)
+    return result
+
+
+async def _notify_if_exit_had_failures(
+    notification_service: NotificationService, result: dict[str, Any],
+) -> None:
+    """Records a `risk`-category notification when any position failed to flatten after
+    SmartOrderService.exit_positions's own retry loop gave up -- covers both the "max-loss result
+    had failures" and "exit retries exhausted" scenarios in one message, since a result reaching
+    here with status="error" for a position *is* exactly a retry-exhausted outcome."""
+    failed = [item for item in result.get("results", []) if item.get("status") == "error"]
+    if not failed:
+        return
+    await notification_service.record(
+        category="risk",
+        severity="critical",
+        title="Position exit failed",
+        message=f"{len(failed)} of {result.get('positions_found', len(failed))} position(s) could not be flattened.",
+        details={"positions_found": result.get("positions_found"), "results": result.get("results")},
+    )
 
 
 @protected_router.put("/orders/modify")
@@ -969,6 +1073,7 @@ async def cancel_resting_exit(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
+    notification_service: NotificationService = Depends(get_notification_service),
 ) -> dict[str, Any]:
     """Best-effort cancels a still-resting plain (non-GTT) stoploss order -- see
     SmartOrderService.cancel_resting_stoploss_orders -- for one instrument, before the app submits
@@ -982,11 +1087,19 @@ async def cancel_resting_exit(
     """
     access_token = _load_access_token(token_store)
     try:
-        await SmartOrderService(service).cancel_resting_stoploss_orders(
+        result = await SmartOrderService(service).cancel_resting_stoploss_orders(
             access_token,
             instrument_keys={request.instrument_key},
             pending_oco_store=PendingOcoPairsStore(settings),
         )
+        if result["failed"]:
+            await notification_service.record(
+                category="risk",
+                severity="critical",
+                title="Resting stoploss could not be cancelled",
+                message=f"{len(result['failed'])} stoploss order(s) for {request.instrument_key} could not be cancelled before this exit.",
+                details={"instrument_key": request.instrument_key, "failed_order_ids": result["failed"]},
+            )
     except UpstoxApiError:
         pass
     return {"status": "success"}
