@@ -827,6 +827,21 @@ async def register_device(
     return {"status": "success"}
 
 
+@protected_router.post("/notifications/test")
+async def send_test_notification(
+    notification_service: NotificationService = Depends(get_notification_service),
+) -> dict[str, Any]:
+    """Records a throwaway `system`/`info` notification through the exact same path as every
+    real one -- store + stream dispatch + FCM push if a device is registered -- so the FCM
+    wiring can be verified end-to-end without waiting for a real event to trigger it."""
+    return await notification_service.record(
+        category="system",
+        severity="info",
+        title="Test notification",
+        message="This is a test notification.",
+    )
+
+
 @protected_router.post("/orders/smart-bracket")
 async def place_smart_bracket_order(
     order: SmartBracketOrderRequest,
