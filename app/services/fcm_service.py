@@ -58,9 +58,12 @@ class FcmService:
         if self._app is None:
             return
         message = messaging.Message(
-            # `fid`, not the deprecated `token` kwarg -- same meaning, just firebase-admin's newer
-            # name for a single device's registration id.
-            fid=token,
+            # `Message.fid` is a distinct addressing scheme (Firebase Installations), not an
+            # alias for a classic FirebaseMessaging.getToken() registration token -- passing our
+            # token there made every send fail as UnregisteredError regardless of how fresh the
+            # token was. `token` is deprecated in this SDK version but is still the correct field
+            # for this token type.
+            token=token,
             data={"title": title, "body": body, **data},
         )
         await asyncio.to_thread(messaging.send, message, app=self._app)

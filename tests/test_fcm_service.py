@@ -82,7 +82,7 @@ async def test_send_builds_expected_message(tmp_path: Path, monkeypatch: pytest.
     )
 
     message = captured["message"]
-    assert message.fid == "device-token"
+    assert message.token == "device-token"
     assert message.data == {
         "title": "Order filled",
         "body": "Order for NIFTY completed.",
