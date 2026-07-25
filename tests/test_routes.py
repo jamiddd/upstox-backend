@@ -10,6 +10,7 @@ import anyio
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import (
+    get_candle_cache_store,
     get_oi_snapshot_store,
     get_signal_snapshot_store,
     get_token_store,
@@ -868,6 +869,7 @@ def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     # delta lookup, see UnderlyingSignalsService._oi_analysis), and the real dependency tries to
     # create Settings.oi_database_path's parent directory, which doesn't exist in this sandbox.
     app.dependency_overrides[get_oi_snapshot_store] = lambda: None
+    app.dependency_overrides[get_candle_cache_store] = lambda: None
     return TestClient(app)
 
 
@@ -3024,6 +3026,8 @@ class _LargePositionFakeUpstoxService(FakeUpstoxService):
     def __init__(self) -> None:
         self.place_market_order_calls: list[dict[str, Any]] = []
         self.fail_on_call_number: Optional[int] = None
+        self.fail_every_call = False
+        self.remaining_quantity = 3750
 
     async def get_positions(self, access_token: str) -> dict[str, Any]:
         return {
@@ -3032,7 +3036,7 @@ class _LargePositionFakeUpstoxService(FakeUpstoxService):
                 {
                     "instrument_token": "NSE_FO|111",
                     "trading_symbol": "NIFTY26JUL25000CE",
-                    "quantity": 3750,
+                    "quantity": self.remaining_quantity,
                     "product": "I",
                     "average_price": 120.0,
                     "last_price": 125.0,
@@ -3051,10 +3055,11 @@ class _LargePositionFakeUpstoxService(FakeUpstoxService):
         product: str,
     ) -> dict[str, Any]:
         self.place_market_order_calls.append({"instrument_key": instrument_key, "quantity": quantity})
-        if self.fail_on_call_number == len(self.place_market_order_calls):
+        if self.fail_every_call or self.fail_on_call_number == len(self.place_market_order_calls):
             from app.core.exceptions import UpstoxApiError
 
             raise UpstoxApiError("Order rejected", status_code=400, upstox_code="UDAPI100041")
+        self.remaining_quantity -= quantity
         return {"status": "success", "data": {"order_ids": [f"MKT-{instrument_key}"]}}
 
 
@@ -3079,9 +3084,9 @@ def test_exit_positions_slices_a_position_over_freeze_quantity() -> None:
     assert [call["quantity"] for call in fake_service.place_market_order_calls] == [1800, 1800, 150]
 
 
-def test_exit_positions_reports_error_when_a_slice_fails_partway() -> None:
-    """A slice failing partway through a position's flatten is reported as that position's own
-    error -- a half-flattened position isn't actually safe, so it must not read as "success"."""
+def test_exit_positions_retries_remaining_quantity_when_a_slice_fails_partway() -> None:
+    """After one slice succeeds and the next fails, re-fetch the live remaining quantity and
+    retry only that remainder -- never the original quantity, which could reverse the position."""
     _set_exit_positions_instrument_rules_cache()
     fake_service = _LargePositionFakeUpstoxService()
     fake_service.fail_on_call_number = 2
@@ -3096,9 +3101,31 @@ def test_exit_positions_reports_error_when_a_slice_fails_partway() -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["results"][0]["status"] == "error"
-    # The first slice was already submitted before the second one failed.
-    assert len(fake_service.place_market_order_calls) == 2
+    assert payload["results"][0]["status"] == "success"
+    assert payload["results"][0]["attempts"] == 2
+    assert [call["quantity"] for call in fake_service.place_market_order_calls] == [
+        1800, 1800, 1800, 150,
+    ]
+
+
+def test_exit_positions_reports_error_after_retry_limit() -> None:
+    _set_exit_positions_instrument_rules_cache()
+    fake_service = _LargePositionFakeUpstoxService()
+    fake_service.fail_every_call = True
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = lambda: fake_service
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    client = TestClient(app)
+    try:
+        response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["status"] == "error"
+    assert result["attempts"] == 3
+    assert len(fake_service.place_market_order_calls) == 3
 
 
 def test_modify_orders_accepts_more_than_upstream_multi_order_limit() -> None:

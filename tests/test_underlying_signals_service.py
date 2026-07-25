@@ -1337,6 +1337,8 @@ def test_oi_support_resistance_deltas_survive_a_strike_handoff(tmp_path: Path) -
     )
 
     assert result["oi_resistance"]["value"] == 25200.0
+    assert result["oi_resistance"]["call_oi_change_5m"] == 100_000.0
+    assert result["oi_resistance"]["put_oi_change_5m"] == 50_000.0
     resistance_tag = next(tag for tag in result["tags"] if tag.startswith("OI(R)"))
     # 900,000 - 800,000 = +1.0L -- a real delta despite this being the first time 25200 has ever
     # been the resistance strike.

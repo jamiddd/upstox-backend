@@ -452,11 +452,13 @@ looks like this instead (`opening_range.position` `"above"`, LTP right on "OR Ta
   `oi_support` is the strike with the single highest **put** OI *within that window* (heavy put
   writing there reads as a level put writers will defend, i.e. support); `oi_resistance` is the
   strike with the highest **call** OI in the same window (the mirror image). `oi` on each is that
-  strike's own OI count (put OI for `oi_support`, call OI for `oi_resistance`). `null` if there's
-  no usable per-strike data within the window. The corresponding `"OI(S) {strike}"` /
-  `"OI(R) {strike}"` tag additionally tracks the **other** side's OI at that same strike internally
-  (not a separate JSON field) so its 5-minute-change suffix can show both sides at once -- see the
-  `tags` description below.
+  strike's own OI count (put OI for `oi_support`, call OI for `oi_resistance`).
+  `call_oi_change_5m` and `put_oi_change_5m` expose each side's signed five-minute change at that
+  exact strike for the Android OI Levels dashboard tile: positive means OI addition and negative
+  means reduction. These change fields are omitted until an in-band previous snapshot exists.
+  `oi_support`/`oi_resistance` is `null` if there's no usable per-strike data within the window.
+  The corresponding `"OI(S) {strike}"` / `"OI(R) {strike}"` tags show the same changes in compact
+  ticker form -- see the `tags` description below.
 - ATM straddle (no dedicated JSON field -- tag only): when `expiry_date` is given, a
   `"STR(ATM) {value} ({delta})"` tag is appended -- `value` is the sum of the ATM call and ATM
   put's own LTP (the strike closest to underlying LTP, from the same option-chain fetch used for
@@ -795,3 +797,22 @@ For open positions, subscribe to their instrument keys. If only LTP is needed fo
 ```
 
 When the selected strike changes, unsubscribe the previous selected contract and subscribe the new contract in `full` mode. When positions open or close, update the `ltpc` subscriptions accordingly.
+
+## Chart candle freshness and cache
+
+`GET /api/market/candles` merges Upstox historical and intraday data with a persistent SQLite
+last-known candle cache. The tracked-instrument dashboard poller writes its five- and
+fifteen-minute underlying candles to this cache during market hours, without making an additional
+feed connection or API request. This preserves a completed session when Upstox's historical API
+temporarily omits it during overnight maintenance.
+
+The response includes:
+
+- `expected_latest_trading_date`: latest weekday that should have completed data, accounting for
+  weekends and the pre-open period.
+- `latest_candle_date`: newest date actually present after cache/upstream merging.
+- `is_stale`: true when the actual latest date precedes the expected date.
+
+Fresh upstream rows always replace same-timestamp cached rows. Other instruments and intervals
+become cached whenever their chart endpoint is requested; the poller proactively covers only
+tracked underlyings at five and fifteen minutes.

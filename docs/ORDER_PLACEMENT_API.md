@@ -387,6 +387,7 @@ Response:
       "transaction_type": "SELL",
       "quantity": 75,
       "status": "success",
+      "attempts": 1,
       "upstox_response": {}
     }
   ]
@@ -395,10 +396,13 @@ Response:
 
 Each position is closed independently -- one failing doesn't stop the others; check each result's
 own `status`. A position's own flattening order is internally sliced against its instrument's
-`freeze_quantity` (same mechanism as Smart Bracket Order/Attach GTT Exits) -- transparent to this
-response shape (`quantity` is still the position's full amount), but if a slice fails partway
-through, that position's own `status` is `"error"` even if an earlier slice already went
-through, since a half-flattened position isn't actually safe.
+`freeze_quantity` (same mechanism as Smart Bracket Order/Attach GTT Exits).
+
+An exit that returns an error is retried up to three times. Before each retry the backend waits,
+re-fetches broker positions, retries any tracked resting-stop cancellation, and submits only the
+position's remaining live quantity. An accepted first attempt is never blindly duplicated.
+`attempts` reports how many submissions were needed; after the third failed attempt the result
+remains `"error"` for manual intervention.
 
 ## Modify Orders
 

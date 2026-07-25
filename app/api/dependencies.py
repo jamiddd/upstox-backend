@@ -4,6 +4,7 @@ from fastapi import Depends, HTTPException, status
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import TokenStoreError
+from app.services.candle_cache_store import CandleCacheStore
 from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.token_store import EncryptedTokenStore
@@ -36,6 +37,11 @@ def get_signal_snapshot_store(settings: Settings = Depends(get_settings)) -> Sig
 def get_oi_snapshot_store(settings: Settings = Depends(get_settings)) -> OISnapshotStore:
     """Create the SQLite-backed per-strike OI snapshot store for a request."""
     return OISnapshotStore(settings)
+
+
+def get_candle_cache_store(settings: Settings = Depends(get_settings)) -> CandleCacheStore:
+    """Create the persistent completed-candle cache for a chart request."""
+    return CandleCacheStore(settings)
 
 
 def get_upstox_service(settings: Settings = Depends(get_settings)) -> UpstoxService:

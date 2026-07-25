@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from app.core.exceptions import UpstoxApiError
 from app.core.market_hours import is_market_open
+from app.services.candle_cache_store import CandleCacheStore
 from app.services.oi_analysis_service import OIAnalysisService
 from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.signal_snapshot_store import SignalSnapshotStore
@@ -194,10 +195,12 @@ class UnderlyingSignalsService:
         *,
         snapshot_store: SignalSnapshotStore | None = None,
         oi_snapshot_store: OISnapshotStore | None = None,
+        candle_cache_store: CandleCacheStore | None = None,
     ) -> None:
         self.upstox = upstox_service
         self.snapshot_store = snapshot_store
         self.oi_snapshot_store = oi_snapshot_store
+        self.candle_cache_store = candle_cache_store
 
     async def get_signals(
         self,
@@ -408,12 +411,36 @@ class UnderlyingSignalsService:
                 else None
             ),
             "oi_support": (
-                {"value": oi_summary.support_strike, "oi": oi_summary.support_oi}
+                {
+                    "value": oi_summary.support_strike,
+                    "oi": oi_summary.support_oi,
+                    **(
+                        {
+                            "call_oi_change_5m": oi_summary.support_call_oi_delta,
+                            "put_oi_change_5m": oi_summary.support_oi_delta,
+                        }
+                        if oi_summary.support_call_oi_delta is not None
+                        or oi_summary.support_oi_delta is not None
+                        else {}
+                    ),
+                }
                 if oi_summary.support_strike is not None
                 else None
             ),
             "oi_resistance": (
-                {"value": oi_summary.resistance_strike, "oi": oi_summary.resistance_oi}
+                {
+                    "value": oi_summary.resistance_strike,
+                    "oi": oi_summary.resistance_oi,
+                    **(
+                        {
+                            "call_oi_change_5m": oi_summary.resistance_oi_delta,
+                            "put_oi_change_5m": oi_summary.resistance_put_oi_delta,
+                        }
+                        if oi_summary.resistance_oi_delta is not None
+                        or oi_summary.resistance_put_oi_delta is not None
+                        else {}
+                    ),
+                }
                 if oi_summary.resistance_strike is not None
                 else None
             ),
@@ -622,6 +649,24 @@ class UnderlyingSignalsService:
             access_token, underlying_key, unit="minutes", interval=interval,
         )
         candles = _merge_candles(_parse_candles(historical), _parse_candles(intraday))
+        if self.candle_cache_store is not None:
+            self.candle_cache_store.save(
+                underlying_key,
+                "minutes",
+                int(interval),
+                [
+                    {
+                        "timestamp": candle.timestamp,
+                        "open": candle.open,
+                        "high": candle.high,
+                        "low": candle.low,
+                        "close": candle.close,
+                        "volume": int(candle.volume),
+                        "open_interest": 0.0,
+                    }
+                    for candle in candles
+                ],
+            )
         _cache_set(cache_key, [asdict(candle) for candle in candles], ttl_seconds=60.0)
         return candles
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.services.upstox_service import UpstoxService
+from app.services.candle_cache_store import CandleCacheStore
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -17,9 +18,10 @@ class CandleService:
     so the Android chart always receives one stable, oldest-first series.
     """
 
-    def __init__(self, upstox: UpstoxService) -> None:
+    def __init__(self, upstox: UpstoxService, cache_store: CandleCacheStore | None = None) -> None:
         """Create a chart candle service backed by the shared Upstox REST integration."""
         self.upstox = upstox
+        self.cache_store = cache_store
 
     async def get_candles(
         self,
@@ -41,6 +43,15 @@ class CandleService:
         today = (now or datetime.now(_IST)).astimezone(_IST).date()
         yesterday = today - timedelta(days=1)
         rows_by_timestamp: dict[str, dict[str, Any]] = {}
+        if self.cache_store is not None:
+            cached = self.cache_store.load(
+                instrument_key,
+                unit,
+                interval,
+                from_timestamp=f"{from_date.isoformat()}T00:00:00",
+                to_timestamp=f"{(to_date + timedelta(days=1)).isoformat()}T00:00:00",
+            )
+            rows_by_timestamp.update({row["timestamp"]: row for row in cached})
 
         historical_to = min(to_date, yesterday)
         if from_date <= historical_to:
@@ -52,7 +63,12 @@ class CandleService:
                 to_date=historical_to.isoformat(),
                 from_date=from_date.isoformat(),
             )
-            rows_by_timestamp.update(_normalize_candles(historical))
+            normalized_historical = _normalize_candles(historical)
+            rows_by_timestamp.update(normalized_historical)
+            if self.cache_store is not None:
+                self.cache_store.save(
+                    instrument_key, unit, interval, list(normalized_historical.values()),
+                )
 
         if from_date <= today <= to_date:
             intraday = await self.upstox.get_intraday_candle(
@@ -61,15 +77,28 @@ class CandleService:
                 unit=unit,
                 interval=str(interval),
             )
-            rows_by_timestamp.update(_normalize_candles(intraday))
+            normalized_intraday = _normalize_candles(intraday)
+            rows_by_timestamp.update(normalized_intraday)
+            if self.cache_store is not None:
+                self.cache_store.save(
+                    instrument_key, unit, interval, list(normalized_intraday.values()),
+                )
 
         candles = [rows_by_timestamp[key] for key in sorted(rows_by_timestamp)]
+        expected_latest_date = _expected_latest_trading_date(
+            min(to_date, today),
+            local_now=(now or datetime.now(_IST)).astimezone(_IST),
+        )
+        latest_candle_date = _latest_candle_date(candles)
         return {
             "instrument_key": instrument_key,
             "unit": unit,
             "interval": interval,
             "timezone": "Asia/Kolkata",
             "candles": candles,
+            "expected_latest_trading_date": expected_latest_date.isoformat(),
+            "latest_candle_date": latest_candle_date.isoformat() if latest_candle_date else None,
+            "is_stale": latest_candle_date is None or latest_candle_date < expected_latest_date,
         }
 
 
@@ -99,3 +128,22 @@ def _normalize_candles(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
             continue
         normalized[timestamp] = candle
     return normalized
+
+
+def _expected_latest_trading_date(requested_to: date, *, local_now: datetime) -> date:
+    candidate = requested_to
+    # Before today's normal session begins there cannot be a current-session candle yet.
+    if candidate == local_now.date() and local_now.time() < time(9, 15):
+        candidate -= timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _latest_candle_date(candles: list[dict[str, Any]]) -> date | None:
+    for candle in reversed(candles):
+        try:
+            return datetime.fromisoformat(candle["timestamp"]).astimezone(_IST).date()
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None

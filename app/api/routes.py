@@ -11,6 +11,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import (
+    get_candle_cache_store,
     get_oi_snapshot_store,
     get_signal_snapshot_store,
     get_token_store,
@@ -28,6 +29,7 @@ from app.core.exceptions import (
 )
 from app.services.token_store import EncryptedTokenStore
 from app.services.candle_service import CandleService
+from app.services.candle_cache_store import CandleCacheStore
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_service import UpstoxService
 from app.core.security import require_mobile_api_key
@@ -668,6 +670,7 @@ async def market_candles(
     to_date: date = Query(),
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    candle_cache_store: Optional[CandleCacheStore] = Depends(get_candle_cache_store),
 ) -> dict[str, Any]:
     """Return a normalized historical-plus-intraday candle series for the mobile chart."""
     if from_date > to_date:
@@ -685,7 +688,7 @@ async def market_candles(
 
     access_token = _load_access_token(token_store)
     try:
-        return await CandleService(service).get_candles(
+        return await CandleService(service, candle_cache_store).get_candles(
             access_token,
             instrument_key=instrument_key,
             unit=unit,

@@ -9,6 +9,9 @@ from app.services.order_book_lookup import TERMINAL_ORDER_STATUSES, index_orders
 from app.services.pending_oco_pairs_store import PendingExit, PendingOcoPairsStore
 from app.services.upstox_service import UpstoxService
 
+_EXIT_MAX_ATTEMPTS = 3
+_EXIT_RETRY_DELAY_SECONDS = 1.0
+
 
 class SmartOrderService:
     """Translate app smart-order requests into Upstox GTT orders."""
@@ -334,62 +337,109 @@ class SmartOrderService:
             pending_oco_store=pending_oco_store,
         )
 
-        results: list[dict[str, Any]] = []
-        for position in open_positions:
-            quantity = _position_quantity(position)
-            instrument_key = _string_value(position, "instrument_token", "instrument_key")
-            product = _string_value(position, "product") or "I"
-            # Signed quantity (positive = net long, negative = net short) -- same convention the
-            # rest of this app relies on (see MainViewModel.handleTick's PnL formula) -- so
-            # flattening a long is a SELL and flattening a short is a BUY.
-            transaction_type = "SELL" if quantity > 0 else "BUY"
-            abs_quantity = int(abs(quantity))
-            try:
-                rules = await instrument_rules_service.get_rules(instrument_key)
-                slice_qty = slice_quantity_for_freeze(abs_quantity, rules)
-            except AppConfigError:
-                # Best-effort: an instrument-rules lookup hiccup shouldn't block flattening a
-                # position outright -- fall back to a single order (correct for the overwhelming
-                # majority of positions, which are already under freeze quantity anyway).
-                slice_qty = abs_quantity
-            try:
-                upstox_response: Any = None
-                for chunk_quantity in _split_quantity(abs_quantity, slice_qty):
-                    upstox_response = await self.upstox.place_market_order(
-                        access_token,
-                        instrument_key=instrument_key,
-                        transaction_type=transaction_type,
-                        quantity=chunk_quantity,
-                        product=product,
-                    )
-                results.append(
-                    {
+        original_quantities = {
+            _string_value(position, "instrument_token", "instrument_key"):
+                int(abs(_position_quantity(position)))
+            for position in open_positions
+        }
+        result_by_key: dict[str, dict[str, Any]] = {}
+        positions_to_attempt = open_positions
+
+        for attempt in range(1, _EXIT_MAX_ATTEMPTS + 1):
+            failed_keys: set[str] = set()
+            for position in positions_to_attempt:
+                quantity = _position_quantity(position)
+                instrument_key = _string_value(position, "instrument_token", "instrument_key")
+                product = _string_value(position, "product") or "I"
+                # Always use the freshly fetched *remaining* signed quantity on a retry. If an
+                # earlier sliced attempt partially succeeded, resubmitting the original quantity
+                # could reverse the position instead of flattening it.
+                transaction_type = "SELL" if quantity > 0 else "BUY"
+                remaining_quantity = int(abs(quantity))
+                try:
+                    rules = await instrument_rules_service.get_rules(instrument_key)
+                    slice_qty = slice_quantity_for_freeze(remaining_quantity, rules)
+                except AppConfigError:
+                    slice_qty = remaining_quantity
+                try:
+                    upstox_response: Any = None
+                    for chunk_quantity in _split_quantity(remaining_quantity, slice_qty):
+                        upstox_response = await self.upstox.place_market_order(
+                            access_token,
+                            instrument_key=instrument_key,
+                            transaction_type=transaction_type,
+                            quantity=chunk_quantity,
+                            product=product,
+                        )
+                    result_by_key[instrument_key] = {
                         "instrument_key": instrument_key,
                         "transaction_type": transaction_type,
-                        "quantity": abs_quantity,
+                        "quantity": original_quantities[instrument_key],
                         "status": "success",
+                        "attempts": attempt,
                         "upstox_response": upstox_response,
                     }
-                )
-            except UpstoxApiError as exc:
-                # A slice failing partway through is reported as this position's own "error", not
-                # a partial-success this response shape has no room for -- a half-flattened
-                # position isn't actually safe, so it should surface exactly like a total failure
-                # (the app's own "close manually" messaging), not read as done.
-                results.append(
-                    {
+                except UpstoxApiError as exc:
+                    failed_keys.add(instrument_key)
+                    result_by_key[instrument_key] = {
                         "instrument_key": instrument_key,
                         "transaction_type": transaction_type,
-                        "quantity": abs_quantity,
+                        "quantity": original_quantities[instrument_key],
                         "status": "error",
+                        "attempts": attempt,
                         "error": str(exc),
                     }
-                )
+
+            if not failed_keys or attempt == _EXIT_MAX_ATTEMPTS:
+                break
+
+            await asyncio.sleep(_EXIT_RETRY_DELAY_SECONDS)
+            try:
+                refreshed_payload = await self.upstox.get_positions(access_token)
+            except UpstoxApiError:
+                break
+            refreshed_data = refreshed_payload.get("data")
+            refreshed_positions = (
+                [item for item in refreshed_data if isinstance(item, dict)]
+                if isinstance(refreshed_data, list)
+                else []
+            )
+            open_by_key = {
+                _string_value(item, "instrument_token", "instrument_key"): item
+                for item in refreshed_positions
+                if _position_quantity(item) != 0
+            }
+            positions_to_attempt = [
+                open_by_key[key] for key in failed_keys if key in open_by_key
+            ]
+            # A failed API response can race a fill acknowledgement. If the broker now reports
+            # the position flat, treat it as success and never submit a duplicate exit.
+            for closed_key in failed_keys - open_by_key.keys():
+                previous = result_by_key[closed_key]
+                result_by_key[closed_key] = {
+                    **previous,
+                    "status": "success",
+                    "attempts": attempt,
+                    "error": None,
+                }
+            if not positions_to_attempt:
+                break
+            # A transient cancellation/order-book failure may have left a plain protective
+            # stop-loss reserving the exit quantity on the first pass. Retry that cancellation
+            # for only the instruments that are still open before submitting another market exit.
+            await self.cancel_resting_stoploss_orders(
+                access_token,
+                instrument_keys=set(open_by_key) & failed_keys,
+                pending_oco_store=pending_oco_store,
+            )
 
         return {
             "status": "success",
             "positions_found": len(open_positions),
-            "results": results,
+            "results": [
+                result_by_key[_string_value(position, "instrument_token", "instrument_key")]
+                for position in open_positions
+            ],
         }
 
     async def cancel_resting_stoploss_orders(
@@ -422,7 +472,12 @@ class SmartOrderService:
         if not pending_exits:
             return
 
-        order_book_payload = await self.upstox.get_order_book(access_token)
+        try:
+            order_book_payload = await self.upstox.get_order_book(access_token)
+        except UpstoxApiError:
+            # Protective-order cleanup is best-effort. A temporary order-book failure must not
+            # prevent the emergency market exit itself from being attempted.
+            return
         orders_by_id = index_orders_by_id(order_book_payload)
 
         cancelled_any = False

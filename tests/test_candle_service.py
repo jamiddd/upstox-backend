@@ -36,6 +36,18 @@ class FakeUpstox:
         }
 
 
+class FakeCandleCache:
+    def __init__(self, rows=None) -> None:
+        self.rows = list(rows or [])
+        self.saved = []
+
+    def load(self, *args, **kwargs):
+        return list(self.rows)
+
+    def save(self, instrument_key, unit, interval, candles):
+        self.saved.extend(candles)
+
+
 @pytest.mark.anyio
 async def test_merges_normalizes_and_sorts_historical_and_intraday_candles():
     fake = FakeUpstox()
@@ -54,6 +66,7 @@ async def test_merges_normalizes_and_sorts_historical_and_intraday_candles():
     assert result["candles"][0]["open_interest"] == 6.0
     assert fake.historical_calls[0]["to_date"] == "2026-07-22"
     assert len(fake.intraday_calls) == 1
+    assert result["is_stale"] is False
 
 
 @pytest.mark.anyio
@@ -71,3 +84,35 @@ async def test_completed_range_does_not_request_intraday_data():
 
     assert len(fake.historical_calls) == 1
     assert fake.intraday_calls == []
+
+
+@pytest.mark.anyio
+async def test_cached_completed_session_bridges_stale_upstream_history():
+    fake = FakeUpstox()
+    cache = FakeCandleCache(
+        [
+            {
+                "timestamp": "2026-07-24T15:25:00+05:30",
+                "open": 110.0,
+                "high": 112.0,
+                "low": 109.0,
+                "close": 111.0,
+                "volume": 40,
+                "open_interest": 0.0,
+            }
+        ]
+    )
+    result = await CandleService(fake, cache).get_candles(
+        "token",
+        instrument_key="NSE_INDEX|Nifty 50",
+        unit="minutes",
+        interval=5,
+        from_date=date(2026, 7, 22),
+        to_date=date(2026, 7, 25),
+        now=datetime(2026, 7, 25, 1, tzinfo=ZoneInfo("Asia/Kolkata")),
+    )
+
+    assert result["latest_candle_date"] == "2026-07-24"
+    assert result["expected_latest_trading_date"] == "2026-07-24"
+    assert result["is_stale"] is False
+    assert result["candles"][-1]["close"] == 111.0
