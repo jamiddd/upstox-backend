@@ -48,6 +48,10 @@ class UpstoxPortfolioFeedClient:
             authorize=self._authorize,
             on_message=self._on_message,
             on_state_change=on_state_change,
+            # This feed is purely event-driven (no periodic ticks), so the base class's
+            # tick-feed-oriented staleness watchdog doesn't apply here -- see
+            # UpstoxWebSocketClient's own doc comment on `_STALE_AFTER_SECONDS`.
+            stale_after_seconds=None,
         )
 
     def start(self) -> None:

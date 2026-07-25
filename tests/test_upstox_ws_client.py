@@ -79,17 +79,49 @@ async def test_stale_connection_triggers_reconnect(monkeypatch: pytest.MonkeyPat
         "app.services.upstox_ws_client.websockets.connect",
         lambda *a, **k: connection,
     )
-    monkeypatch.setattr("app.services.upstox_ws_client._STALE_AFTER_SECONDS", 0.05)
     client = UpstoxWebSocketClient(
         name="test",
         authorize=lambda: _ok("wss://feed.test/socket"),
         on_message=lambda _msg: None,
+        stale_after_seconds=0.05,
     )
 
     auth_pending = await client._connect_once()
 
     assert auth_pending is False
     assert client._connection is None  # cleaned up after the stale timeout forced a return
+
+
+@pytest.mark.anyio
+async def test_stale_watchdog_disabled_waits_indefinitely_for_a_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`stale_after_seconds=None` (as `UpstoxPortfolioFeedClient` passes) must not apply any
+    timeout at all -- a purely event-driven feed going quiet is normal, not a sign of staleness."""
+    connection = _FakeConnection()
+    monkeypatch.setattr(
+        "app.services.upstox_ws_client.websockets.connect",
+        lambda *a, **k: connection,
+    )
+    received: list[Any] = []
+    client = UpstoxWebSocketClient(
+        name="test",
+        authorize=lambda: _ok("wss://feed.test/socket"),
+        on_message=received.append,
+        stale_after_seconds=None,
+    )
+
+    task = asyncio.create_task(client._connect_once())
+    await asyncio.sleep(0.05)
+    assert client._connection is not None  # still connected, no timeout fired
+
+    connection.push(b"order-update")
+    await asyncio.sleep(0.05)
+    assert received == [b"order-update"]
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.anyio

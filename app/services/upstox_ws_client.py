@@ -12,10 +12,18 @@ from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
 
-# A live feed connected during market hours should never actually go this long without a frame --
-# if it does, the underlying TCP connection is most likely silently half-open (still reports
-# "connected" but nothing is arriving), so treat it as dead and reconnect. Mirrors the Android
-# client's own MarketFeedClient.kt stale-feed watchdog.
+# A live *tick* feed connected during market hours should never actually go this long without a
+# frame -- if it does, the underlying TCP connection is most likely silently half-open (still
+# reports "connected" but nothing is arriving), so treat it as dead and reconnect. Mirrors the
+# Android client's own MarketFeedClient.kt stale-feed watchdog. Only meaningful for a feed that's
+# expected to stream continuously (the market-data feed) -- `UpstoxPortfolioFeedClient` passes
+# `stale_after_seconds=None` to disable this instead, since its feed is purely event-driven and can
+# go quiet for long, entirely normal stretches with no order/position activity; Upstox's own docs
+# describe it sending transport-level ping frames to keep such an idle connection alive, but the
+# `websockets` library answers those automatically without ever surfacing them to `recv()`, so this
+# watchdog would otherwise force a reconnect loop on a perfectly healthy but idle connection. A
+# genuinely dead portfolio-feed connection is still caught -- by the `websockets` library's own
+# ping/pong keepalive raising `ConnectionClosed`, not by this watchdog.
 _STALE_AFTER_SECONDS = 30.0
 _RECONNECT_DELAY_SECONDS = 2.0
 # Upstox tokens expire nightly with no refresh flow (see EncryptedTokenStore's own doc comment) --
@@ -53,11 +61,13 @@ class UpstoxWebSocketClient:
         on_message: Callable[[Any], None],
         desired_subscriptions: Optional[Callable[[], list[dict[str, Any]]]] = None,
         on_state_change: Optional[Callable[[str], None]] = None,
+        stale_after_seconds: Optional[float] = _STALE_AFTER_SECONDS,
     ) -> None:
         self._name = name
         self._authorize = authorize
         self._on_message = on_message
         self._desired_subscriptions = desired_subscriptions or (lambda: [])
+        self._stale_after_seconds = stale_after_seconds
         # One of "connected" / "disconnected" / "auth_pending" -- lets a caller (e.g. a
         # notification on repeated feed instability) observe this connection's health without
         # polling the `connected` property itself. Best-effort: exceptions from the callback are
@@ -161,15 +171,19 @@ class UpstoxWebSocketClient:
                     await self.send_json(message)
 
                 while generation == self._generation:
-                    try:
-                        message = await asyncio.wait_for(
-                            connection.recv(), timeout=_STALE_AFTER_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "%s: no frames for %.0fs, reconnecting", self._name, _STALE_AFTER_SECONDS,
-                        )
-                        return False
+                    if self._stale_after_seconds is None:
+                        message = await connection.recv()
+                    else:
+                        try:
+                            message = await asyncio.wait_for(
+                                connection.recv(), timeout=self._stale_after_seconds,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "%s: no frames for %.0fs, reconnecting",
+                                self._name, self._stale_after_seconds,
+                            )
+                            return False
                     self._on_message(message)
         except ConnectionClosed:
             logger.info("%s: connection closed", self._name)
