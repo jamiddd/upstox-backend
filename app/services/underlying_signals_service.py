@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from time import monotonic
@@ -648,7 +648,28 @@ class UnderlyingSignalsService:
         intraday = await self.upstox.get_intraday_candle(
             access_token, underlying_key, unit="minutes", interval=interval,
         )
-        candles = _merge_candles(_parse_candles(historical), _parse_candles(intraday))
+        candle_lists = [_parse_candles(historical), _parse_candles(intraday)]
+
+        # Layer today's tick-built 1-minute candles (see LiveCandleBuilder/main.py's on_tick
+        # wiring) over the REST intraday snapshot, aggregated up to this call's own interval.
+        # _merge_candles keeps whichever list's value for a given bucket timestamp is *last* in
+        # this argument order, so a live-aggregated bucket overrides the REST one for the same
+        # timestamp -- REST intraday can lag by up to its own cache TTL, while the live cache
+        # reflects ticks received up to this exact moment. Purely additive: if the cache store
+        # isn't wired or has nothing for today yet (e.g. a fresh backend restart, or before the
+        # feed has produced any ticks), this falls through to the REST-only behavior unchanged.
+        if self.candle_cache_store is not None:
+            live_rows = self.candle_cache_store.load(
+                underlying_key,
+                "minutes",
+                1,
+                from_timestamp=f"{today.isoformat()}T00:00:00",
+                to_timestamp=f"{(today + timedelta(days=1)).isoformat()}T00:00:00",
+            )
+            if live_rows:
+                candle_lists.append(_aggregate_minute_candles(live_rows, int(interval)))
+
+        candles = _merge_candles(*candle_lists)
         if self.candle_cache_store is not None:
             self.candle_cache_store.save(
                 underlying_key,
@@ -885,6 +906,55 @@ def _parse_candles(payload: dict[str, Any]) -> list[Candle]:
             continue
     candles.sort(key=lambda candle: candle.timestamp)
     return candles
+
+
+def _aggregate_minute_candles(rows: list[dict[str, Any]], interval_minutes: int) -> list[Candle]:
+    """Aggregates persisted 1-minute candle-cache rows (see `CandleCacheStore`/`LiveCandleBuilder`)
+    into `interval_minutes`-minute bars, bucketed on IST wall-clock boundaries so a bucket's
+    timestamp matches Upstox's own bucket-start convention exactly (verified against
+    `_parse_candles`'s raw Upstox strings -- both produce the identical
+    `YYYY-MM-DDTHH:MM:SS+05:30` format for the same instant, which is required for `_merge_candles`
+    to override the right REST bucket rather than create a duplicate one).
+
+    A bucket with fewer than `interval_minutes` one-minute rows so far (the current, still-
+    forming bar) is aggregated from whatever's arrived -- the same "partial latest bar" behavior
+    Upstox's own intraday endpoint already exhibits, not a bug to guard against.
+    """
+    buckets: dict[str, list[Candle]] = defaultdict(list)
+    for row in rows:
+        try:
+            # Validated and converted to a Candle up front, per row -- a row with just one bad
+            # numeric field (e.g. a corrupted cache entry) must not silently leak its *other*,
+            # individually-valid-looking fields into the bucket aggregate below.
+            timestamp = datetime.fromisoformat(row["timestamp"]).astimezone(_IST)
+            row_candle = Candle(
+                timestamp=str(row["timestamp"]),
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row["volume"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        bucket_minute = (timestamp.minute // interval_minutes) * interval_minutes
+        bucket_start = timestamp.replace(minute=bucket_minute, second=0, microsecond=0)
+        buckets[bucket_start.isoformat()].append(row_candle)
+
+    aggregated: list[Candle] = []
+    for bucket_timestamp, bucket_rows in buckets.items():
+        ordered = sorted(bucket_rows, key=lambda candle: candle.timestamp)
+        aggregated.append(
+            Candle(
+                timestamp=bucket_timestamp,
+                open=ordered[0].open,
+                high=max(candle.high for candle in ordered),
+                low=min(candle.low for candle in ordered),
+                close=ordered[-1].close,
+                volume=sum(candle.volume for candle in ordered),
+            ),
+        )
+    return sorted(aggregated, key=lambda candle: candle.timestamp)
 
 
 def _merge_candles(*candle_lists: list[Candle]) -> list[Candle]:

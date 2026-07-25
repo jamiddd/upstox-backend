@@ -1,0 +1,185 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+from starlette.websockets import WebSocketState
+
+from app.core.config import Settings
+from app.services.stream_connection_manager import StreamConnectionManager
+from app.services.upstox_market_feed_client import FeedCandle, FeedTick
+
+
+def _settings() -> Settings:
+    return Settings(
+        upstox_api_key="api-key",
+        upstox_api_secret="api-secret",
+        upstox_redirect_url="https://example.com/api/auth/callback",
+        upstox_environment="sandbox",
+        mobile_api_key="mobile-secret",
+        token_encryption_key="",
+        token_store_path=Path("/tmp/stream_test_token.enc"),
+    )
+
+
+class _FakeWebSocket:
+    def __init__(self) -> None:
+        self.application_state = WebSocketState.CONNECTED
+        self.sent: list[dict[str, Any]] = []
+
+    async def accept(self) -> None:
+        pass
+
+    async def send_text(self, text: str) -> None:
+        self.sent.append(json.loads(text))
+
+
+class _FakeSubscriptionManager:
+    def __init__(self) -> None:
+        self.set_calls: list[tuple[str, list[str], list[str]]] = []
+        self.removed: list[str] = []
+
+    async def set_client_subscription(self, session_id: str, *, full: list[str], ltpc: list[str]) -> None:
+        self.set_calls.append((session_id, full, ltpc))
+
+    async def remove_client(self, session_id: str) -> None:
+        self.removed.append(session_id)
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+def _manager() -> tuple[StreamConnectionManager, _FakeSubscriptionManager]:
+    fake_sub = _FakeSubscriptionManager()
+    manager = StreamConnectionManager(settings=_settings(), subscription_manager=fake_sub)
+    return manager, fake_sub
+
+
+@pytest.mark.anyio
+async def test_subscribe_message_forwards_to_subscription_manager() -> None:
+    manager, fake_sub = _manager()
+    websocket = _FakeWebSocket()
+    session = await manager.connect(websocket)  # type: ignore[arg-type]
+
+    await manager.handle_message(
+        session, json.dumps({"type": "subscribe", "full": ["A", "B"], "ltpc": ["C"]}),
+    )
+
+    assert fake_sub.set_calls == [(session.session_id, ["A", "B"], ["C"])]
+    assert session.full_keys == {"A", "B"}
+    assert session.ltpc_keys == {"C"}
+
+
+@pytest.mark.anyio
+async def test_malformed_message_is_ignored() -> None:
+    manager, fake_sub = _manager()
+    websocket = _FakeWebSocket()
+    session = await manager.connect(websocket)  # type: ignore[arg-type]
+
+    await manager.handle_message(session, "not json")
+    await manager.handle_message(session, json.dumps(["not", "a", "dict"]))
+    await manager.handle_message(session, json.dumps({"type": "unknown_type"}))
+
+    assert fake_sub.set_calls == []
+
+
+@pytest.mark.anyio
+async def test_set_underlying_records_session_state_and_starts_signals_task() -> None:
+    manager, _ = _manager()
+    websocket = _FakeWebSocket()
+    session = await manager.connect(websocket)  # type: ignore[arg-type]
+
+    await manager.handle_message(
+        session,
+        json.dumps({
+            "type": "set_underlying",
+            "underlying_key": "NSE_INDEX|Nifty 50",
+            "expiry_date": "2026-07-31",
+            "underlying_symbol": "NIFTY",
+        }),
+    )
+
+    assert session.underlying_key == "NSE_INDEX|Nifty 50"
+    assert session.expiry_date == "2026-07-31"
+    assert session.underlying_symbol == "NIFTY"
+    assert session.signals_task is not None
+
+    await manager.disconnect(session)
+
+
+@pytest.mark.anyio
+async def test_disconnect_cancels_signals_task_and_removes_client() -> None:
+    manager, fake_sub = _manager()
+    websocket = _FakeWebSocket()
+    session = await manager.connect(websocket)  # type: ignore[arg-type]
+    await manager.handle_message(
+        session, json.dumps({"type": "set_underlying", "underlying_key": "NSE_INDEX|Nifty 50"}),
+    )
+    task = session.signals_task
+    assert task is not None
+
+    await manager.disconnect(session)
+    await asyncio.sleep(0.01)
+
+    assert task.cancelled() or task.done()
+    assert fake_sub.removed == [session.session_id]
+
+
+@pytest.mark.anyio
+async def test_dispatch_tick_only_reaches_sessions_watching_that_instrument() -> None:
+    manager, _ = _manager()
+    watching = _FakeWebSocket()
+    not_watching = _FakeWebSocket()
+    watching_session = await manager.connect(watching)  # type: ignore[arg-type]
+    not_watching_session = await manager.connect(not_watching)  # type: ignore[arg-type]
+    watching_session.full_keys = {"NSE_FO|111"}
+
+    tick = FeedTick(
+        instrument_key="NSE_FO|111",
+        ltp=125.5,
+        last_trade_time_millis=1_700_000_000_000,
+        bid_price=125.0,
+        ask_price=126.0,
+        one_minute_candle=FeedCandle(
+            timestamp_millis=1_700_000_000_000, open=124.0, high=126.0, low=123.0, close=125.5, volume=900,
+        ),
+    )
+    await manager.dispatch_tick(tick)
+
+    assert len(watching.sent) == 1
+    assert watching.sent[0]["type"] == "tick"
+    assert watching.sent[0]["data"]["instrument_key"] == "NSE_FO|111"
+    assert watching.sent[0]["data"]["one_minute_candle"]["close"] == 125.5
+    assert not_watching.sent == []
+    del not_watching_session
+
+
+@pytest.mark.anyio
+async def test_dispatch_order_update_reaches_every_connected_session() -> None:
+    manager, _ = _manager()
+    a = _FakeWebSocket()
+    b = _FakeWebSocket()
+    await manager.connect(a)  # type: ignore[arg-type]
+    await manager.connect(b)  # type: ignore[arg-type]
+
+    await manager.dispatch_order_update({"order_id": "O1", "status": "complete"})
+
+    assert a.sent == [{"type": "order_update", "data": {"order_id": "O1", "status": "complete"}}]
+    assert b.sent == a.sent
+
+
+@pytest.mark.anyio
+async def test_send_is_a_noop_when_socket_not_connected() -> None:
+    manager, _ = _manager()
+    websocket = _FakeWebSocket()
+    websocket.application_state = WebSocketState.DISCONNECTED
+    session = await manager.connect(websocket)  # type: ignore[arg-type]
+
+    await manager.dispatch_order_update({"order_id": "O1", "status": "complete"})
+
+    assert websocket.sent == []

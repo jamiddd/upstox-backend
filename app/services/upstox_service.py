@@ -541,6 +541,24 @@ class UpstoxService:
             raise UpstoxApiError("Unexpected Upstox market feed authorization response")
         return payload
 
+    async def get_portfolio_feed_authorize(self, access_token: str) -> dict[str, Any]:
+        """Fetch a one-time Portfolio Stream Feed WebSocket authorization URL -- the separate
+        Upstox feed that pushes order/position update events, distinct from the market-data feed
+        above (see `UpstoxPortfolioFeedClient`). Same one-time-URL shape as
+        `get_market_feed_authorize`, just a different Upstox path."""
+        response = await self._request(
+            "GET",
+            f"{self.settings.upstox_api_v3_base_url}/feed/portfolio-stream-feed/authorize",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox portfolio feed authorization response")
+        return payload
+
     async def _get_json(
         self,
         path: str,

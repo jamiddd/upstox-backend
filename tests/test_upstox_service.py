@@ -388,6 +388,33 @@ def test_get_market_feed_authorize_uses_v3_authorize_endpoint() -> None:
     }
 
 
+def test_get_portfolio_feed_authorize_uses_v3_authorize_endpoint() -> None:
+    """Fetch a one-time V3 WebSocket authorization URL for the separate portfolio/order stream."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v3/feed/portfolio-stream-feed/authorize"
+        assert request.headers["Accept"] == "application/json"
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"authorized_redirect_uri": "wss://portfolio-feed.test/socket"},
+            },
+        )
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_portfolio_feed_authorize("upstox-token")
+
+    payload = anyio.run(run)
+    assert payload == {
+        "status": "success",
+        "data": {"authorized_redirect_uri": "wss://portfolio-feed.test/socket"},
+    }
+
+
 def test_search_instruments_sends_fo_option_filters() -> None:
     """Search instruments with filters that find option-capable underlyings."""
     async def handler(request: httpx.Request) -> httpx.Response:

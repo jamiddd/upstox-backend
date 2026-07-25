@@ -733,70 +733,76 @@ underlying-signals candle-derived values (EMAs/ATR/opening range/pivots): ~60 se
 
 For millisecond-level flashing values, the next backend step should be a market data WebSocket bridge or authorization endpoint.
 
-## Live Market Feed
+## Live Data Stream
 
-For the lowest-latency bid/ask, spot, and position LTP updates, use Upstox Market Data Feed V3 instead of REST polling.
-
-First request a one-time WebSocket URL:
+The app no longer connects to Upstox directly. The backend owns two persistent Upstox WebSocket
+connections of its own -- the Market Data Feed V3 (ticks/candles) and the separate Portfolio
+Stream Feed (order/position updates) -- and relays everything derived from them over one
+backend-hosted channel:
 
 ```http
-GET /api/market/feed/authorize
+GET /api/stream
 ```
 
-Response:
+This is a WebSocket upgrade, authenticated the same way every REST route is: the `X-API-Key`
+header on the handshake request. JSON both ways (the backend already decoded Upstox's own
+binary/protobuf frames before this point, so the app never handles that format at all).
+
+**Client -> server messages:**
+
+Replace this session's complete desired instrument-key sets (a plain replace, not an incremental
+add/remove -- the backend does its own diffing against the single shared Upstox connection, unioned
+across every connected session and its own tracked-underlying needs):
 
 ```json
 {
-  "status": "success",
-  "data": {
-    "authorized_redirect_uri": "wss://..."
-  }
+  "type": "subscribe",
+  "full": ["NSE_INDEX|Nifty 50", "NSE_FO|<selected_contract_key>"],
+  "ltpc": ["NSE_FO|<position_1>", "NSE_FO|<position_2>"]
 }
 ```
 
-The app should connect directly to `authorized_redirect_uri`. The URL is single-use, so request a new one for every WebSocket connection attempt.
-
-Subscribe with Upstox's binary/protobuf V3 request format. For this screen:
+Use `full` for the selected option contract (buy/sell buttons need best bid/ask); `ltpc` is enough
+for open positions/watchlist entries that only need last-traded price. Tell the backend which
+underlying/expiry this session is actively viewing, so its pushed `signals` messages compute
+against the right one:
 
 ```json
 {
-  "guid": "<client-generated-id>",
-  "method": "sub",
-  "data": {
-    "mode": "full",
-    "instrumentKeys": [
-      "NSE_INDEX|Nifty 50",
-      "NSE_FO|<selected_contract_key>"
-    ]
-  }
+  "type": "set_underlying",
+  "underlying_key": "NSE_INDEX|Nifty 50",
+  "expiry_date": "2026-07-31",
+  "underlying_symbol": "NIFTY"
 }
 ```
 
-Use `full` for the selected option contract because the buy/sell buttons need best bid/ask. The selected contract feed includes:
+**Server -> client messages:**
 
-```text
-fullFeed.marketFF.ltpc.ltp
-fullFeed.marketFF.marketLevel.bidAskQuote[0].bidP
-fullFeed.marketFF.marketLevel.bidAskQuote[0].askP
-```
-
-For open positions, subscribe to their instrument keys. If only LTP is needed for local P&L, `ltpc` mode is enough:
-
-```json
-{
-  "guid": "<client-generated-id>",
-  "method": "sub",
-  "data": {
-    "mode": "ltpc",
-    "instrumentKeys": [
-      "NSE_FO|<position_1>",
-      "NSE_FO|<position_2>"
-    ]
+- `tick` -- one instrument's live price/candle update:
+  ```json
+  {
+    "type": "tick",
+    "data": {
+      "instrument_key": "NSE_FO|111",
+      "ltp": 125.5,
+      "last_trade_time_millis": 1721873700000,
+      "bid_price": 124.5,
+      "ask_price": 126.0,
+      "one_minute_candle": {
+        "timestamp_millis": 1721873700000,
+        "open": 124.0, "high": 126.0, "low": 123.5, "close": 125.5, "volume": 900
+      }
+    }
   }
-}
-```
+  ```
+- `signals` -- the same payload shape `GET /api/main/underlying-signals` returns, pushed on the
+  backend's own cadence for whichever underlying/expiry `set_underlying` last specified.
+- `order_update` -- something in today's order book changed. The payload is Upstox's own portfolio-
+  feed event shape (not yet fully verified against live Upstox docs -- treat it as a "something
+  changed, go refresh" signal rather than a fully trusted schema).
 
-When the selected strike changes, unsubscribe the previous selected contract and subscribe the new contract in `full` mode. When positions open or close, update the `ltpc` subscriptions accordingly.
+When the selected strike changes, send a new `subscribe` replacing the full-mode set. When
+positions open or close, update the `ltpc` set the same way.
 
 ## Chart candle freshness and cache
 
@@ -812,6 +818,21 @@ The response includes:
   weekends and the pre-open period.
 - `latest_candle_date`: newest date actually present after cache/upstream merging.
 - `is_stale`: true when the actual latest date precedes the expected date.
+
+### Tick-driven signals freshness
+
+Separately, `LiveCandleBuilder` (see `app.main`'s lifespan) builds one-minute candles directly from
+the market-data feed's live ticks and persists each completed minute into the same cache store
+under its own `(instrument_key, "minutes", 1)` key -- independent of any REST poll. `GET
+/api/main/underlying-signals`' EMA/VWAP/opening-range/pivot computation (`UnderlyingSignalsService
+._minute_series`) reads today's rows from this one-minute cache, aggregates them up to whatever
+interval it needs (5m/15m), and layers them over the REST historical+intraday merge -- a
+live-aggregated bucket overrides the REST value for the same timestamp, since it reflects ticks
+received up to the exact moment of the request rather than REST's own refresh cadence. Purely
+additive: with no live rows yet (a fresh restart, or before the feed has produced any ticks), this
+falls through to the REST-only behavior unchanged. PCR/max-pain/OI-derived signals are unaffected
+by this -- they still come from the existing option-chain-snapshot REST polling, since those need a
+full chain fan-out per underlying that a single live-tick stream doesn't provide economically.
 
 Fresh upstream rows always replace same-timestamp cached rows. Other instruments and intervals
 become cached whenever their chart endpoint is requested; the poller proactively covers only
