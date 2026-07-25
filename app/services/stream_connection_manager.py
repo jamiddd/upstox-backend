@@ -110,7 +110,6 @@ class StreamConnectionManager:
             return
 
         message_type = message.get("type")
-        logger.info("Stream message from session %s: type=%s", session.session_id, message_type)
         if message_type == "subscribe":
             await self._handle_subscribe(session, message)
         elif message_type == "set_underlying":
