@@ -829,16 +829,20 @@ async def register_device(
 
 @protected_router.post("/notifications/test")
 async def send_test_notification(
+    severity: str = Query(default="info", pattern="^(info|warning|critical)$"),
     notification_service: NotificationService = Depends(get_notification_service),
 ) -> dict[str, Any]:
-    """Records a throwaway `system`/`info` notification through the exact same path as every
-    real one -- store + stream dispatch + FCM push if a device is registered -- so the FCM
-    wiring can be verified end-to-end without waiting for a real event to trigger it."""
+    """Records a throwaway `system` notification through the exact same path as every real one
+    -- store + stream dispatch + FCM push if a device is registered -- so the FCM wiring can be
+    verified end-to-end without waiting for a real event to trigger it. `severity` defaults to
+    `info` but must be raised to match the registered device's push preference (see
+    `NotificationService._maybe_push`'s `_PUSH_SEVERITIES` gate) for a push to actually fire --
+    e.g. a `critical`-only preference silently drops an `info` test notification."""
     return await notification_service.record(
         category="system",
-        severity="info",
+        severity=severity,
         title="Test notification",
-        message="This is a test notification.",
+        message=f"This is a test notification ({severity}).",
     )
 
 
