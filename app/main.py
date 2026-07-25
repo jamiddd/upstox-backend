@@ -31,6 +31,21 @@ from app.services.upstox_market_feed_client import FeedTick, UpstoxMarketFeedCli
 from app.services.upstox_portfolio_feed_client import UpstoxPortfolioFeedClient
 from app.services.upstox_service import UpstoxService
 
+# No prior config meant every logger.info/debug call across this whole backend was silently
+# dropped -- Python's root logger defaults to WARNING with no handler, so only warning/error
+# calls (e.g. the feed-disconnect notifier, FCM push failures) were ever visible in
+# `docker compose logs`. This is the one place guaranteed to run before any other module's
+# logger.* call, since every route/service is imported above and reachable only through this
+# app.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    # uvicorn may have already attached its own handler to the root logger by the time this
+    # module imports (depends on how it's launched) -- plain basicConfig() is a no-op once any
+    # handler exists, force=True guarantees this config wins regardless.
+    force=True,
+)
+
 logger = logging.getLogger(__name__)
 
 # How often the tracked-instruments "always needed" subscription set is re-applied -- matches

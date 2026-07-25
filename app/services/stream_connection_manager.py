@@ -52,11 +52,15 @@ class ClientSession:
 
     async def send(self, message: dict[str, Any]) -> None:
         if self.websocket.application_state != WebSocketState.CONNECTED:
+            logger.info(
+                "Dropping send to session %s: application_state=%s (type=%s)",
+                self.session_id, self.websocket.application_state, message.get("type"),
+            )
             return
         try:
             await self.websocket.send_text(json.dumps(message))
         except Exception:
-            logger.debug("Failed to send to session %s", self.session_id, exc_info=True)
+            logger.warning("Failed to send to session %s", self.session_id, exc_info=True)
 
 
 class StreamConnectionManager:
