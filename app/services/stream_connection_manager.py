@@ -106,6 +106,7 @@ class StreamConnectionManager:
             return
 
         message_type = message.get("type")
+        logger.info("Stream message from session %s: type=%s", session.session_id, message_type)
         if message_type == "subscribe":
             await self._handle_subscribe(session, message)
         elif message_type == "set_underlying":
@@ -123,7 +124,15 @@ class StreamConnectionManager:
     def _handle_set_underlying(self, session: ClientSession, message: dict[str, Any]) -> None:
         underlying_key = message.get("underlying_key")
         if not isinstance(underlying_key, str) or not underlying_key:
+            logger.warning(
+                "set_underlying message missing/invalid underlying_key for session %s: %r",
+                session.session_id, message,
+            )
             return
+        logger.info(
+            "set_underlying for session %s: underlying_key=%s expiry_date=%s",
+            session.session_id, underlying_key, message.get("expiry_date"),
+        )
         session.underlying_key = underlying_key
         expiry_date = message.get("expiry_date")
         session.expiry_date = expiry_date if isinstance(expiry_date, str) else None
