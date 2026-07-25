@@ -388,11 +388,12 @@ def test_get_market_feed_authorize_uses_v3_authorize_endpoint() -> None:
     }
 
 
-def test_get_portfolio_feed_authorize_uses_v3_authorize_endpoint() -> None:
-    """Fetch a one-time V3 WebSocket authorization URL for the separate portfolio/order stream."""
+def test_get_portfolio_feed_authorize_uses_v2_authorize_endpoint() -> None:
+    """Fetch a one-time WebSocket authorization URL for the separate portfolio/order stream --
+    this endpoint was never migrated to v3, unlike the market-data feed's own authorize call."""
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
-        assert request.url.path == "/v3/feed/portfolio-stream-feed/authorize"
+        assert request.url.path == "/v2/feed/portfolio-stream-feed/authorize"
         assert request.headers["Accept"] == "application/json"
         assert request.headers["Authorization"] == "Bearer upstox-token"
         return httpx.Response(

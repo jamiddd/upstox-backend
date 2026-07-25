@@ -545,10 +545,13 @@ class UpstoxService:
         """Fetch a one-time Portfolio Stream Feed WebSocket authorization URL -- the separate
         Upstox feed that pushes order/position update events, distinct from the market-data feed
         above (see `UpstoxPortfolioFeedClient`). Same one-time-URL shape as
-        `get_market_feed_authorize`, just a different Upstox path."""
+        `get_market_feed_authorize`, but -- unlike the market-data feed -- this endpoint was never
+        migrated to v3 and only exists under v2; hitting it at the v3 path returns a permanent
+        404, which is exactly what caused the backend's own portfolio-feed connection to never
+        stay up."""
         response = await self._request(
             "GET",
-            f"{self.settings.upstox_api_v3_base_url}/feed/portfolio-stream-feed/authorize",
+            f"{self.settings.upstox_api_base_url}/feed/portfolio-stream-feed/authorize",
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {access_token}",
