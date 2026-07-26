@@ -49,7 +49,6 @@ from app.services.notification_store import NotificationStore
 from app.services.order_history_service import OrderHistoryService
 from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
-from app.services.pending_oco_pairs_store import PendingOcoPairsStore
 from app.services.account_snapshot_store import AccountSnapshotStore
 from app.services.oi_analysis_service import OIAnalysisService
 from app.services.oi_snapshot_store import OISnapshotStore, SnapshotNotFoundError
@@ -121,22 +120,6 @@ class ExitPositionsRequest(BaseModel):
     instrument_keys: Optional[list[str]] = None
 
 
-class AttachGttExitsRequest(BaseModel):
-    """Attaches a target and a stoploss to an already-open position with no existing GTT bracket,
-    without re-entering. See SmartOrderService.attach_gtt_exits.
-    """
-
-    instrument_key: str = Field(min_length=1)
-    quantity: int = Field(gt=0)
-    product: Literal["I", "D", "MTF"] = "I"
-    exit_transaction_type: Literal["BUY", "SELL"]
-    target_trigger_price: float = Field(gt=0)
-    stoploss_trigger_price: float = Field(gt=0)
-    # Overrides the instrument's freeze-quantity-based auto-slicing when set -- same convention
-    # as SmartBracketOrderRequest.slice_quantity.
-    slice_quantity: Optional[int] = Field(default=None, gt=0)
-
-
 class ModifyOrderRequest(BaseModel):
     """Fields accepted by the Upstox V3 modify-order endpoint."""
 
@@ -162,12 +145,6 @@ class CancelOrdersRequest(BaseModel):
     """
 
     order_ids: list[str] = Field(min_length=1)
-
-
-class CancelRestingExitRequest(BaseModel):
-    """See `cancel_resting_exit` below."""
-
-    instrument_key: str = Field(min_length=1)
 
 
 @protected_router.get("/status")
@@ -930,50 +907,6 @@ async def cancel_gtt_order(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.post("/orders/gtt/attach-exits")
-async def attach_gtt_exits(
-    order: AttachGttExitsRequest,
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-    notification_service: NotificationService = Depends(get_notification_service),
-) -> dict[str, Any]:
-    """Attaches a target/stoploss to a position with no existing GTT bracket. See
-    SmartOrderService.attach_gtt_exits.
-    """
-    access_token = _load_access_token(token_store)
-    try:
-        rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
-        validate_quantity(order.quantity, rules)
-        validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
-        validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
-        slice_quantity = order.slice_quantity or slice_quantity_for_freeze(order.quantity, rules)
-        result = await SmartOrderService(service).attach_gtt_exits(
-            access_token,
-            instrument_key=order.instrument_key,
-            quantity=order.quantity,
-            product=order.product,
-            exit_transaction_type=order.exit_transaction_type,
-            target_trigger_price=order.target_trigger_price,
-            stoploss_trigger_price=order.stoploss_trigger_price,
-            slice_quantity=slice_quantity,
-            pending_oco_store=PendingOcoPairsStore(settings),
-        )
-    except AppConfigError as exc:
-        raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
-    if result.get("status") in ("partial_success", "error"):
-        await notification_service.record(
-            category="risk",
-            severity="critical",
-            title="GTT exit protection incomplete",
-            message=f"Attaching target/stoploss for {order.instrument_key} ended with status '{result.get('status')}'.",
-            details={"instrument_key": order.instrument_key, "slices": result.get("slices")},
-        )
-    return result
-
-
 @protected_router.post("/orders/exit-all")
 async def exit_all_positions(
     service: UpstoxService = Depends(get_upstox_service),
@@ -989,7 +922,6 @@ async def exit_all_positions(
         result = await SmartOrderService(service).exit_all_positions(
             access_token,
             instrument_rules_service=InstrumentRulesService(settings),
-            pending_oco_store=PendingOcoPairsStore(settings),
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
@@ -1015,7 +947,6 @@ async def exit_positions(
             access_token,
             instrument_keys=request.instrument_keys,
             instrument_rules_service=InstrumentRulesService(settings),
-            pending_oco_store=PendingOcoPairsStore(settings),
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
@@ -1065,44 +996,6 @@ async def cancel_orders(
     """
     access_token = _load_access_token(token_store)
     return await OrderCancellationService(service).cancel_orders(access_token, request.order_ids)
-
-
-@protected_router.post("/orders/cancel-resting-exit")
-async def cancel_resting_exit(
-    request: CancelRestingExitRequest,
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-    notification_service: NotificationService = Depends(get_notification_service),
-) -> dict[str, Any]:
-    """Best-effort cancels a still-resting plain (non-GTT) stoploss order -- see
-    SmartOrderService.cancel_resting_stoploss_orders -- for one instrument, before the app submits
-    a fresh opposite-side smart-bracket order to manually close that position from the sticky
-    action panel. A position protected by a real GTT bracket needs no equivalent call (Upstox
-    cleans up its own bracket legs once flattened); this only matters for a position whose
-    protection came from `POST /orders/gtt/attach-exits` instead. Always reports success -- same
-    best-effort posture as the internal call `exit_positions` already makes for bulk/max-loss
-    flattening: a failed lookup/cancel here just means the order that follows fails exactly the
-    way it would have without this call.
-    """
-    access_token = _load_access_token(token_store)
-    try:
-        result = await SmartOrderService(service).cancel_resting_stoploss_orders(
-            access_token,
-            instrument_keys={request.instrument_key},
-            pending_oco_store=PendingOcoPairsStore(settings),
-        )
-        if result["failed"]:
-            await notification_service.record(
-                category="risk",
-                severity="critical",
-                title="Resting stoploss could not be cancelled",
-                message=f"{len(result['failed'])} stoploss order(s) for {request.instrument_key} could not be cancelled before this exit.",
-                details={"instrument_key": request.instrument_key, "failed_order_ids": result["failed"]},
-            )
-    except UpstoxApiError:
-        pass
-    return {"status": "success"}
 
 
 def _load_access_token(token_store: EncryptedTokenStore) -> str:

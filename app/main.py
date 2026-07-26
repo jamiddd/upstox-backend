@@ -19,7 +19,6 @@ from app.services.feed_subscription_manager import FeedSubscriptionManager
 from app.services.live_candle_builder import LiveCandleBuilder, feed_candle_to_cache_row
 from app.services.notification_service import NotificationService
 from app.services.notification_retention import run_notification_retention
-from app.services.oco_watcher import run_oco_watcher
 from app.services.account_snapshot_scheduler import run_account_snapshot_scheduler
 from app.services.oi_snapshot_collector import run_oi_snapshot_collector
 from app.services.order_fill_detector import OrderFillDetector
@@ -125,11 +124,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # client is actively polling. Cancelled cleanly on shutdown, same as any other background task
     # tied to the app's own lifetime.
     poller_task = asyncio.create_task(run_tracked_instruments_poller(settings))
-    # See PendingOcoPairsStore / run_oco_watcher's own doc comment -- reconciles the plain
-    # target/stoploss order pairs SmartOrderService.attach_gtt_exits places for a position with
-    # no GTT bracket, independent of whether the app itself is open. Same lifecycle as the poller
-    # above.
-    oco_watcher_task = asyncio.create_task(run_oco_watcher(settings))
     oi_collector_task = asyncio.create_task(run_oi_snapshot_collector(settings))
     account_snapshot_task = asyncio.create_task(
         run_account_snapshot_scheduler(settings, notification_service),
@@ -221,7 +215,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         poller_task.cancel()
-        oco_watcher_task.cancel()
         oi_collector_task.cancel()
         account_snapshot_task.cancel()
         auth_watchdog_task.cancel()
@@ -229,8 +222,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         subscription_refresh_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await poller_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await oco_watcher_task
         with contextlib.suppress(asyncio.CancelledError):
             await oi_collector_task
         with contextlib.suppress(asyncio.CancelledError):

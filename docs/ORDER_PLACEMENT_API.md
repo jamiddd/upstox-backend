@@ -5,13 +5,16 @@ Backend contract for placing app smart orders.
 The app used to also have `POST /api/orders/market-bracket` (a real immediate-fill MARKET entry
 with target/stoploss GTT exits attached after) plus `GET /api/orders/pending-exits` and
 `PUT /api/orders/pending-exits/target-price` for viewing/editing those exits before they resolved
--- retired for being unreliable in live trading. Every order the app places now goes through
-Smart Bracket Order below, a real Upstox GTT bracket. `POST /api/orders/gtt/attach-exits` (see
-below) is unrelated to that retired flow -- it's a still-live fallback for attaching protection to
-a position that has no GTT bracket at all (e.g. opened outside the app), and keeps using the same
-underlying pending-exit/`oco_watcher` mechanism -- as does `POST /api/orders/cancel-resting-exit`
-(also below), which replaced the old pending-exits lookup for the one thing that still needed it:
-clearing a resting plain stoploss order before the app manually closes such a position.
+-- retired for being unreliable in live trading. A later fallback, `POST
+/api/orders/gtt/attach-exits` (for attaching protection to a position with no GTT bracket at
+all, e.g. opened outside the app) plus its own `POST /api/orders/cancel-resting-exit` helper, was
+retired too -- its watched-target mechanism (a background poller that armed the target as a
+price level and fired a MARKET order once price crossed it) had a real silent-failure mode if
+that market order itself failed after the position was already dropped from tracking. Every
+order the app places now goes exclusively through Smart Bracket Order below, a real Upstox GTT
+bracket for both target and stoploss placed atomically at entry -- there is no in-app recovery
+path for a position that somehow ends up without one; that has to be handled directly in
+Upstox's own app.
 
 All endpoints require:
 
@@ -188,113 +191,6 @@ Response (raw passthrough of the matching Upstox GTT order entries):
 ]
 ```
 
-## Attach GTT Exits
-
-```http
-POST /api/orders/gtt/attach-exits
-```
-
-Attaches a target and a stoploss to an already-open position that has **no existing GTT
-bracket** (`GET /api/orders/gtt` above returned nothing usable). Unlike Smart Bracket Order,
-this never submits a new entry.
-
-Only the **stoploss** is ever placed as a real Upstox order (a plain `SL-M` order, not GTT --
-GTT requires exactly one `ENTRY` rule in every order, so a `type=SINGLE` order with only a
-`TARGET` or `STOPLOSS` rule is rejected outright: "One ENTRY strategy is required."). Placing
-*both* legs as live orders doesn't work either: Upstox reserves the full held quantity against
-the first live SELL order placed, so a second SELL order for the same quantity has nothing left
-to "cover" it and gets margin-checked as a brand new naked short (a "You need to add Rs. X in
-your account" rejection) -- there's no way to have two live sell orders each covering the full
-position at once.
-
-So the **target** is armed as a price level the backend's own background watcher
-(`app/services/oco_watcher.py`) polls against live quotes every 5s, and only becomes a real
-`MARKET` order once price actually crosses it -- at which point the stoploss order above is
-cancelled. This trades the target's precision (it fires as a market order once the watcher
-notices the cross, not a resting limit order at the exact price) for correctness (no rejected
-second order). The response below still carries a `target` sub-object per slice (mirroring
-`stoploss`) purely so existing per-leg error handling keeps working -- there's no separate
-placement outcome for `target` any more since it was never a live order.
-
-`exit_transaction_type` is the *exit* side, i.e. the opposite of how the position was opened
-(`"SELL"` to attach exits to a long position, `"BUY"` for a short) -- required since a plain
-order has no `ENTRY` leg to infer direction from.
-
-Like Smart Bracket Order, `quantity` is sliced into multiple stoploss orders (each with its own
-watched target) when it exceeds the instrument's `freeze_quantity` -- a position sized over
-freeze quantity would otherwise be rejected outright by Upstox. If `slice_quantity` is provided,
-it overrides the instrument freeze quantity.
-
-There's no dedicated endpoint to view or edit a pending exit once armed -- the stoploss leg's own
-price can still be re-pointed through the ordinary `PUT /orders/modify` below (a real order), but
-the watched target price itself isn't currently exposed for editing after the fact. When the
-client is about to manually close a position that might be protected this way (rather than by a
-real GTT bracket), see `POST /orders/cancel-resting-exit` below.
-
-Request:
-
-```json
-{
-  "instrument_key": "NSE_FO|111",
-  "quantity": 75,
-  "product": "I",
-  "exit_transaction_type": "SELL",
-  "target_trigger_price": 140.0,
-  "stoploss_trigger_price": 115.0
-}
-```
-
-Fields:
-
-```text
-instrument_key required
-quantity required, positive integer, validated against the instrument's lot_size
-product optional, I|D|MTF, default I
-exit_transaction_type required, BUY|SELL
-target_trigger_price required, positive number, validated against tick_size
-stoploss_trigger_price required, positive number, validated against tick_size
-slice_quantity optional, positive integer
-```
-
-Each slice's target/stoploss legs are placed independently, so one failing doesn't stop the
-rest. Response:
-
-```json
-{
-  "status": "partial_success",
-  "total_quantity": 3750,
-  "slice_quantity": 1800,
-  "slice_count": 3,
-  "slices": [
-    {
-      "slice_number": 1,
-      "quantity": 1800,
-      "target": { "status": "success", "submitted_order": {}, "upstox_response": {} },
-      "stoploss": { "status": "success", "submitted_order": {}, "upstox_response": {} }
-    },
-    {
-      "slice_number": 2,
-      "quantity": 1800,
-      "target": { "status": "success", "submitted_order": {}, "upstox_response": {} },
-      "stoploss": {
-        "status": "error",
-        "submitted_order": {},
-        "error": "GTT order cannot be placed"
-      }
-    },
-    {
-      "slice_number": 3,
-      "quantity": 150,
-      "target": { "status": "success", "submitted_order": {}, "upstox_response": {} },
-      "stoploss": { "status": "success", "submitted_order": {}, "upstox_response": {} }
-    }
-  ]
-}
-```
-
-Top-level `status` is `success` (every slice's stoploss placed), `partial_success` (some placed),
-or `error` (none placed).
-
 ## Modify GTT Order
 
 ```http
@@ -466,34 +362,3 @@ Response:
 The top-level status is `success`, `partial_success`, or `error`. A failed item does
 not roll back successful modifications because Upstox processes them as independent
 orders.
-
-## Cancel Resting Exit
-
-```http
-POST /api/orders/cancel-resting-exit
-```
-
-Best-effort cancels a still-resting plain (non-GTT) stoploss order for one instrument -- see
-Attach GTT Exits above -- before the client submits a fresh opposite-side Smart Bracket Order to
-manually close that position from the sticky action panel. Without this, Upstox can see more
-pending exit exposure than the position actually holds and reject the fresh order for margin (a
-"naked excess"), since the resting stoploss already reserves the full quantity.
-
-A position protected by a real GTT bracket needs no equivalent call -- Upstox cleans up its own
-bracket legs once the position is flattened. This only matters for a position whose protection
-came from `POST /orders/gtt/attach-exits` instead, which is what `PendingOcoPairsStore` tracks.
-Bulk/max-loss flattening (`POST /orders/exit-positions`/`exit-all`) already does this same
-cancellation internally for every position being closed; this endpoint exposes the same
-mechanism for a single manual close.
-
-Request:
-
-```json
-{
-  "instrument_key": "NSE_FO|111"
-}
-```
-
-Response: always `{"status": "success"}`, whether or not anything was actually cancelled -- a
-failed lookup/cancel here just means the order that follows fails exactly the way it would have
-without this call.

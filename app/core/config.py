@@ -24,7 +24,6 @@ class Settings:
     token_encryption_key: str
     token_store_path: Path
     tracked_instruments_path: Path = Path("/data/tracked_instruments.json")
-    pending_oco_pairs_path: Path = Path("/data/pending_oco_pairs.json")
     account_snapshot_path: Path = Path("/data/account_snapshot.json")
     oi_database_path: Path = Path("/data/oi_snapshots.sqlite3")
     notification_database_path: Path = Path("/data/notifications.sqlite3")
@@ -62,9 +61,6 @@ class Settings:
             token_store_path=Path(os.getenv("TOKEN_STORE_PATH", "/data/upstox_token.enc")),
             tracked_instruments_path=Path(
                 os.getenv("TRACKED_INSTRUMENTS_PATH", "/data/tracked_instruments.json"),
-            ),
-            pending_oco_pairs_path=Path(
-                os.getenv("PENDING_OCO_PAIRS_PATH", "/data/pending_oco_pairs.json"),
             ),
             account_snapshot_path=Path(
                 os.getenv("ACCOUNT_SNAPSHOT_PATH", "/data/account_snapshot.json"),

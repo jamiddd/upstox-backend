@@ -5,8 +5,6 @@ from typing import Any, Optional
 
 from app.core.exceptions import AppConfigError, UpstoxApiError
 from app.services.instrument_rules_service import InstrumentRulesService, slice_quantity_for_freeze
-from app.services.order_book_lookup import TERMINAL_ORDER_STATUSES, index_orders_by_id, order_status
-from app.services.pending_oco_pairs_store import PendingExit, PendingOcoPairsStore
 from app.services.upstox_service import UpstoxService
 
 _EXIT_MAX_ATTEMPTS = 3
@@ -86,124 +84,6 @@ class SmartOrderService:
             "slices": placed_slices,
         }
 
-    async def attach_gtt_exits(
-        self,
-        access_token: str,
-        *,
-        instrument_key: str,
-        quantity: int,
-        product: str,
-        exit_transaction_type: str,
-        target_trigger_price: float,
-        stoploss_trigger_price: float,
-        slice_quantity: int,
-        pending_oco_store: PendingOcoPairsStore,
-    ) -> dict[str, Any]:
-        """Attaches a target and a stoploss to an already-open position that has no existing GTT
-        bracket, without touching the entry.
-
-        FIX: this used to place two independent GTT type=SINGLE orders per slice, which Upstox
-        rejected outright (every GTT order requires exactly one ENTRY rule, which a SINGLE-with-
-        no-ENTRY shape never had -- "One ENTRY strategy is required.", 100% of the time). Switching
-        both legs to plain (non-GTT) orders fixed *that* rejection, but hit a second, harder wall:
-        Upstox rejects the *second* live SELL order for the same already-held quantity outright.
-        Placing a LIMIT sell for the full position reserves all of it against that order; a second
-        SELL order for the same quantity (the SL-M stoploss) then has nothing left to "cover" it,
-        so Upstox margin-checks it as a brand new naked short (the "You need to add Rs. X in your
-        account" rejection) -- there is no way to have two live sell orders each covering the full
-        position at once.
-
-        So only the stoploss is ever placed as a real order now -- it's the safety-critical leg.
-        The target is armed as a price level `oco_watcher`'s background loop itself watches
-        against live quotes, and only becomes a real MARKET order once price actually crosses it
-        (see that module's own doc comment, and [PendingExit] for the full reasoning). This trades
-        the target leg's precision for correctness: it fires as a market order once the watcher's
-        own tick notices the cross, not as a resting limit order sitting at the exact price, so a
-        fast-moving price can slip a little between the cross and the fill.
-
-        [exit_transaction_type] is the *exit* side (opposite of how the position was opened --
-        e.g. "SELL" to exit a long). [quantity] is sliced by [slice_quantity] the same way
-        place_bracket_order slices its own entry -- a position sized over the instrument's freeze
-        quantity would otherwise be rejected outright by Upstox.
-
-        Best-effort per slice, same as exit_positions: one slice's stoploss failing to place
-        doesn't stop the rest. Returns "success" (every slice's stoploss placed), "partial_success"
-        (some placed), or "error" (none placed). The response still carries a "target" sub-object
-        per slice (mirroring "stoploss") purely so the app's existing per-leg error rendering
-        keeps working unchanged -- there's no separate placement outcome for "target" any more
-        since it was never a live order to begin with.
-        """
-        slices = _split_quantity(quantity, slice_quantity)
-        placed_slices: list[dict[str, Any]] = []
-        for index, slice_qty in enumerate(slices, start=1):
-            order = {
-                "quantity": slice_qty,
-                "product": product,
-                "order_type": "SL-M",
-                "price": 0.0,
-                "trigger_price": stoploss_trigger_price,
-                "instrument_token": instrument_key,
-                "transaction_type": exit_transaction_type,
-            }
-            try:
-                response = await self.upstox.place_order(
-                    access_token,
-                    instrument_key=instrument_key,
-                    transaction_type=exit_transaction_type,
-                    quantity=slice_qty,
-                    product=product,
-                    order_type="SL-M",
-                    price=0.0,
-                    trigger_price=stoploss_trigger_price,
-                )
-                stoploss_order_id = _extract_order_id(response)
-                leg_result = {
-                    "status": "success",
-                    "submitted_order": order,
-                    "upstox_response": response,
-                }
-                if stoploss_order_id:
-                    pending_oco_store.add(
-                        PendingExit(
-                            stoploss_order_id=stoploss_order_id,
-                            instrument_key=instrument_key,
-                            exit_transaction_type=exit_transaction_type,
-                            quantity=slice_qty,
-                            product=product,
-                            target_trigger_price=target_trigger_price,
-                        )
-                    )
-            except UpstoxApiError as exc:
-                leg_result = {
-                    "status": "error",
-                    "submitted_order": order,
-                    "error": str(exc),
-                }
-            placed_slices.append(
-                {
-                    "slice_number": index,
-                    "quantity": slice_qty,
-                    "target": leg_result,
-                    "stoploss": leg_result,
-                }
-            )
-
-        successes = sum(
-            1
-            for slice_result in placed_slices
-            for leg in ("target", "stoploss")
-            if slice_result[leg]["status"] == "success"
-        )
-        total_legs = len(placed_slices) * 2
-        overall_status = "success" if successes == total_legs else "partial_success" if successes else "error"
-        return {
-            "status": overall_status,
-            "total_quantity": quantity,
-            "slice_quantity": slice_quantity,
-            "slice_count": len(slices),
-            "slices": placed_slices,
-        }
-
     async def get_gtt_orders_for_instrument(
         self, access_token: str, *, instrument_key: str | None = None, include_history: bool = False
     ) -> list[dict[str, Any]]:
@@ -273,15 +153,14 @@ class SmartOrderService:
         access_token: str,
         *,
         instrument_rules_service: InstrumentRulesService,
-        pending_oco_store: PendingOcoPairsStore,
     ) -> dict[str, Any]:
-        """Flattens every currently open position -- backs the app's max-loss auto square-off
-        (see MainViewModel.watchMaxLoss). Thin wrapper over exit_positions with no filter.
+        """Flattens every currently open position -- backs both the app's own max-loss auto
+        square-off (MainViewModel.checkMaxLoss) and the backend's own max-loss watcher
+        (max_loss_watcher.py). Thin wrapper over exit_positions with no filter.
         """
         return await self.exit_positions(
             access_token,
             instrument_rules_service=instrument_rules_service,
-            pending_oco_store=pending_oco_store,
         )
 
     async def exit_positions(
@@ -290,7 +169,6 @@ class SmartOrderService:
         *,
         instrument_keys: Optional[list[str]] = None,
         instrument_rules_service: InstrumentRulesService,
-        pending_oco_store: PendingOcoPairsStore,
     ) -> dict[str, Any]:
         """Flattens open positions (quantity != 0) with an immediate market order in the opposite
         direction. [instrument_keys] is None means every open position (exit_all_positions above);
@@ -320,22 +198,6 @@ class SmartOrderService:
                 for item in open_positions
                 if _string_value(item, "instrument_token", "instrument_key") in wanted
             ]
-
-        # A still-active plain stoploss order (see attach_gtt_exits) reserves exit-side quantity
-        # against its position -- flattening with a *fresh* market order on top of that makes
-        # Upstox see more pending exposure than the position actually holds and reject it demanding
-        # margin for a "naked" excess (the same rejection the app's own `POST
-        # /orders/cancel-resting-exit` route exists to prevent for a manual single-position close).
-        # Best-effort and never blocks flattening below: a failed lookup/cancel here just means
-        # the market order that follows fails exactly the way it did before this existed.
-        target_instrument_keys = {
-            _string_value(item, "instrument_token", "instrument_key") for item in open_positions
-        }
-        await self.cancel_resting_stoploss_orders(
-            access_token,
-            instrument_keys=target_instrument_keys,
-            pending_oco_store=pending_oco_store,
-        )
 
         original_quantities = {
             _string_value(position, "instrument_token", "instrument_key"):
@@ -424,14 +286,6 @@ class SmartOrderService:
                 }
             if not positions_to_attempt:
                 break
-            # A transient cancellation/order-book failure may have left a plain protective
-            # stop-loss reserving the exit quantity on the first pass. Retry that cancellation
-            # for only the instruments that are still open before submitting another market exit.
-            await self.cancel_resting_stoploss_orders(
-                access_token,
-                instrument_keys=set(open_by_key) & failed_keys,
-                pending_oco_store=pending_oco_store,
-            )
 
         return {
             "status": "success",
@@ -442,76 +296,6 @@ class SmartOrderService:
             ],
         }
 
-    async def cancel_resting_stoploss_orders(
-        self,
-        access_token: str,
-        *,
-        instrument_keys: set[Optional[str]],
-        pending_oco_store: PendingOcoPairsStore,
-    ) -> dict[str, list[str]]:
-        """Cancels whichever plain (non-GTT) stoploss orders -- see [PendingExit]/attach_gtt_exits
-        -- are still resting for [instrument_keys], before a fresh opposite-side order is about to
-        be submitted against the same instrument(s). Only the plain-order mechanism is handled: a
-        real GTT bracket has no equivalent standalone stoploss order to cancel, and Upstox itself
-        cleans up a GTT bracket's remaining legs once the position it was watching is actually
-        flattened.
-
-        Two callers: [exit_positions] (bulk/max-loss flattening, [instrument_keys] is every
-        position being closed) and the app's own `POST /orders/cancel-resting-exit` route (a
-        single position the user is manually closing via a fresh opposite-side smart-bracket
-        order -- see that route's own doc comment for why it needs this too).
-
-        A cancelled stoploss's own paired pending target is cleaned up server-side by
-        `oco_watcher` on its own next tick, nothing to do here beyond the cancel itself.
-
-        Returns `{"cancelled": [order_id, ...], "failed": [order_id, ...]}` so a caller (the
-        standalone route) can tell the user when a still-live stoploss couldn't actually be
-        cancelled -- this used to be entirely silent (`cancelled_any: bool` didn't survive past
-        this function), which meant a manual close could proceed while a stale stoploss was still
-        resting behind it with no way for the app to know.
-        """
-        pending_exits = [
-            pending_exit
-            for pending_exit in pending_oco_store.load()
-            if pending_exit.instrument_key in instrument_keys
-        ]
-        if not pending_exits:
-            return {"cancelled": [], "failed": []}
-
-        try:
-            order_book_payload = await self.upstox.get_order_book(access_token)
-        except UpstoxApiError:
-            # Protective-order cleanup is best-effort. A temporary order-book failure must not
-            # prevent the emergency market exit itself from being attempted.
-            return {"cancelled": [], "failed": [pending_exit.stoploss_order_id for pending_exit in pending_exits]}
-        orders_by_id = index_orders_by_id(order_book_payload)
-
-        cancelled: list[str] = []
-        failed: list[str] = []
-        for pending_exit in pending_exits:
-            stoploss_order = orders_by_id.get(pending_exit.stoploss_order_id)
-            if stoploss_order is None or order_status(stoploss_order) in TERMINAL_ORDER_STATUSES:
-                continue
-            try:
-                await self.upstox.cancel_order(access_token, pending_exit.stoploss_order_id)
-                cancelled.append(pending_exit.stoploss_order_id)
-            except UpstoxApiError:
-                failed.append(pending_exit.stoploss_order_id)
-
-        if cancelled:
-            # Gives Upstox a moment to actually release the quantity/margin the cancelled
-            # order(s) were holding before the order that follows (a flattening market order, or
-            # the app's own fresh smart-bracket close order) asks for it -- without this, a
-            # cancel-then-immediately-place sequence can still race and hit the same rejection the
-            # cancel was meant to prevent.
-            await asyncio.sleep(_EXIT_ORDER_CANCEL_SETTLE_SECONDS)
-
-        return {"cancelled": cancelled, "failed": failed}
-
-
-# How long to wait after cancelling a resting stoploss order before submitting whatever order
-# follows -- see cancel_resting_stoploss_orders's own doc comment.
-_EXIT_ORDER_CANCEL_SETTLE_SECONDS = 0.8
 
 # Terminal GTT statuses -- anything else (e.g. a still-pending/triggered rule) is treated as
 # active. See SmartOrderService.get_gtt_orders_for_instrument.
@@ -641,17 +425,3 @@ def _string_value(payload: dict[str, Any], *names: str) -> str:
         if isinstance(value, str):
             return value
     return ""
-
-
-def _extract_order_id(place_order_response: dict[str, Any]) -> Optional[str]:
-    """Pulls the new order's id out of a Place Order V3 response (`{"data": {"order_id":
-    "..."}}`) -- see SmartOrderService.attach_gtt_exits, which needs each leg's own order id to
-    register the pair for OCO watching. Returns None for any unexpected shape rather than raising
-    -- a leg that placed successfully but whose id couldn't be read just doesn't get OCO-watched,
-    same "degrade, don't crash" posture as the rest of this service's best-effort semantics.
-    """
-    data = place_order_response.get("data")
-    if not isinstance(data, dict):
-        return None
-    order_id = data.get("order_id")
-    return order_id if isinstance(order_id, str) else None

@@ -15,10 +15,6 @@ class TrackedInstrumentsStoreError(RuntimeError):
     """Raised when the tracked-instruments store cannot be used."""
 
 
-class PendingOcoPairsStoreError(RuntimeError):
-    """Raised when the pending-OCO-pairs store cannot be used."""
-
-
 class UpstoxAuthRequiredError(RuntimeError):
     """Raised when an Upstox-backed route is called before login."""
 
