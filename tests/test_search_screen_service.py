@@ -69,3 +69,17 @@ def test_search_contracts_returns_contracts_across_all_expiries() -> None:
         "2026-09-24",
     }
     assert len(response["results"]) == 3
+
+
+def test_search_contracts_uses_selected_equity_underlying_key() -> None:
+    upstox = _FakeUpstoxService()
+
+    asyncio.run(
+        SearchScreenService(upstox).search_contracts(
+            "access-token",
+            query="RELIANCE",
+            underlying_key="NSE_EQ|INE002A01018",
+        )
+    )
+
+    assert upstox.requested_underlying == "NSE_EQ|INE002A01018"

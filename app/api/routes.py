@@ -731,6 +731,7 @@ async def search_underlyings(
 @protected_router.get("/search/contracts")
 async def search_contracts(
     query: str = Query(min_length=2, max_length=50),
+    underlying_key: Optional[str] = Query(default=None, min_length=3, max_length=200),
     limit: int = Query(default=30, ge=1, le=30),
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
@@ -741,6 +742,7 @@ async def search_contracts(
         return await SearchScreenService(service).search_contracts(
             access_token,
             query=query,
+            underlying_key=underlying_key,
             limit=limit,
         )
     except UpstoxApiError as exc:

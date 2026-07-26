@@ -119,6 +119,7 @@ class SearchScreenService:
         access_token: str,
         *,
         query: str,
+        underlying_key: Optional[str] = None,
         limit: int = 30,
     ) -> dict[str, Any]:
         """Return the complete listed option catalogue for one supported underlying.
@@ -131,7 +132,7 @@ class SearchScreenService:
         if len(normalized_query) < 2:
             return {"query": normalized_query, "results": []}
         upper_query = normalized_query.upper()
-        underlying_key = next(
+        resolved_underlying_key = underlying_key or next(
             (
                 item["instrument_key"]
                 for item in DEFAULT_OPTION_INDICES
@@ -139,13 +140,13 @@ class SearchScreenService:
             ),
             None,
         )
-        if underlying_key is None and upper_query == "SENSEX":
+        if resolved_underlying_key is None and upper_query == "SENSEX":
             sensex = await self._sensex_default_entry(access_token)
-            underlying_key = sensex.get("instrument_key") if sensex else None
-        if not underlying_key:
+            resolved_underlying_key = sensex.get("instrument_key") if sensex else None
+        if not resolved_underlying_key:
             return {"query": normalized_query, "results": []}
 
-        payload = await self.upstox.get_option_contracts(access_token, underlying_key)
+        payload = await self.upstox.get_option_contracts(access_token, resolved_underlying_key)
         data = payload.get("data")
         results: list[dict[str, Any]] = []
         if isinstance(data, list):
