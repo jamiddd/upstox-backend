@@ -52,18 +52,23 @@ class MainScreenService:
         quote = await self._quotes(access_token, [underlying_key])
         summary = await self.summary(access_token)
         positions = await self._positions(access_token)
+        underlying_quote = _find_quote(quote, underlying_key)
 
         return {
             "underlying": {
                 "instrument_key": underlying_key,
                 "symbol": _underlying_symbol(underlying_key, contracts),
                 "name": _underlying_name(underlying_key, contracts),
-                "spot_price": _last_price(_find_quote(quote, underlying_key)),
+                "spot_price": _last_price(underlying_quote),
                 # Previous trading day's close -- lets the app show a "(+0.40%)" change badge
                 # next to the spot price. Fetched directly from the daily candle endpoint (the
                 # previous *completed* session's own close), not derived from a live quote's
                 # `net_change` field -- see _fetch_previous_close's doc comment for why.
-                "previous_close": await self._fetch_previous_close(access_token, underlying_key, date.today()),
+                "previous_close": await self._fetch_previous_close(
+                    access_token,
+                    underlying_key,
+                    _last_trade_date(underlying_quote, fallback=date.today()),
+                ),
             },
             "expiries": expiries,
             "selected_expiry": selected_expiry,
@@ -247,6 +252,7 @@ class MainScreenService:
         positions = []
         for key in keys:
             quote = _find_quote(quotes, key)
+            session_date = _last_trade_date(quote, fallback=today)
             if not quote:
                 # Upstox keys its quotes response by a colon-separated "EXCHANGE:SYMBOL" form,
                 # not the pipe-separated instrument_key used in the request, so _find_quote's
@@ -262,7 +268,7 @@ class MainScreenService:
                 {
                     "instrument_key": key,
                     "ltp": _last_price(quote),
-                    "previous_close": await self._fetch_previous_close(access_token, key, today),
+                    "previous_close": await self._fetch_previous_close(access_token, key, session_date),
                 }
             )
         return {"positions": positions}
@@ -453,7 +459,7 @@ class MainScreenService:
         _cache_set(cache_key, payload, ttl_seconds=1.0)
         return _positions_data(payload)
 
-    async def _fetch_previous_close(self, access_token: str, instrument_key: str, today: date) -> float:
+    async def _fetch_previous_close(self, access_token: str, instrument_key: str, session_date: date) -> float:
         """The previous *completed* trading session's actual closing price for [instrument_key].
 
         FIX: this used to be derived from a live quote's `net_change` field (`last_price -
@@ -463,18 +469,28 @@ class MainScreenService:
         a gap-open), which showed up as a change badge reading the wrong *direction* entirely
         (e.g. "+0.5%" on a day that gapped down). The only way to get the real previous close
         without trusting a derived field is to ask for it directly -- the daily candle endpoint's
-        most recent completed session (`to_date` = yesterday) *is* that close, full stop.
+        most recent completed session (`to_date` = the day before [session_date]) *is* that close,
+        full stop.
+
+        FIX: [session_date] must be the trading session the live quote's own price actually
+        belongs to (see `_last_trade_date`, derived from the quote's `last_trade_time`) -- NOT
+        `date.today()`. Over a weekend/holiday, `date.today()` is a non-trading day while the
+        live LTP is still showing Friday's frozen close; fetching "the most recent completed
+        session before today" then resolves to that *same* Friday session, making previous_close
+        equal the current price and every change badge read a flat 0.00% no matter how Friday
+        itself actually moved. Using the quote's real session date instead correctly walks back
+        one further session (e.g. Thursday) in that case, same as any regular trading day.
 
         Cached per (instrument_key, day) since this value is fixed for the entire trading day --
         avoids re-fetching it on every position-quotes/bootstrap poll.
         """
-        cache_key = ("previous_close", instrument_key, today.isoformat())
+        cache_key = ("previous_close", instrument_key, session_date.isoformat())
         cached = _cache_get(cache_key)
         if cached is not None:
             return cached["close"]
 
-        yesterday = today - timedelta(days=1)
-        from_date = (today - timedelta(days=10)).isoformat()
+        yesterday = session_date - timedelta(days=1)
+        from_date = (session_date - timedelta(days=10)).isoformat()
         try:
             payload = await self.upstox.get_historical_candle(
                 access_token,
@@ -720,6 +736,26 @@ def _option_side(side: Any) -> Optional[dict[str, Any]]:
 
 def _last_price(quote: dict[str, Any]) -> float:
     return _number_value(quote, "last_price", "ltp")
+
+
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _last_trade_date(quote: dict[str, Any], *, fallback: date) -> date:
+    """The IST calendar date [quote]'s own `last_price` actually traded on -- from its
+    `last_trade_time` (epoch milliseconds, per a real captured Upstox quote response), not
+    `date.today()`. See `_fetch_previous_close`'s own doc comment for why this distinction
+    matters: over a weekend/holiday, `last_trade_time` still correctly points at Friday while
+    `date.today()` has already moved on to Saturday/Sunday. Falls back to [fallback] (the
+    caller's own `date.today()`) if the field is missing/unparseable rather than failing the
+    whole quote -- same degrade-gracefully posture as every other quote field helper here.
+    """
+    raw = quote.get("last_trade_time")
+    try:
+        epoch_millis = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return datetime.fromtimestamp(epoch_millis / 1000, tz=_IST).date()
 
 
 def _latest_daily_close(payload: dict[str, Any]) -> float:
