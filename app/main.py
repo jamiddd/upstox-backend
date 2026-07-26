@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -16,13 +18,18 @@ from app.services.auth_watchdog import run_auth_watchdog
 from app.services.candle_cache_store import CandleCacheStore
 from app.services.fcm_service import FcmService
 from app.services.feed_subscription_manager import FeedSubscriptionManager
+from app.services.instrument_rules_service import InstrumentRulesService
 from app.services.live_candle_builder import LiveCandleBuilder, feed_candle_to_cache_row
-from app.services.max_loss_watcher import run_max_loss_watcher
+from app.services.max_loss_settings_store import MaxLossSettingsStore
+from app.services.max_loss_watcher import check_now as check_max_loss_now
+from app.services.max_loss_watcher import run_max_loss_watcher_fallback
 from app.services.notification_service import NotificationService
 from app.services.notification_retention import run_notification_retention
 from app.services.account_snapshot_scheduler import run_account_snapshot_scheduler
 from app.services.oi_snapshot_collector import run_oi_snapshot_collector
 from app.services.order_fill_detector import OrderFillDetector
+from app.services.position_pnl_tracker import PositionPnlTracker
+from app.services.smart_order_service import SmartOrderService
 from app.services.stream_connection_manager import StreamConnectionManager
 from app.services.token_store import EncryptedTokenStore
 from app.services.tracked_instruments_poller import run_tracked_instruments_poller
@@ -53,10 +60,30 @@ logger = logging.getLogger(__name__)
 # isn't otherwise pushed to the feed subscription manager immediately.
 _SUBSCRIPTION_REFRESH_INTERVAL_SECONDS = 60.0
 
+# Fallback-only cadence for PositionPnlTracker's own structural refresh -- _on_portfolio_update
+# already triggers an immediate one on every real order/position change; see
+# _run_position_tracker_refresh's own doc comment for what this interval actually catches.
+_POSITION_TRACKER_REFRESH_INTERVAL_SECONDS = 15.0
+
 # How many consecutive disconnected/auth-pending transitions one of the backend's own Upstox feed
 # connections can have before it's worth a notification -- avoids notifying on a single transient
 # reconnect, which is routine and self-healing.
 _FEED_FAILURE_NOTIFY_THRESHOLD = 3
+
+
+@dataclass
+class _MaxLossWatcherDeps:
+    """Bundles what check_max_loss_now needs so _on_market_tick's on_tick lambda (called on
+    every single live tick) doesn't need eight separate positional captures. Constructed once in
+    the lifespan, passed by reference -- everything in it is either immutable for the app's
+    lifetime or (exit_all_lock, notification_service) already safe to share across callers."""
+
+    token_store: EncryptedTokenStore
+    settings_store: MaxLossSettingsStore
+    smart_order_service: SmartOrderService
+    instrument_rules_service: InstrumentRulesService
+    notification_service: NotificationService
+    exit_all_lock: asyncio.Lock
 
 
 class _FeedStateNotifier:
@@ -137,11 +164,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     auth_watchdog_task = asyncio.create_task(run_auth_watchdog(settings, notification_service))
     notification_retention_task = asyncio.create_task(run_notification_retention(settings))
+
     # Backend-side backstop for max-loss auto square-off -- reacts even if the app is closed,
-    # backgrounded, or offline. See run_max_loss_watcher's own doc comment.
-    max_loss_watcher_task = asyncio.create_task(
-        run_max_loss_watcher(settings, notification_service, exit_all_lock),
-    )
+    # backgrounded, or offline, and (see check_max_loss_now's own doc comment) reacts to live
+    # market ticks rather than a REST-polling timer. Dedicated token store/UpstoxService instances,
+    # same posture as market_feed_token_store/portfolio_feed_token_store below.
+    max_loss_token_store = EncryptedTokenStore(settings)
+    max_loss_upstox = UpstoxService(settings)
+    position_tracker = PositionPnlTracker(max_loss_upstox, max_loss_token_store)
+    max_loss_settings_store = MaxLossSettingsStore(settings)
+    max_loss_smart_order_service = SmartOrderService(max_loss_upstox)
+    max_loss_instrument_rules_service = InstrumentRulesService(settings)
 
     # The backend's own persistent Upstox connections, replacing the client's direct-to-Upstox
     # WebSocket and the old REST-polling paths for live prices/candles/order status. Stored on
@@ -177,7 +210,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     market_feed_client = UpstoxMarketFeedClient(
         upstox=market_feed_upstox,
         token_store=market_feed_token_store,
-        on_tick=lambda tick: _on_market_tick(candle_builder, stream_manager, tick),
+        on_tick=lambda tick: _on_market_tick(
+            candle_builder, stream_manager, position_tracker, max_loss_watcher_deps, tick,
+        ),
         on_state_change=market_feed_notifier.handle,
     )
     portfolio_feed_token_store = EncryptedTokenStore(settings)
@@ -186,7 +221,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         upstox=portfolio_feed_upstox,
         token_store=portfolio_feed_token_store,
         on_order_update=lambda payload: _on_portfolio_update(
-            order_fill_detector, stream_manager, notification_service, payload,
+            order_fill_detector,
+            stream_manager,
+            notification_service,
+            position_tracker,
+            subscription_manager,
+            payload,
         ),
         on_state_change=portfolio_feed_notifier.handle,
     )
@@ -202,6 +242,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     notification_service.stream_manager = stream_manager
 
+    # Bundled together purely so _on_market_tick's lambda above doesn't need eight positional
+    # captures -- unpacked at each call site instead.
+    max_loss_watcher_deps = _MaxLossWatcherDeps(
+        token_store=max_loss_token_store,
+        settings_store=max_loss_settings_store,
+        smart_order_service=max_loss_smart_order_service,
+        instrument_rules_service=max_loss_instrument_rules_service,
+        notification_service=notification_service,
+        exit_all_lock=exit_all_lock,
+    )
+
     app.state.market_feed_client = market_feed_client
     app.state.portfolio_feed_client = portfolio_feed_client
     app.state.feed_subscription_manager = subscription_manager
@@ -210,10 +261,31 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.notification_service = notification_service
     app.state.fcm_service = fcm_service
 
+    # Best-effort initial fill so open positions are already subscribed (and their live P&L
+    # already known) before the very first tick, not just from whenever the periodic refresh
+    # below happens to next run.
+    with contextlib.suppress(Exception):
+        await position_tracker.refresh()
+        await subscription_manager.set_open_position_instruments(position_tracker.instrument_keys())
+
     market_feed_client.start()
     portfolio_feed_client.start()
     subscription_refresh_task = asyncio.create_task(
         _run_subscription_refresh(subscription_manager),
+    )
+    position_tracker_refresh_task = asyncio.create_task(
+        _run_position_tracker_refresh(position_tracker, subscription_manager),
+    )
+    max_loss_watcher_task = asyncio.create_task(
+        run_max_loss_watcher_fallback(
+            token_store=max_loss_watcher_deps.token_store,
+            settings_store=max_loss_watcher_deps.settings_store,
+            tracker=position_tracker,
+            smart_order_service=max_loss_watcher_deps.smart_order_service,
+            instrument_rules_service=max_loss_watcher_deps.instrument_rules_service,
+            notification_service=max_loss_watcher_deps.notification_service,
+            exit_all_lock=max_loss_watcher_deps.exit_all_lock,
+        ),
     )
 
     await notification_service.record(
@@ -233,6 +305,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         notification_retention_task.cancel()
         max_loss_watcher_task.cancel()
         subscription_refresh_task.cancel()
+        position_tracker_refresh_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await poller_task
         with contextlib.suppress(asyncio.CancelledError):
@@ -247,6 +320,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await max_loss_watcher_task
         with contextlib.suppress(asyncio.CancelledError):
             await subscription_refresh_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await position_tracker_refresh_task
         await market_feed_client.stop()
         await portfolio_feed_client.stop()
 
@@ -263,6 +338,25 @@ async def _run_subscription_refresh(subscription_manager: FeedSubscriptionManage
             raise
         except Exception:
             logger.warning("Feed subscription refresh failed unexpectedly", exc_info=True)
+
+
+async def _run_position_tracker_refresh(
+    tracker: PositionPnlTracker,
+    subscription_manager: FeedSubscriptionManager,
+) -> None:
+    """Periodic structural refresh for PositionPnlTracker -- a fallback only, since
+    _on_portfolio_update already triggers an immediate refresh the moment any order actually
+    changes. Catches whatever that path might miss (e.g. a position opened by some means other
+    than a normal order-placement flow) within this interval instead of indefinitely."""
+    while True:
+        await asyncio.sleep(_POSITION_TRACKER_REFRESH_INTERVAL_SECONDS)
+        try:
+            await tracker.refresh()
+            await subscription_manager.set_open_position_instruments(tracker.instrument_keys())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Position P&L tracker refresh failed unexpectedly", exc_info=True)
 
 
 def _persist_completed_candle(
@@ -299,18 +393,51 @@ def _handle_order_update(detector: OrderFillDetector, payload: dict[str, Any]) -
 def _on_market_tick(
     candle_builder: LiveCandleBuilder,
     stream_manager: StreamConnectionManager,
+    position_tracker: PositionPnlTracker,
+    max_loss_watcher_deps: _MaxLossWatcherDeps,
     tick: FeedTick,
 ) -> None:
     candle_builder.handle_tick(tick)
     asyncio.create_task(stream_manager.dispatch_tick(tick))
+
+    position_tracker.apply_tick(tick.instrument_key, tick.ltp)
+    if tick.instrument_key in position_tracker.instrument_keys():
+        asyncio.create_task(
+            check_max_loss_now(
+                now=datetime.now(timezone.utc),
+                token_store=max_loss_watcher_deps.token_store,
+                settings_store=max_loss_watcher_deps.settings_store,
+                tracker=position_tracker,
+                smart_order_service=max_loss_watcher_deps.smart_order_service,
+                instrument_rules_service=max_loss_watcher_deps.instrument_rules_service,
+                notification_service=max_loss_watcher_deps.notification_service,
+                exit_all_lock=max_loss_watcher_deps.exit_all_lock,
+            ),
+        )
 
 
 def _on_portfolio_update(
     detector: OrderFillDetector,
     stream_manager: StreamConnectionManager,
     notification_service: NotificationService,
+    position_tracker: PositionPnlTracker,
+    subscription_manager: FeedSubscriptionManager,
     payload: dict[str, Any],
 ) -> None:
+    async def _refresh_position_tracker() -> None:
+        try:
+            await position_tracker.refresh()
+            await subscription_manager.set_open_position_instruments(
+                position_tracker.instrument_keys(),
+            )
+        except Exception:
+            logger.warning("Position P&L tracker refresh (on order update) failed", exc_info=True)
+
+    # Any order-related event (new fill, rejection, modification) can mean the open-position set
+    # itself just changed -- refresh immediately rather than waiting for the next periodic tick,
+    # so a newly opened position starts getting live max-loss coverage right away.
+    asyncio.create_task(_refresh_position_tracker())
+
     is_new_fill = _handle_order_update(detector, payload)
     if is_new_fill:
         symbol = payload.get("trading_symbol") or payload.get("instrument_token") or "position"

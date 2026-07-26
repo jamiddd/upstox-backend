@@ -18,6 +18,16 @@ _MARKET_OPEN_NOW = datetime(2026, 7, 21, 10, 0, tzinfo=_IST)  # a Tuesday, mid-s
 _MARKET_CLOSED_NOW = datetime(2026, 7, 21, 20, 0, tzinfo=_IST)
 
 
+class _FakeTracker:
+    """Stands in for PositionPnlTracker -- check_now only ever reads total_pnl()."""
+
+    def __init__(self, pnl: float) -> None:
+        self.pnl = pnl
+
+    def total_pnl(self) -> float:
+        return self.pnl
+
+
 class _FakeTokenStore:
     def __init__(self, *, has_token: bool = True) -> None:
         self._has_token = has_token
@@ -54,24 +64,6 @@ class _RaceSettingsStore(_FakeSettingsStore):
         return self.amount if self.load_calls == 1 else 0.0
 
 
-class _FakeUpstox:
-    def __init__(self, pnl_values: list[float]) -> None:
-        self._pnl_values = pnl_values
-
-    async def get_positions(self, access_token: str) -> dict[str, Any]:
-        return {
-            "data": [
-                {"instrument_token": f"NSE_FO|{i}", "quantity": 75, "pnl": pnl}
-                for i, pnl in enumerate(self._pnl_values)
-            ]
-        }
-
-
-class _FailingUpstox:
-    async def get_positions(self, access_token: str) -> dict[str, Any]:
-        raise UpstoxApiError("Upstox is down")
-
-
 class _FakeSmartOrderService:
     def __init__(self, *, raises: Optional[Exception] = None) -> None:
         self.raises = raises
@@ -100,7 +92,7 @@ def _run(
     now: datetime = _MARKET_OPEN_NOW,
     token_store: Any = None,
     settings_store: Any,
-    upstox: Any,
+    pnl: float,
     smart_order_service: Any = None,
     notification_service: Any = None,
 ) -> tuple[Any, Any]:
@@ -109,11 +101,11 @@ def _run(
 
     async def go() -> None:
         lock = asyncio.Lock()
-        await watcher._check_once(
+        await watcher.check_now(
             now=now,
             token_store=token_store or _FakeTokenStore(),
             settings_store=settings_store,
-            upstox=upstox,
+            tracker=_FakeTracker(pnl),
             smart_order_service=smart_order_service,
             instrument_rules_service=InstrumentRulesService(_settings_stub()),
             notification_service=notification_service,
@@ -136,67 +128,42 @@ def _settings_stub() -> Settings:
     )
 
 
-def test_positions_pnl_sums_numeric_pnl_fields() -> None:
-    payload = {
-        "data": [
-            {"pnl": 100.5},
-            {"pnl": -250.25},
-            {"pnl": "not-a-number"},
-            {"other": "field"},
-        ]
-    }
-    assert watcher._positions_pnl(payload) == 100.5 - 250.25
-
-
-def test_check_once_noop_when_market_closed() -> None:
+def test_check_now_noop_when_market_closed() -> None:
     settings_store = _FakeSettingsStore(1000.0)
     smart_order_service, notifications = _run(
-        now=_MARKET_CLOSED_NOW,
-        settings_store=settings_store,
-        upstox=_FakeUpstox([-2000.0]),
+        now=_MARKET_CLOSED_NOW, settings_store=settings_store, pnl=-2000.0,
     )
     assert smart_order_service.calls == 0
     assert notifications.recorded == []
 
 
-def test_check_once_noop_when_threshold_disabled() -> None:
+def test_check_now_noop_when_threshold_disabled() -> None:
     settings_store = _FakeSettingsStore(0.0)
+    smart_order_service, notifications = _run(settings_store=settings_store, pnl=-5000.0)
+    assert smart_order_service.calls == 0
+    assert notifications.recorded == []
+
+
+def test_check_now_noop_when_no_token() -> None:
+    settings_store = _FakeSettingsStore(1000.0)
     smart_order_service, notifications = _run(
-        settings_store=settings_store,
-        upstox=_FakeUpstox([-5000.0]),
+        token_store=_FakeTokenStore(has_token=False), settings_store=settings_store, pnl=-5000.0,
     )
     assert smart_order_service.calls == 0
     assert notifications.recorded == []
 
 
-def test_check_once_noop_when_no_token() -> None:
+def test_check_now_noop_when_pnl_has_not_breached_threshold() -> None:
     settings_store = _FakeSettingsStore(1000.0)
-    smart_order_service, notifications = _run(
-        token_store=_FakeTokenStore(has_token=False),
-        settings_store=settings_store,
-        upstox=_FakeUpstox([-5000.0]),
-    )
-    assert smart_order_service.calls == 0
-    assert notifications.recorded == []
-
-
-def test_check_once_noop_when_pnl_has_not_breached_threshold() -> None:
-    settings_store = _FakeSettingsStore(1000.0)
-    smart_order_service, notifications = _run(
-        settings_store=settings_store,
-        upstox=_FakeUpstox([-500.0]),  # loss, but not past the 1000 threshold
-    )
+    smart_order_service, notifications = _run(settings_store=settings_store, pnl=-500.0)
     assert smart_order_service.calls == 0
     assert notifications.recorded == []
     assert not settings_store.cleared
 
 
-def test_check_once_flattens_and_disarms_on_breach() -> None:
+def test_check_now_flattens_and_disarms_on_breach() -> None:
     settings_store = _FakeSettingsStore(1000.0)
-    smart_order_service, notifications = _run(
-        settings_store=settings_store,
-        upstox=_FakeUpstox([-600.0, -500.0]),  # total -1100, breaches -1000
-    )
+    smart_order_service, notifications = _run(settings_store=settings_store, pnl=-1100.0)
     assert smart_order_service.calls == 1
     assert settings_store.cleared
     assert len(notifications.recorded) == 1
@@ -205,13 +172,11 @@ def test_check_once_flattens_and_disarms_on_breach() -> None:
     assert notifications.recorded[0]["title"] == "Max-loss auto square-off triggered"
 
 
-def test_check_once_notifies_without_disarming_when_flatten_fails() -> None:
+def test_check_now_notifies_without_disarming_when_flatten_fails() -> None:
     settings_store = _FakeSettingsStore(1000.0)
     failing_service = _FakeSmartOrderService(raises=UpstoxApiError("margin call rejected"))
     _, notifications = _run(
-        settings_store=settings_store,
-        upstox=_FakeUpstox([-2000.0]),
-        smart_order_service=failing_service,
+        settings_store=settings_store, pnl=-2000.0, smart_order_service=failing_service,
     )
     assert failing_service.calls == 1
     assert not settings_store.cleared  # stays armed -- next tick retries
@@ -219,24 +184,11 @@ def test_check_once_notifies_without_disarming_when_flatten_fails() -> None:
     assert notifications.recorded[0]["title"] == "Max-loss auto square-off failed"
 
 
-def test_check_once_skips_if_disarmed_by_a_concurrent_trigger_after_acquiring_lock() -> None:
+def test_check_now_skips_if_disarmed_by_a_concurrent_trigger_after_acquiring_lock() -> None:
     """Covers the race this whole lock exists for: the client's own check wins and flattens
     first, disarming the threshold in the moment between this watcher's own pre-lock breach
     check and it actually acquiring the lock."""
     settings_store = _RaceSettingsStore(1000.0)
-    smart_order_service, notifications = _run(
-        settings_store=settings_store,
-        upstox=_FakeUpstox([-2000.0]),
-    )
-    assert smart_order_service.calls == 0
-    assert notifications.recorded == []
-
-
-def test_check_once_noop_when_positions_fetch_fails() -> None:
-    settings_store = _FakeSettingsStore(1000.0)
-    smart_order_service, notifications = _run(
-        settings_store=settings_store,
-        upstox=_FailingUpstox(),
-    )
+    smart_order_service, notifications = _run(settings_store=settings_store, pnl=-2000.0)
     assert smart_order_service.calls == 0
     assert notifications.recorded == []

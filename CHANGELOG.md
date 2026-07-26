@@ -45,9 +45,19 @@
   for a position that somehow ends up without a bracket -- deliberate tradeoff, not an oversight.
 - Added a backend-side max-loss watcher (`max_loss_watcher.py`) as a backstop alongside the app's
   own foreground, tick-driven `MainViewModel.checkMaxLoss` -- reacts even if the app is closed,
-  backgrounded, or offline. Checks every 5s during market hours against a threshold synced from
-  the app via new `GET`/`PUT /settings/max-loss` endpoints (`MaxLossSettingsStore`); on breach,
-  flattens every position (`SmartOrderService.exit_all_positions`) and records a `risk`/critical
-  notification either way -- success or a failed flatten. Shares a lock with
-  `POST /orders/exit-all`/`exit-positions` (both routes now hold it too), so a client-triggered
-  flatten and the watcher's own can never race into flattening the same still-open position twice.
+  backgrounded, or offline. Threshold synced from the app via new `GET`/`PUT /settings/max-loss`
+  endpoints (`MaxLossSettingsStore`); on breach, flattens every position
+  (`SmartOrderService.exit_all_positions`) and records a `risk`/critical notification either way --
+  success or a failed flatten. Shares a lock with `POST /orders/exit-all`/`exit-positions` (both
+  routes now hold it too), so a client-triggered flatten and the watcher's own can never race into
+  flattening the same still-open position twice.
+  - Checked on every live market tick for an open position's instrument, not a polling timer --
+    `PositionPnlTracker` keeps a cached `pnl`/`last_price` snapshot per position (refreshed
+    immediately on any portfolio-feed order event, plus a slow periodic fallback) and adjusts it
+    live as ticks arrive using the same delta formula Android's own `MainViewModel.handleTick`
+    already uses for its live P&L display. Every open position's instrument is kept subscribed on
+    the shared market feed for exactly this reason (`FeedSubscriptionManager
+    .set_open_position_instruments`, a new third always-needed source alongside tracked
+    underlyings), independent of whether any app session has it open. A slow REST-polling loop
+    (`run_max_loss_watcher_fallback`) still runs as a backstop for whenever ticks themselves stop
+    flowing, reading the tracker's last-known cached total rather than making a fresh REST call.

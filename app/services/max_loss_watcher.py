@@ -6,20 +6,20 @@ from datetime import datetime
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-from app.core.config import Settings
 from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequiredError
 from app.core.market_hours import is_market_open
 from app.services.instrument_rules_service import InstrumentRulesService
-from app.services.max_loss_settings_store import MaxLossSettingsStore
 from app.services.notification_service import NotificationService
-from app.services.smart_order_service import SmartOrderService
-from app.services.token_store import EncryptedTokenStore
-from app.services.upstox_service import UpstoxService
+from app.services.position_pnl_tracker import PositionPnlTracker
 
 logger = logging.getLogger(__name__)
 
 _IST = ZoneInfo("Asia/Kolkata")
-_LOOP_INTERVAL_SECONDS = 5.0
+# Purely a fallback safety net now (see check_now's own doc comment for the real, tick-driven
+# reactivity path) -- catches a breach during a stretch with no live ticks at all (e.g. the
+# market feed itself is reconnecting) using PositionPnlTracker's last-known cached total, no
+# fresh REST call needed.
+_FALLBACK_LOOP_INTERVAL_SECONDS = 5.0
 
 
 class _TokenStoreProtocol(Protocol):
@@ -32,42 +32,33 @@ class _MaxLossSettingsStoreProtocol(Protocol):
     def clear(self) -> None: ...
 
 
-class _UpstoxServiceProtocol(Protocol):
-    async def get_positions(self, access_token: str) -> dict[str, Any]: ...
-
-
 class _SmartOrderServiceProtocol(Protocol):
     async def exit_all_positions(
         self, access_token: str, *, instrument_rules_service: InstrumentRulesService,
     ) -> dict[str, Any]: ...
 
 
-async def run_max_loss_watcher(
-    settings: Settings,
+async def run_max_loss_watcher_fallback(
+    token_store: _TokenStoreProtocol,
+    settings_store: _MaxLossSettingsStoreProtocol,
+    tracker: PositionPnlTracker,
+    smart_order_service: _SmartOrderServiceProtocol,
+    instrument_rules_service: InstrumentRulesService,
     notification_service: NotificationService,
     exit_all_lock: asyncio.Lock,
 ) -> None:
-    """Backend-side backstop for max-loss auto square-off -- reacts even if the app is closed,
-    backgrounded, or offline, unlike MainViewModel.checkMaxLoss (foreground, tick-driven only).
-    Both stay running at once: whichever notices a breach first flattens everything; the other
-    finds nothing left open on its own next check. [exit_all_lock] is the same lock
-    `POST /orders/exit-all` holds while flattening, so a client-triggered flatten and this
-    watcher's own can never race into a double-exit against the same still-open position (see
-    that route's own doc comment).
+    """Background fallback loop -- see `check_now`'s own doc comment for the primary, tick-driven
+    reactivity path this backs up. Only matters when live ticks stop arriving for a stretch (e.g.
+    the market feed itself is between reconnects); otherwise `check_now` fires on every tick well
+    before this loop's own next iteration would.
     """
-    token_store = EncryptedTokenStore(settings)
-    settings_store = MaxLossSettingsStore(settings)
-    upstox = UpstoxService(settings)
-    smart_order_service = SmartOrderService(upstox)
-    instrument_rules_service = InstrumentRulesService(settings)
-
     while True:
         try:
-            await _check_once(
+            await check_now(
                 now=datetime.now(_IST),
                 token_store=token_store,
                 settings_store=settings_store,
-                upstox=upstox,
+                tracker=tracker,
                 smart_order_service=smart_order_service,
                 instrument_rules_service=instrument_rules_service,
                 notification_service=notification_service,
@@ -76,26 +67,40 @@ async def run_max_loss_watcher(
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Max-loss watcher tick failed unexpectedly")
-        await asyncio.sleep(_LOOP_INTERVAL_SECONDS)
+            logger.exception("Max-loss fallback loop tick failed unexpectedly")
+        await asyncio.sleep(_FALLBACK_LOOP_INTERVAL_SECONDS)
 
 
-async def _check_once(
+async def check_now(
     *,
     now: datetime,
     token_store: _TokenStoreProtocol,
     settings_store: _MaxLossSettingsStoreProtocol,
-    upstox: _UpstoxServiceProtocol,
+    tracker: PositionPnlTracker,
     smart_order_service: _SmartOrderServiceProtocol,
     instrument_rules_service: InstrumentRulesService,
     notification_service: NotificationService,
     exit_all_lock: asyncio.Lock,
 ) -> None:
+    """The actual max-loss check -- called from `app.main`'s own market-tick handler on every
+    live tick for an instrument that's part of an open position (see `PositionPnlTracker.apply_tick`
+    and `FeedSubscriptionManager.set_open_position_instruments`), so a breach is caught within
+    however fast Upstox's own feed ticks, not on a fixed polling interval. Also called by
+    `run_max_loss_watcher_fallback` on a plain timer as a backstop for whenever ticks themselves
+    stop flowing.
+
+    Reads `tracker.total_pnl()` -- already-cached, tick-adjusted -- rather than making a fresh
+    REST call itself; this function is cheap enough to call on every tick precisely because it
+    does no I/O until (rarely) a breach actually needs flattening.
+    """
     if not is_market_open(now.astimezone(_IST)):
         return
 
     threshold = settings_store.load()
     if threshold <= 0.0:
+        return
+
+    if tracker.total_pnl() > -threshold:
         return
 
     if not token_store.has_token():
@@ -105,19 +110,16 @@ async def _check_once(
     except (TokenStoreError, UpstoxAuthRequiredError):
         return
 
-    try:
-        positions_payload = await upstox.get_positions(access_token)
-    except UpstoxApiError:
-        return
-
-    pnl = _positions_pnl(positions_payload)
-    if pnl > -threshold:
-        return
-
     async with exit_all_lock:
         # Re-read: the client's own check may have already fired (and disarmed the threshold)
         # in the moment between the check above and actually acquiring the lock.
         if settings_store.load() <= 0.0:
+            return
+        # Re-read the live total too -- ticks (and this function being re-entered concurrently
+        # for a different tick) don't wait for the lock, so the breach that triggered this call
+        # may already be stale.
+        pnl = tracker.total_pnl()
+        if pnl > -threshold:
             return
 
         try:
@@ -151,17 +153,3 @@ async def _check_once(
             ),
             details={"pnl": pnl, "threshold": threshold, "result": result},
         )
-
-
-def _positions_pnl(positions_payload: dict[str, Any]) -> float:
-    """Sums every position's own `pnl` field (including squared-off ones -- a closed position's
-    realized P&L still counts toward today's total), same field Upstox reports and
-    MainScreenService.summary's own profit_loss is derived from."""
-    data = positions_payload.get("data")
-    positions = [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
-    total = 0.0
-    for position in positions:
-        pnl = position.get("pnl")
-        if isinstance(pnl, (int, float)) and not isinstance(pnl, bool):
-            total += float(pnl)
-    return total

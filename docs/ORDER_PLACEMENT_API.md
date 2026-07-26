@@ -321,10 +321,22 @@ open on its own next check.
 The app calls `PUT` whenever the user edits the amount in Order Settings, and `GET` on load to
 reconcile its local value against the server (e.g. the watcher may have already fired and
 disarmed it while the app was closed). `amount <= 0` disables the watcher -- same convention as
-`AppSettingsRepository.maxLossAmount` on the client. Checked every 5 seconds during market hours
-against the sum of every open (and today's already-closed) position's own `pnl` field from
-Upstox; once triggered, the threshold is cleared back to 0 (consumed, needs an explicit re-arm)
-and a `risk`/`critical` notification is recorded either way -- success or a failed flatten attempt.
+`AppSettingsRepository.maxLossAmount` on the client.
+
+Checked on every live market tick for an open position's own instrument, not a polling timer --
+`PositionPnlTracker` keeps a cached snapshot of each position's Upstox-reported `pnl`/`last_price`
+(refreshed via REST immediately on any order-related portfolio-feed event, plus a slow periodic
+fallback), and adjusts it live as ticks arrive: `live_pnl = snapshot_pnl + (tick_ltp -
+snapshot_last_price) * quantity` -- the same formula Android's own `MainViewModel.handleTick`
+already uses for its own live P&L display. Every open position's instrument is kept subscribed on
+the backend's shared market feed for exactly this reason (`FeedSubscriptionManager
+.set_open_position_instruments`), independent of whether any app session happens to have it open
+too. A slow REST-polling loop (`run_max_loss_watcher_fallback`) still runs as a backstop for
+whenever ticks themselves stop flowing (e.g. the market feed is between reconnects), using the
+tracker's last-known cached total rather than a fresh REST call.
+
+Once triggered, the threshold is cleared back to 0 (consumed, needs an explicit re-arm) and a
+`risk`/`critical` notification is recorded either way -- success or a failed flatten attempt.
 
 `PUT` request/response:
 

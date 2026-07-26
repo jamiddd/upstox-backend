@@ -107,6 +107,53 @@ async def test_ltpc_set_change_unsubscribes_previous_before_subscribing_new() ->
 
 
 @pytest.mark.anyio
+async def test_open_position_instruments_are_always_in_ltpc_subscription() -> None:
+    client = _FakeMarketFeedClient()
+    manager = FeedSubscriptionManager(market_feed_client=client, tracked_store=_FakeTrackedStore([]))
+
+    await manager.set_open_position_instruments({"NSE_FO|111"})
+
+    assert client.ltpc_subscribe_calls[-1] == ["NSE_FO|111"]
+
+
+@pytest.mark.anyio
+async def test_open_position_instruments_defer_to_full_mode_for_the_same_key() -> None:
+    client = _FakeMarketFeedClient()
+    manager = FeedSubscriptionManager(
+        market_feed_client=client, tracked_store=_FakeTrackedStore(["NSE_FO|111"]),
+    )
+
+    await manager.set_open_position_instruments({"NSE_FO|111"})
+
+    assert client.full_calls[-1] == ["NSE_FO|111"]
+    assert client.ltpc_subscribe_calls == []
+
+
+@pytest.mark.anyio
+async def test_open_position_instruments_union_with_client_ltpc_wants() -> None:
+    client = _FakeMarketFeedClient()
+    manager = FeedSubscriptionManager(market_feed_client=client, tracked_store=_FakeTrackedStore([]))
+    await manager.set_client_subscription("session-1", full=[], ltpc=["A"])
+    client.ltpc_subscribe_calls.clear()
+
+    await manager.set_open_position_instruments({"B"})
+
+    assert client.ltpc_subscribe_calls[-1] == sorted(["A", "B"])
+
+
+@pytest.mark.anyio
+async def test_closed_position_drops_out_of_ltpc_subscription() -> None:
+    client = _FakeMarketFeedClient()
+    manager = FeedSubscriptionManager(market_feed_client=client, tracked_store=_FakeTrackedStore([]))
+    await manager.set_open_position_instruments({"NSE_FO|111", "NSE_FO|222"})
+    client.ltpc_subscribe_calls.clear()
+
+    await manager.set_open_position_instruments({"NSE_FO|111"})
+
+    assert client.ltpc_subscribe_calls[-1] == ["NSE_FO|111"]
+
+
+@pytest.mark.anyio
 async def test_unchanged_ltpc_set_does_not_resend() -> None:
     client = _FakeMarketFeedClient()
     manager = FeedSubscriptionManager(market_feed_client=client, tracked_store=_FakeTrackedStore([]))
