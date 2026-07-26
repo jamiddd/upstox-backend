@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 import logging
@@ -13,6 +14,8 @@ from pydantic import BaseModel, Field
 from app.api.dependencies import (
     get_candle_cache_store,
     get_device_token_store,
+    get_exit_all_lock,
+    get_max_loss_settings_store,
     get_notification_service,
     get_notification_store,
     get_oi_snapshot_store,
@@ -43,6 +46,7 @@ from app.services.instrument_rules_service import (
     validate_quantity,
 )
 from app.services.device_token_store import DeviceTokenStore
+from app.services.max_loss_settings_store import MaxLossSettingsStore
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 from app.services.notification_service import NotificationService
 from app.services.notification_store import NotificationStore
@@ -118,6 +122,13 @@ class ExitPositionsRequest(BaseModel):
     """
 
     instrument_keys: Optional[list[str]] = None
+
+
+class MaxLossSettingsRequest(BaseModel):
+    """Body for `PUT /settings/max-loss`. `amount <= 0` disables the backend's own watcher, same
+    convention as AppSettingsRepository.maxLossAmount on the client."""
+
+    amount: float = Field(ge=0)
 
 
 class ModifyOrderRequest(BaseModel):
@@ -907,24 +918,56 @@ async def cancel_gtt_order(
         raise _upstox_http_error(exc) from exc
 
 
+@protected_router.get("/settings/max-loss")
+def get_max_loss_settings(
+    store: MaxLossSettingsStore = Depends(get_max_loss_settings_store),
+) -> dict[str, float]:
+    """Current max-loss threshold the backend's own max_loss_watcher enforces -- lets the app
+    reconcile its local Order Settings value against the server on load (e.g. the watcher may
+    have already fired and disarmed it while the app was closed)."""
+    return {"amount": store.load()}
+
+
+@protected_router.put("/settings/max-loss")
+def set_max_loss_settings(
+    request: MaxLossSettingsRequest,
+    store: MaxLossSettingsStore = Depends(get_max_loss_settings_store),
+) -> dict[str, float]:
+    """Sets the max-loss threshold the backend's own max_loss_watcher enforces -- called whenever
+    the user edits the amount in Order Settings, so the watcher stays in sync with whatever the
+    app itself is configured to protect against. `amount <= 0` disables it."""
+    store.save(request.amount)
+    return {"amount": request.amount}
+
+
 @protected_router.post("/orders/exit-all")
 async def exit_all_positions(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
     notification_service: NotificationService = Depends(get_notification_service),
+    exit_all_lock: asyncio.Lock = Depends(get_exit_all_lock),
 ) -> dict[str, Any]:
     """Flattens every currently open position with an immediate market order -- backs the app's
-    max-loss auto square-off. See SmartOrderService.exit_all_positions.
+    own max-loss auto square-off (MainViewModel.checkMaxLoss). See
+    SmartOrderService.exit_all_positions.
+
+    Held under [exit_all_lock] -- shared with the backend's own max_loss_watcher, which can
+    trigger the exact same flatten independently (e.g. the app is closed). Without this, a
+    client-triggered flatten and the watcher's own could race: Upstox's position book doesn't
+    always reflect a just-placed market order's fill instantly, so both could see the same
+    position as still open and each submit their own exit, flattening it twice -- e.g. closing a
+    long with two separate sell orders leaves a net *short* position instead of flat.
     """
     access_token = _load_access_token(token_store)
-    try:
-        result = await SmartOrderService(service).exit_all_positions(
-            access_token,
-            instrument_rules_service=InstrumentRulesService(settings),
-        )
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
+    async with exit_all_lock:
+        try:
+            result = await SmartOrderService(service).exit_all_positions(
+                access_token,
+                instrument_rules_service=InstrumentRulesService(settings),
+            )
+        except UpstoxApiError as exc:
+            raise _upstox_http_error(exc) from exc
     await _notify_if_exit_had_failures(notification_service, result)
     return result
 
@@ -936,20 +979,23 @@ async def exit_positions(
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
     notification_service: NotificationService = Depends(get_notification_service),
+    exit_all_lock: asyncio.Lock = Depends(get_exit_all_lock),
 ) -> dict[str, Any]:
     """Flattens open positions with an immediate market order, optionally scoped to
     [ExitPositionsRequest.instrument_keys] (e.g. "close only profitable positions", computed
-    client-side). See SmartOrderService.exit_positions.
+    client-side). See SmartOrderService.exit_positions and [exit_all_positions]'s own doc
+    comment for why this shares the same lock.
     """
     access_token = _load_access_token(token_store)
-    try:
-        result = await SmartOrderService(service).exit_positions(
-            access_token,
-            instrument_keys=request.instrument_keys,
-            instrument_rules_service=InstrumentRulesService(settings),
-        )
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
+    async with exit_all_lock:
+        try:
+            result = await SmartOrderService(service).exit_positions(
+                access_token,
+                instrument_keys=request.instrument_keys,
+                instrument_rules_service=InstrumentRulesService(settings),
+            )
+        except UpstoxApiError as exc:
+            raise _upstox_http_error(exc) from exc
     await _notify_if_exit_had_failures(notification_service, result)
     return result
 

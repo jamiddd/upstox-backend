@@ -28,6 +28,7 @@ class Settings:
     oi_database_path: Path = Path("/data/oi_snapshots.sqlite3")
     notification_database_path: Path = Path("/data/notifications.sqlite3")
     device_token_path: Path = Path("/data/device_token.json")
+    max_loss_settings_path: Path = Path("/data/max_loss_settings.json")
     notification_retention_days: int = 90
     firebase_service_account_path: Path = Path("/data/firebase_service_account.json")
     upstox_api_base_url: str = "https://api.upstox.com/v2"
@@ -73,6 +74,9 @@ class Settings:
             ),
             device_token_path=Path(
                 os.getenv("DEVICE_TOKEN_PATH", "/data/device_token.json"),
+            ),
+            max_loss_settings_path=Path(
+                os.getenv("MAX_LOSS_SETTINGS_PATH", "/data/max_loss_settings.json"),
             ),
             notification_retention_days=max(
                 1, int(os.getenv("NOTIFICATION_RETENTION_DAYS", "90")),

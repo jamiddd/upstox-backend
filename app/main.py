@@ -17,6 +17,7 @@ from app.services.candle_cache_store import CandleCacheStore
 from app.services.fcm_service import FcmService
 from app.services.feed_subscription_manager import FeedSubscriptionManager
 from app.services.live_candle_builder import LiveCandleBuilder, feed_candle_to_cache_row
+from app.services.max_loss_watcher import run_max_loss_watcher
 from app.services.notification_service import NotificationService
 from app.services.notification_retention import run_notification_retention
 from app.services.account_snapshot_scheduler import run_account_snapshot_scheduler
@@ -119,6 +120,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     fcm_service = FcmService(settings)
     notification_service.fcm_service = fcm_service
 
+    # Shared by POST /orders/exit-all|exit-positions and max_loss_watcher below -- see
+    # get_exit_all_lock's own doc comment for why a client-triggered flatten and the watcher's own
+    # must never run concurrently against the same open positions.
+    exit_all_lock = asyncio.Lock()
+    app.state.exit_all_lock = exit_all_lock
+
     # See TrackedInstrumentsStore / run_tracked_instruments_poller's own doc comment for why this
     # exists -- keeps 5-minute-change history warm for Settings-picked underlyings even while no
     # client is actively polling. Cancelled cleanly on shutdown, same as any other background task
@@ -130,6 +137,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     auth_watchdog_task = asyncio.create_task(run_auth_watchdog(settings, notification_service))
     notification_retention_task = asyncio.create_task(run_notification_retention(settings))
+    # Backend-side backstop for max-loss auto square-off -- reacts even if the app is closed,
+    # backgrounded, or offline. See run_max_loss_watcher's own doc comment.
+    max_loss_watcher_task = asyncio.create_task(
+        run_max_loss_watcher(settings, notification_service, exit_all_lock),
+    )
 
     # The backend's own persistent Upstox connections, replacing the client's direct-to-Upstox
     # WebSocket and the old REST-polling paths for live prices/candles/order status. Stored on
@@ -219,6 +231,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         account_snapshot_task.cancel()
         auth_watchdog_task.cancel()
         notification_retention_task.cancel()
+        max_loss_watcher_task.cancel()
         subscription_refresh_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await poller_task
@@ -230,6 +243,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await auth_watchdog_task
         with contextlib.suppress(asyncio.CancelledError):
             await notification_retention_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await max_loss_watcher_task
         with contextlib.suppress(asyncio.CancelledError):
             await subscription_refresh_task
         await market_feed_client.stop()

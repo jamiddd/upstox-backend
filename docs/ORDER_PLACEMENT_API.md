@@ -292,13 +292,49 @@ Response:
 
 Each position is closed independently -- one failing doesn't stop the others; check each result's
 own `status`. A position's own flattening order is internally sliced against its instrument's
-`freeze_quantity` (same mechanism as Smart Bracket Order/Attach GTT Exits).
+`freeze_quantity` (same mechanism as Smart Bracket Order).
 
 An exit that returns an error is retried up to three times. Before each retry the backend waits,
-re-fetches broker positions, retries any tracked resting-stop cancellation, and submits only the
-position's remaining live quantity. An accepted first attempt is never blindly duplicated.
-`attempts` reports how many submissions were needed; after the third failed attempt the result
-remains `"error"` for manual intervention.
+re-fetches broker positions, and submits only the position's remaining live quantity. An accepted
+first attempt is never blindly duplicated. `attempts` reports how many submissions were needed;
+after the third failed attempt the result remains `"error"` for manual intervention.
+
+Both this endpoint and `POST /api/orders/exit-all` are held under the same lock as the backend's
+own `max_loss_watcher` (see Max Loss Settings below) -- a client-triggered flatten and the
+watcher's own can never run concurrently against the same open positions.
+
+## Max Loss Settings
+
+```http
+GET /api/settings/max-loss
+PUT /api/settings/max-loss
+```
+
+The max-loss threshold (rupees, absolute value) the backend's own background watcher
+(`app/services/max_loss_watcher.py`) enforces independently of the app -- a backstop that keeps
+working even if the app is closed, backgrounded, or offline, unlike the app's own foreground,
+live-tick-driven `MainViewModel.checkMaxLoss`. Both stay active at once and share the same
+underlying flatten (`SmartOrderService.exit_all_positions`) under the same lock mentioned above,
+so whichever notices a breach first flattens everything and the other simply finds nothing left
+open on its own next check.
+
+The app calls `PUT` whenever the user edits the amount in Order Settings, and `GET` on load to
+reconcile its local value against the server (e.g. the watcher may have already fired and
+disarmed it while the app was closed). `amount <= 0` disables the watcher -- same convention as
+`AppSettingsRepository.maxLossAmount` on the client. Checked every 5 seconds during market hours
+against the sum of every open (and today's already-closed) position's own `pnl` field from
+Upstox; once triggered, the threshold is cleared back to 0 (consumed, needs an explicit re-arm)
+and a `risk`/`critical` notification is recorded either way -- success or a failed flatten attempt.
+
+`PUT` request/response:
+
+```json
+{
+  "amount": 3000.0
+}
+```
+
+`GET` response is the same shape.
 
 ## Modify Orders
 

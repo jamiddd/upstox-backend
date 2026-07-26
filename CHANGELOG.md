@@ -34,3 +34,20 @@
   `logger.info`/`debug` call across the whole backend was silently dropped from
   `docker compose logs`, regardless of when or how often it was checked. This was the root cause
   of several dead-end investigations before the actual bugs above were found.
+- Removed the target-watcher/attach-gtt-exits recovery mechanism (`oco_watcher.py`,
+  `pending_oco_pairs_store.py`, `SmartOrderService.attach_gtt_exits`/`cancel_resting_stoploss_orders`,
+  `POST /orders/gtt/attach-exits`, `POST /orders/cancel-resting-exit`) -- every order now goes
+  exclusively through a real Upstox GTT bracket placed atomically at entry, making the "attach
+  protection to an already-open, unprotected position" fallback unnecessary. Its target-watching
+  half was the single most fragile piece of the whole safety surface: it armed a target as a
+  watched price level and, if the market order it fired on a cross itself failed, the position was
+  already dropped from tracking with no notification at all. There is now no in-app recovery path
+  for a position that somehow ends up without a bracket -- deliberate tradeoff, not an oversight.
+- Added a backend-side max-loss watcher (`max_loss_watcher.py`) as a backstop alongside the app's
+  own foreground, tick-driven `MainViewModel.checkMaxLoss` -- reacts even if the app is closed,
+  backgrounded, or offline. Checks every 5s during market hours against a threshold synced from
+  the app via new `GET`/`PUT /settings/max-loss` endpoints (`MaxLossSettingsStore`); on breach,
+  flattens every position (`SmartOrderService.exit_all_positions`) and records a `risk`/critical
+  notification either way -- success or a failed flatten. Shares a lock with
+  `POST /orders/exit-all`/`exit-positions` (both routes now hold it too), so a client-triggered
+  flatten and the watcher's own can never race into flattening the same still-open position twice.
