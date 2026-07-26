@@ -12,7 +12,7 @@ from app.core.config import Settings
 from app.core.exceptions import UpstoxApiError
 from app.services import stream_connection_manager as stream_connection_manager_module
 from app.services.stream_connection_manager import StreamConnectionManager
-from app.services.upstox_market_feed_client import FeedCandle, FeedTick
+from app.services.upstox_market_feed_client import FeedCandle, FeedTick, MarketDepthLevel
 
 
 def _settings(tmp_path: Path | None = None) -> Settings:
@@ -149,6 +149,7 @@ async def test_dispatch_tick_only_reaches_sessions_watching_that_instrument() ->
         last_trade_time_millis=1_700_000_000_000,
         bid_price=125.0,
         ask_price=126.0,
+        market_depth=(MarketDepthLevel(450, 125.0, 300, 126.0),),
         one_minute_candle=FeedCandle(
             timestamp_millis=1_700_000_000_000, open=124.0, high=126.0, low=123.0, close=125.5, volume=900,
         ),
@@ -158,6 +159,12 @@ async def test_dispatch_tick_only_reaches_sessions_watching_that_instrument() ->
     assert len(watching.sent) == 1
     assert watching.sent[0]["type"] == "tick"
     assert watching.sent[0]["data"]["instrument_key"] == "NSE_FO|111"
+    assert watching.sent[0]["data"]["market_depth"] == [{
+        "bid_quantity": 450,
+        "bid_price": 125.0,
+        "ask_quantity": 300,
+        "ask_price": 126.0,
+    }]
     assert watching.sent[0]["data"]["one_minute_candle"]["close"] == 125.5
     assert not_watching.sent == []
     del not_watching_session

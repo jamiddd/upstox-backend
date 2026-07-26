@@ -36,6 +36,14 @@ class FeedCandle:
 
 
 @dataclass(frozen=True)
+class MarketDepthLevel:
+    bid_quantity: int
+    bid_price: float
+    ask_quantity: int
+    ask_price: float
+
+
+@dataclass(frozen=True)
 class FeedTick:
     """A simplified, backend-friendly view of one instrument's data from a decoded Upstox market
     feed message. Mirrors Android's `FeedTick` field-for-field -- see that class's own doc comment
@@ -46,6 +54,7 @@ class FeedTick:
     last_trade_time_millis: Optional[int] = None
     bid_price: Optional[float] = None
     ask_price: Optional[float] = None
+    market_depth: tuple[MarketDepthLevel, ...] = ()
     one_minute_candle: Optional[FeedCandle] = None
 
 
@@ -87,12 +96,22 @@ def _decode_full_feed(instrument_key: str, full_feed: Any) -> Optional[FeedTick]
         # "Best" bid/ask is the first entry in the depth-of-market quote list.
         quotes = market_full_feed.marketLevel.bidAskQuote
         top_of_book = quotes[0] if len(quotes) > 0 else None
+        market_depth = tuple(
+            MarketDepthLevel(
+                bid_quantity=quote.bidQ,
+                bid_price=quote.bidP,
+                ask_quantity=quote.askQ,
+                ask_price=quote.askP,
+            )
+            for quote in quotes
+        )
         return FeedTick(
             instrument_key=instrument_key,
             ltp=market_full_feed.ltpc.ltp,
             last_trade_time_millis=market_full_feed.ltpc.ltt,
             bid_price=top_of_book.bidP if top_of_book is not None else None,
             ask_price=top_of_book.askP if top_of_book is not None else None,
+            market_depth=market_depth,
             one_minute_candle=_one_minute_candle(market_full_feed.marketOHLC.ohlc),
         )
     if union == "indexFF":

@@ -6,6 +6,7 @@ from app.generated import MarketDataFeed_pb2 as pb
 from app.services.upstox_market_feed_client import (
     FeedCandle,
     FeedTick,
+    MarketDepthLevel,
     UpstoxMarketFeedClient,
     decode_feed_response,
 )
@@ -50,8 +51,11 @@ def test_decodes_full_mode_market_contract_with_bid_ask_and_candle() -> None:
     ltpc = pb.LTPC(ltp=125.0)
     ohlc = pb.OHLC(interval="I1", ts=1_721_873_700_000, open=124.0, high=126.0, low=123.5, close=125.0, vol=900)
     market_ohlc = pb.MarketOHLC(ohlc=[ohlc])
-    quote = pb.Quote(bidP=124.5, askP=125.5)
-    market_level = pb.MarketLevel(bidAskQuote=[quote])
+    quotes = [
+        pb.Quote(bidQ=150, bidP=124.5, askQ=225, askP=125.5),
+        pb.Quote(bidQ=300, bidP=124.0, askQ=375, askP=126.0),
+    ]
+    market_level = pb.MarketLevel(bidAskQuote=quotes)
     market_full_feed = pb.MarketFullFeed(ltpc=ltpc, marketLevel=market_level, marketOHLC=market_ohlc)
     full_feed = pb.FullFeed(marketFF=market_full_feed)
     feed = pb.Feed(fullFeed=full_feed)
@@ -66,6 +70,10 @@ def test_decodes_full_mode_market_contract_with_bid_ask_and_candle() -> None:
     assert tick.ltp == 125.0
     assert tick.bid_price == 124.5
     assert tick.ask_price == 125.5
+    assert tick.market_depth == (
+        MarketDepthLevel(150, 124.5, 225, 125.5),
+        MarketDepthLevel(300, 124.0, 375, 126.0),
+    )
     assert tick.one_minute_candle == FeedCandle(
         timestamp_millis=1_721_873_700_000, open=124.0, high=126.0, low=123.5, close=125.0, volume=900,
     )

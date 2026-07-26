@@ -217,6 +217,15 @@ class StreamConnectionManager:
                     "last_trade_time_millis": tick.last_trade_time_millis,
                     "bid_price": tick.bid_price,
                     "ask_price": tick.ask_price,
+                    "market_depth": [
+                        {
+                            "bid_quantity": level.bid_quantity,
+                            "bid_price": level.bid_price,
+                            "ask_quantity": level.ask_quantity,
+                            "ask_price": level.ask_price,
+                        }
+                        for level in tick.market_depth
+                    ],
                     "one_minute_candle": (
                         {
                             "timestamp_millis": candle.timestamp_millis,
