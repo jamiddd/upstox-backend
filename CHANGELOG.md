@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added the forward-only journaling ledger: irrecoverable placement/fill market-context snapshots,
+  idempotent current-day fill reconciliation, FIFO round-trip matching with stable fill-set
+  identity, computed charges, protected annotations, journal REST endpoints, and sample-aware
+  analytics. Reconciliation waits for daily re-authentication and is triggered immediately after
+  OAuth succeeds.
 - Added durable, paginated notifications with severity/category filters, unread state, device
   preference registration, and live `/api/stream` dispatch.
 - Added notifications for authentication expiry, risk-exit and GTT failures, feed health,

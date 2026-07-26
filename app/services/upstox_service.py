@@ -119,6 +119,10 @@ class UpstoxService:
         """Fetch the current day's order book."""
         return await self._get_json("/order/retrieve-all", access_token)
 
+    async def get_trades_for_day(self, access_token: str) -> dict[str, Any]:
+        """Fetch today's authoritative execution records for the forward-only journal ledger."""
+        return await self._get_json("/order/trades/get-trades-for-day", access_token)
+
     async def get_historical_trades(
         self,
         access_token: str,

@@ -27,6 +27,7 @@ class Settings:
     account_snapshot_path: Path = Path("/data/account_snapshot.json")
     oi_database_path: Path = Path("/data/oi_snapshots.sqlite3")
     notification_database_path: Path = Path("/data/notifications.sqlite3")
+    journal_database_path: Path = Path("/data/journal.sqlite3")
     device_token_path: Path = Path("/data/device_token.json")
     max_loss_settings_path: Path = Path("/data/max_loss_settings.json")
     notification_retention_days: int = 90
@@ -71,6 +72,9 @@ class Settings:
             ),
             notification_database_path=Path(
                 os.getenv("NOTIFICATION_DATABASE_PATH", "/data/notifications.sqlite3"),
+            ),
+            journal_database_path=Path(
+                os.getenv("JOURNAL_DATABASE_PATH", "/data/journal.sqlite3"),
             ),
             device_token_path=Path(
                 os.getenv("DEVICE_TOKEN_PATH", "/data/device_token.json"),

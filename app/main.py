@@ -19,6 +19,8 @@ from app.services.candle_cache_store import CandleCacheStore
 from app.services.fcm_service import FcmService
 from app.services.feed_subscription_manager import FeedSubscriptionManager
 from app.services.instrument_rules_service import InstrumentRulesService
+from app.services.journal_store import JournalStore
+from app.services.journal_reconciler import JournalReconciler, run_journal_reconciler
 from app.services.live_candle_builder import LiveCandleBuilder, feed_candle_to_cache_row
 from app.services.max_loss_settings_store import MaxLossSettingsStore
 from app.services.max_loss_watcher import check_now as check_max_loss_now
@@ -34,6 +36,10 @@ from app.services.stream_connection_manager import StreamConnectionManager
 from app.services.token_store import EncryptedTokenStore
 from app.services.tracked_instruments_poller import run_tracked_instruments_poller
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
+from app.services.trade_context_service import TradeContextService
+from app.services.underlying_signals_service import UnderlyingSignalsService
+from app.services.signal_snapshot_store import SignalSnapshotStore
+from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.upstox_market_feed_client import FeedTick, UpstoxMarketFeedClient
 from app.services.upstox_portfolio_feed_client import UpstoxPortfolioFeedClient
 from app.services.upstox_service import UpstoxService
@@ -198,6 +204,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
     )
     order_fill_detector = OrderFillDetector()
+    journal_store = JournalStore(settings)
+    trade_context_token_store = EncryptedTokenStore(settings)
+    trade_context_upstox = UpstoxService(settings)
+    trade_context_service = TradeContextService(
+        store=journal_store,
+        upstox=trade_context_upstox,
+        signals=UnderlyingSignalsService(
+            trade_context_upstox,
+            snapshot_store=SignalSnapshotStore(settings),
+            oi_snapshot_store=OISnapshotStore(settings),
+        ),
+    )
+    journal_reconciler = JournalReconciler(
+        store=journal_store,
+        upstox=trade_context_upstox,
+        token_store=trade_context_token_store,
+        notifications=notification_service,
+    )
     market_feed_notifier = _FeedStateNotifier(
         name="Market data feed", notification_service=notification_service,
     )
@@ -226,6 +250,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             notification_service,
             position_tracker,
             subscription_manager,
+            trade_context_service,
+            trade_context_token_store,
+            journal_reconciler,
             payload,
         ),
         on_state_change=portfolio_feed_notifier.handle,
@@ -260,6 +287,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.stream_manager = stream_manager
     app.state.notification_service = notification_service
     app.state.fcm_service = fcm_service
+    app.state.journal_reconciler = journal_reconciler
+    journal_reconciler_task = asyncio.create_task(run_journal_reconciler(journal_reconciler))
+    asyncio.create_task(journal_reconciler.reconcile())
 
     # Best-effort initial fill so open positions are already subscribed (and their live P&L
     # already known) before the very first tick, not just from whenever the periodic refresh
@@ -306,6 +336,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_loss_watcher_task.cancel()
         subscription_refresh_task.cancel()
         position_tracker_refresh_task.cancel()
+        journal_reconciler_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await poller_task
         with contextlib.suppress(asyncio.CancelledError):
@@ -322,6 +353,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await subscription_refresh_task
         with contextlib.suppress(asyncio.CancelledError):
             await position_tracker_refresh_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await journal_reconciler_task
         await market_feed_client.stop()
         await portfolio_feed_client.stop()
 
@@ -422,6 +455,9 @@ def _on_portfolio_update(
     notification_service: NotificationService,
     position_tracker: PositionPnlTracker,
     subscription_manager: FeedSubscriptionManager,
+    trade_context_service: TradeContextService,
+    trade_context_token_store: EncryptedTokenStore,
+    journal_reconciler: JournalReconciler,
     payload: dict[str, Any],
 ) -> None:
     async def _refresh_position_tracker() -> None:
@@ -437,6 +473,7 @@ def _on_portfolio_update(
     # itself just changed -- refresh immediately rather than waiting for the next periodic tick,
     # so a newly opened position starts getting live max-loss coverage right away.
     asyncio.create_task(_refresh_position_tracker())
+    asyncio.create_task(journal_reconciler.reconcile())
 
     is_new_fill = _handle_order_update(detector, payload)
     if is_new_fill:
@@ -450,6 +487,21 @@ def _on_portfolio_update(
                 details={"order_id": payload.get("order_id"), "status": payload.get("status")},
             )
         )
+        order_id = payload.get("order_id")
+        instrument_key = payload.get("instrument_token")
+        if isinstance(order_id, str) and order_id and trade_context_token_store.has_token():
+            async def _capture_fill_context() -> None:
+                try:
+                    await trade_context_service.capture_fill_from_placement(
+                        access_token=trade_context_token_store.load_access_token(),
+                        order_id=order_id,
+                        instrument_key=instrument_key if isinstance(instrument_key, str) else None,
+                        contract_ltp=_payload_price(payload),
+                    )
+                except Exception:
+                    logger.warning("Fill trade-context capture failed", exc_info=True)
+
+            asyncio.create_task(_capture_fill_context())
     elif payload.get("status") == "rejected":
         symbol = payload.get("trading_symbol") or payload.get("instrument_token") or "position"
         reason = payload.get("status_message") or "No reason given by Upstox."
@@ -467,6 +519,14 @@ def _on_portfolio_update(
     # OrderFillDetector's own edge-detection is specifically about when to play the fill sound,
     # a client-side concern, not a filter on what state changes reach the app at all.
     asyncio.create_task(stream_manager.dispatch_order_update(payload))
+
+
+def _payload_price(payload: dict[str, Any]) -> Optional[float]:
+    for key in ("average_price", "price"):
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    return None
 
 
 app = FastAPI(title="Upstox Scalper Backend", version="0.1.0", lifespan=_lifespan)

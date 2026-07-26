@@ -7,7 +7,7 @@ import logging
 from typing import Any, Literal, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -15,6 +15,7 @@ from app.api.dependencies import (
     get_candle_cache_store,
     get_device_token_store,
     get_exit_all_lock,
+    get_journal_store,
     get_max_loss_settings_store,
     get_notification_service,
     get_notification_store,
@@ -50,6 +51,7 @@ from app.services.max_loss_settings_store import MaxLossSettingsStore
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 from app.services.notification_service import NotificationService
 from app.services.notification_store import NotificationStore
+from app.services.journal_store import JournalStore
 from app.services.order_history_service import OrderHistoryService
 from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
@@ -60,6 +62,7 @@ from app.services.search_screen_service import SearchScreenService
 from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.smart_order_service import SmartOrderService
 from app.services.underlying_signals_service import UnderlyingSignalsService
+from app.services.trade_context_service import TradeContextService, extract_order_ids
 from app.services.usd_inr_service import UsdInrService
 
 public_router = APIRouter()
@@ -72,6 +75,8 @@ class SmartBracketOrderRequest(BaseModel):
     """Client-provided bracket-like GTT order parameters."""
 
     instrument_key: str = Field(min_length=1)
+    underlying_key: Optional[str] = Field(default=None, min_length=1)
+    signal_expiry_date: Optional[str] = None
     transaction_type: Literal["BUY", "SELL"]
     quantity: int = Field(gt=0)
     product: Literal["I", "D", "MTF"] = "I"
@@ -178,6 +183,7 @@ def get_login_url(
 
 @public_router.get("/auth/callback")
 async def auth_callback(
+    request: Request,
     code: str,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
@@ -198,6 +204,9 @@ async def auth_callback(
     try:
         token_payload = await service.exchange_code_for_token(code)
         token_store.save(token_payload)
+        reconciler = getattr(request.app.state, "journal_reconciler", None)
+        if reconciler is not None:
+            asyncio.create_task(reconciler.reconcile())
     except (AppConfigError, TokenStoreError) as exc:
         return RedirectResponse(f"{settings.mobile_app_redirect_url}?status=error&message={quote(str(exc))}")
     except UpstoxApiError as exc:
@@ -757,6 +766,35 @@ class RegisterDeviceRequest(BaseModel):
     push_preference: str = Field(pattern="^(off|critical|everything)$")
 
 
+class JournalNotesRequest(BaseModel):
+    setup: Optional[str] = None
+    entry_reason: Optional[str] = None
+    exit_reason: Optional[str] = None
+    plan: Optional[str] = None
+    mistakes: Optional[str] = None
+    lessons: Optional[str] = None
+    notes: Optional[str] = None
+    tags: list[str] = Field(default_factory=list)
+    confidence_rating: Optional[int] = Field(default=None, ge=1, le=5)
+    execution_rating: Optional[int] = Field(default=None, ge=1, le=5)
+    reviewed: bool = False
+
+
+class ManualJournalTradeRequest(BaseModel):
+    instrument_key: str
+    trading_symbol: str
+    trade_date: str
+    direction: Literal["long", "short"]
+    quantity: float = Field(gt=0)
+    entry_price: float = Field(gt=0)
+    exit_price: float = Field(gt=0)
+    opened_at: str
+    closed_at: str
+    gross_pnl: float
+    charges: float = Field(default=0, ge=0)
+    journal: Optional[JournalNotesRequest] = None
+
+
 @protected_router.get("/notifications")
 async def list_notifications(
     category: Optional[str] = None,
@@ -794,6 +832,76 @@ async def mark_notification_read(
     return {"updated": updated, "unread_count": store.unread_count()}
 
 
+@protected_router.get("/journal/trades")
+def list_journal_trades(
+    page_number: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    store: JournalStore = Depends(get_journal_store),
+) -> dict[str, Any]:
+    trades, page = store.list_trades(
+        page_number=page_number, page_size=page_size,
+        start_date=start_date, end_date=end_date,
+    )
+    return {"trades": trades, "page": page}
+
+
+@protected_router.get("/journal/filter-options")
+def journal_filter_options(
+    store: JournalStore = Depends(get_journal_store),
+) -> dict[str, list[str]]:
+    return store.filter_options()
+
+
+@protected_router.get("/journal/trades/{trade_id}")
+def get_journal_trade(
+    trade_id: str,
+    store: JournalStore = Depends(get_journal_store),
+) -> dict[str, Any]:
+    trade = store.get_trade(trade_id)
+    if trade is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "Journal trade not found")
+    return trade
+
+
+@protected_router.patch("/journal/trades/{trade_id}/notes")
+def update_journal_notes(
+    trade_id: str,
+    body: JournalNotesRequest,
+    store: JournalStore = Depends(get_journal_store),
+) -> dict[str, Any]:
+    trade = store.save_notes(trade_id, body.model_dump())
+    if trade is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "Journal trade not found")
+    return trade
+
+
+@protected_router.post("/journal/trades")
+def create_manual_journal_trade(
+    body: ManualJournalTradeRequest,
+    store: JournalStore = Depends(get_journal_store),
+) -> dict[str, Any]:
+    payload = body.model_dump()
+    if body.journal is not None:
+        payload["journal"] = body.journal.model_dump()
+    return store.create_manual_trade(payload)
+
+
+@protected_router.get("/analytics/summary")
+def journal_analytics_summary(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    capital_base: Optional[float] = Query(default=None, gt=0),
+    store: JournalStore = Depends(get_journal_store),
+) -> dict[str, Any]:
+    result = store.analytics_summary(start_date=start_date, end_date=end_date)
+    result["net_pnl_percent"] = (
+        result["net_pnl"] / capital_base * 100 if capital_base else None
+    )
+    return result
+
+
 @protected_router.post("/notifications/read-all")
 async def mark_all_notifications_read(
     store: NotificationStore = Depends(get_notification_store),
@@ -821,6 +929,8 @@ async def place_smart_bracket_order(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
+    snapshot_store: SignalSnapshotStore = Depends(get_signal_snapshot_store),
+    oi_snapshot_store: OISnapshotStore = Depends(get_oi_snapshot_store),
 ) -> dict[str, Any]:
     """Place a bracket-like order using Upstox multi-leg GTT."""
     access_token = _load_access_token(token_store)
@@ -831,7 +941,7 @@ async def place_smart_bracket_order(
         validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
         validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
         slice_quantity = order.slice_quantity or slice_quantity_for_freeze(order.quantity, rules)
-        return await SmartOrderService(service).place_bracket_order(
+        result = await SmartOrderService(service).place_bracket_order(
             access_token,
             instrument_key=order.instrument_key,
             transaction_type=order.transaction_type,
@@ -845,6 +955,29 @@ async def place_smart_bracket_order(
             market_protection=order.market_protection,
             slice_quantity=slice_quantity,
         )
+        if order.underlying_key:
+            order_ids = extract_order_ids(result)
+            if order_ids:
+                context_service = TradeContextService(
+                    store=JournalStore(settings),
+                    upstox=service,
+                    signals=UnderlyingSignalsService(
+                        service,
+                        snapshot_store=snapshot_store,
+                        oi_snapshot_store=oi_snapshot_store,
+                    ),
+                )
+                asyncio.create_task(
+                    context_service.capture(
+                        access_token=access_token,
+                        order_ids=order_ids,
+                        trigger="placement",
+                        instrument_key=order.instrument_key,
+                        underlying_key=order.underlying_key,
+                        expiry_date=order.signal_expiry_date,
+                    )
+                )
+        return result
     except AppConfigError as exc:
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except UpstoxApiError as exc:

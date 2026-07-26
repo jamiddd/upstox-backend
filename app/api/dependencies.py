@@ -9,6 +9,7 @@ from app.core.exceptions import TokenStoreError
 from app.services.candle_cache_store import CandleCacheStore
 from app.services.device_token_store import DeviceTokenStore
 from app.services.max_loss_settings_store import MaxLossSettingsStore
+from app.services.journal_store import JournalStore
 from app.services.notification_service import NotificationService
 from app.services.notification_store import NotificationStore
 from app.services.oi_snapshot_store import OISnapshotStore
@@ -64,6 +65,11 @@ def get_usd_inr_service() -> UsdInrService:
 def get_notification_store(settings: Settings = Depends(get_settings)) -> NotificationStore:
     """Create the SQLite-backed notification log store for a request."""
     return NotificationStore(settings)
+
+
+def get_journal_store(settings: Settings = Depends(get_settings)) -> JournalStore:
+    """Create the dedicated SQLite journal/context store for a request."""
+    return JournalStore(settings)
 
 
 def get_device_token_store(settings: Settings = Depends(get_settings)) -> DeviceTokenStore:
