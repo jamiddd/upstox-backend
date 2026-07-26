@@ -113,6 +113,49 @@ class SearchScreenService:
     def __init__(self, upstox_service: UpstoxService) -> None:
         self.upstox = upstox_service
 
+    async def search_contracts(
+        self,
+        access_token: str,
+        *,
+        query: str,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Return actual CE/PE/FUT instruments for canonical manual-journal symbol selection."""
+        normalized_query = query.strip()
+        if len(normalized_query) < 2:
+            return {"query": normalized_query, "results": []}
+        safe_limit = min(max(limit, 1), 30)
+        payload = await self.upstox.search_instruments(
+            access_token,
+            query=normalized_query,
+            instrument_types="CE,PE,FUT",
+            page_number=1,
+            records=safe_limit,
+        )
+        data = payload.get("data")
+        results: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                instrument_type = _string_value(item, "instrument_type")
+                instrument_key = _string_value(item, "instrument_key")
+                trading_symbol = _string_value(item, "trading_symbol")
+                if instrument_type not in {"CE", "PE", "FUT"} or not instrument_key or not trading_symbol:
+                    continue
+                results.append(
+                    {
+                        "instrument_key": instrument_key,
+                        "trading_symbol": trading_symbol,
+                        "name": _string_value(item, "name"),
+                        "instrument_type": instrument_type,
+                        "exchange": _exchange_from_key(instrument_key) or _string_value(item, "exchange"),
+                    }
+                )
+                if len(results) >= safe_limit:
+                    break
+        return {"query": normalized_query, "results": results}
+
     async def search_underlyings(
         self,
         access_token: str,

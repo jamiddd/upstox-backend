@@ -728,6 +728,25 @@ async def search_underlyings(
         raise _upstox_http_error(exc) from exc
 
 
+@protected_router.get("/search/contracts")
+async def search_contracts(
+    query: str = Query(min_length=2, max_length=50),
+    limit: int = Query(default=20, ge=1, le=30),
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Search actual derivative instruments for canonical manual-journal entry."""
+    access_token = _load_access_token(token_store)
+    try:
+        return await SearchScreenService(service).search_contracts(
+            access_token,
+            query=query,
+            limit=limit,
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
 @protected_router.get("/orders/history")
 async def order_history(
     scope: str = Query(default="today", pattern="^(today|all)$"),
