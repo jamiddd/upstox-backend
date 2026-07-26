@@ -121,18 +121,31 @@ class SearchScreenService:
         query: str,
         limit: int = 30,
     ) -> dict[str, Any]:
-        """Return actual CE/PE/FUT instruments for canonical manual-journal symbol selection."""
+        """Return the complete listed option catalogue for one supported underlying.
+
+        Instrument search is capped/paginated and defaults to one expiry bucket, so it cannot
+        power dependent Expiry/Strike selectors. `/option/contract` is the authoritative complete
+        source and is already used by Main screen bootstrap for the same reason.
+        """
         normalized_query = query.strip()
         if len(normalized_query) < 2:
             return {"query": normalized_query, "results": []}
-        safe_limit = min(max(limit, 1), 30)
-        payload = await self.upstox.search_instruments(
-            access_token,
-            query=normalized_query,
-            instrument_types="CE,PE,FUT",
-            page_number=1,
-            records=safe_limit,
+        upper_query = normalized_query.upper()
+        underlying_key = next(
+            (
+                item["instrument_key"]
+                for item in DEFAULT_OPTION_INDICES
+                if item["symbol"] == upper_query
+            ),
+            None,
         )
+        if underlying_key is None and upper_query == "SENSEX":
+            sensex = await self._sensex_default_entry(access_token)
+            underlying_key = sensex.get("instrument_key") if sensex else None
+        if not underlying_key:
+            return {"query": normalized_query, "results": []}
+
+        payload = await self.upstox.get_option_contracts(access_token, underlying_key)
         data = payload.get("data")
         results: list[dict[str, Any]] = []
         if isinstance(data, list):
@@ -142,7 +155,7 @@ class SearchScreenService:
                 instrument_type = _string_value(item, "instrument_type")
                 instrument_key = _string_value(item, "instrument_key")
                 trading_symbol = _string_value(item, "trading_symbol")
-                if instrument_type not in {"CE", "PE", "FUT"} or not instrument_key or not trading_symbol:
+                if instrument_type not in {"CE", "PE"} or not instrument_key or not trading_symbol:
                     continue
                 results.append(
                     {
@@ -156,8 +169,6 @@ class SearchScreenService:
                         "strike_price": _number_value(item, "strike_price"),
                     }
                 )
-                if len(results) >= safe_limit:
-                    break
         return {"query": normalized_query, "results": results}
 
     async def search_underlyings(
