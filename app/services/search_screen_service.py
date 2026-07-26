@@ -119,13 +119,13 @@ class SearchScreenService:
         access_token: str,
         *,
         query: str,
-        limit: int = 100,
+        limit: int = 30,
     ) -> dict[str, Any]:
         """Return actual CE/PE/FUT instruments for canonical manual-journal symbol selection."""
         normalized_query = query.strip()
         if len(normalized_query) < 2:
             return {"query": normalized_query, "results": []}
-        safe_limit = min(max(limit, 1), 100)
+        safe_limit = min(max(limit, 1), 30)
         payload = await self.upstox.search_instruments(
             access_token,
             query=normalized_query,
