@@ -24,6 +24,12 @@ of the allocated fill IDs, roles, and quantities. A rematch that would change an
 does not discard its notes; the existing trade becomes `needs_review` and a system warning is
 recorded.
 
+Manual creation checks same-day visible trades using normalized symbol, direction, quantity,
+entry/exit prices, and execution times. It returns HTTP `409` when the trade is already journaled.
+If the manual row was saved before its broker fills arrived, the next reconciliation upgrades that
+same row to broker-derived execution facts and attaches the fills while preserving its journal
+notes, rather than creating a second trade.
+
 `trade_context` captures the complete raw underlying-signals response plus the traded contract LTP
 after successful placement and again on a fill. Capture is asynchronous and never blocks order
 placement. A failed signals request still produces a row with `{}` context.

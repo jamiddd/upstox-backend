@@ -51,7 +51,7 @@ from app.services.max_loss_settings_store import MaxLossSettingsStore
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 from app.services.notification_service import NotificationService
 from app.services.notification_store import NotificationStore
-from app.services.journal_store import JournalStore
+from app.services.journal_store import DuplicateJournalTradeError, JournalStore
 from app.services.order_history_service import OrderHistoryService
 from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
@@ -885,7 +885,13 @@ def create_manual_journal_trade(
     payload = body.model_dump()
     if body.journal is not None:
         payload["journal"] = body.journal.model_dump()
-    return store.create_manual_trade(payload)
+    try:
+        return store.create_manual_trade(payload)
+    except DuplicateJournalTradeError as exc:
+        raise _http_error(
+            status.HTTP_409_CONFLICT,
+            f"This trade is already in the journal ({exc.trade_id})",
+        ) from exc
 
 
 @protected_router.get("/analytics/summary")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from app.core.config import Settings
-from app.services.journal_store import JournalStore
+from app.services.journal_store import DuplicateJournalTradeError, JournalStore
 
 
 def _store(tmp_path) -> JournalStore:
@@ -72,3 +74,54 @@ def test_manual_trade_and_analytics(tmp_path) -> None:
     assert summary["trade_count"] == 1
     assert summary["net_pnl"] == 730
     assert summary["low_sample"] is True
+
+
+def test_manual_trade_rejects_existing_automatic_trade(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.upsert_fill(_fill("1", "BUY", 75, 100, "2026-07-27T04:00:25+00:00"))
+    store.upsert_fill(_fill("2", "SELL", 75, 110, "2026-07-27T04:01:20+00:00"))
+    store.rebuild_session("2026-07-27")
+    existing = store.list_trades()[0][0]
+
+    with pytest.raises(DuplicateJournalTradeError) as error:
+        store.create_manual_trade({
+            "instrument_key": "manual", "trading_symbol": "nifty ce",
+            "trade_date": "2026-07-27", "direction": "long", "quantity": 75,
+            "entry_price": 100.05, "exit_price": 109.95,
+            "opened_at": "2026-07-27T04:00:00+00:00",
+            "closed_at": "2026-07-27T04:01:00+00:00",
+            "gross_pnl": 742.5, "charges": 20,
+        })
+
+    assert error.value.trade_id == existing["id"]
+    assert store.list_trades()[1]["total_records"] == 1
+
+
+def test_late_automatic_trade_upgrades_manual_entry_and_preserves_notes(tmp_path) -> None:
+    store = _store(tmp_path)
+    manual = store.create_manual_trade({
+        "instrument_key": "manual", "trading_symbol": "NIFTY CE",
+        "trade_date": "2026-07-27", "direction": "long", "quantity": 75,
+        "entry_price": 100.05, "exit_price": 109.95,
+        "opened_at": "2026-07-27T04:00:00+00:00",
+        "closed_at": "2026-07-27T04:01:00+00:00",
+        "gross_pnl": 742.5, "charges": 25,
+        "journal": {"notes": "Entered before sync", "tags": ["breakout"]},
+    })
+
+    store.upsert_fill(_fill("1", "BUY", 75, 100, "2026-07-27T04:00:25+00:00"))
+    store.upsert_fill(_fill("2", "SELL", 75, 110, "2026-07-27T04:01:20+00:00"))
+    store.rebuild_session("2026-07-27")
+
+    trades, page = store.list_trades()
+    assert page["total_records"] == 1
+    upgraded = store.get_trade(manual["id"])
+    assert upgraded is not None
+    assert upgraded["source"] == "automatic"
+    assert upgraded["instrument_key"] == "NSE_FO|1"
+    assert upgraded["gross_pnl"] == 750
+    assert upgraded["computed_charges"] == 20
+    assert upgraded["manual_charge_override"] is None
+    assert upgraded["notes"] == "Entered before sync"
+    assert upgraded["tags"] == ["breakout"]
+    assert trades[0]["id"] == manual["id"]

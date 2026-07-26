@@ -11,6 +11,12 @@ from typing import Any, Optional
 from app.core.config import Settings
 
 
+class DuplicateJournalTradeError(ValueError):
+    def __init__(self, trade_id: str) -> None:
+        super().__init__("This trade already exists in the journal")
+        self.trade_id = trade_id
+
+
 class JournalStore:
     """Durable, forward-only journal storage.
 
@@ -298,6 +304,13 @@ class JournalStore:
                 """,
                 (trading_date,),
             ).fetchall()
+            manual_trades = connection.execute(
+                """
+                SELECT * FROM journal_trades
+                WHERE trade_date=? AND source='manual' AND excluded=0
+                """,
+                (trading_date,),
+            ).fetchall()
             for row in existing:
                 if row["match_fingerprint"] in fingerprints:
                     continue
@@ -325,6 +338,52 @@ class JournalStore:
 
             for candidate in candidates:
                 if candidate["match_fingerprint"] in blocked_fingerprints:
+                    continue
+                manual_match = next(
+                    (row for row in manual_trades if _same_trade(row, candidate)),
+                    None,
+                )
+                if manual_match is not None:
+                    # The user recorded the trade before its broker fills reached the ledger.
+                    # Keep the manual row's stable ID (and therefore all its notes), replace its
+                    # estimated execution facts with the authoritative matched values, and link
+                    # the real fills. This turns one row from manual to automatic instead of
+                    # adding an indistinguishable second journal entry.
+                    trade_id = manual_match["id"]
+                    connection.execute(
+                        """
+                        UPDATE journal_trades SET
+                            match_fingerprint=?, instrument_key=?, trading_symbol=?,
+                            direction=?, quantity=?, entry_price=?, exit_price=?,
+                            opened_at=?, closed_at=?, gross_pnl=?, computed_charges=?,
+                            manual_charge_override=NULL, source='automatic', updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            candidate["match_fingerprint"], candidate["instrument_key"],
+                            candidate["trading_symbol"], candidate["direction"],
+                            candidate["quantity"], candidate["entry_price"],
+                            candidate["exit_price"], candidate["opened_at"],
+                            candidate["closed_at"], candidate["gross_pnl"],
+                            candidate["computed_charges"], now, trade_id,
+                        ),
+                    )
+                    connection.execute(
+                        "DELETE FROM journal_trade_fills WHERE journal_trade_id=?",
+                        (trade_id,),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO journal_trade_fills (
+                            journal_trade_id, fill_id, role, allocated_quantity
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        [
+                            (trade_id, item["fill_id"], item["role"], item["quantity"])
+                            for item in candidate["allocations"]
+                        ],
+                    )
+                    manual_trades = [row for row in manual_trades if row["id"] != trade_id]
                     continue
                 trade_id = candidate["match_fingerprint"]
                 connection.execute(
@@ -455,6 +514,9 @@ class JournalStore:
         fingerprint = f"manual:{trade_id}"
         gross = float(trade["gross_pnl"])
         with self._connect() as connection:
+            duplicate = self._find_duplicate_trade(connection, trade)
+            if duplicate is not None:
+                raise DuplicateJournalTradeError(duplicate["id"])
             connection.execute(
                 """
                 INSERT INTO journal_trades (
@@ -476,6 +538,27 @@ class JournalStore:
         result = self.get_trade(trade_id)
         assert result is not None
         return result
+
+    def find_duplicate_trade(self, trade: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Return an equivalent visible trade, regardless of whether its source is automatic."""
+        with self._connect() as connection:
+            row = self._find_duplicate_trade(connection, trade)
+        return _trade_row(row) if row is not None else None
+
+    @staticmethod
+    def _find_duplicate_trade(
+        connection: sqlite3.Connection,
+        trade: dict[str, Any],
+    ) -> Optional[sqlite3.Row]:
+        rows = connection.execute(
+            """
+            SELECT * FROM journal_trades
+            WHERE trade_date=? AND excluded=0
+            ORDER BY closed_at DESC
+            """,
+            (trade["trade_date"],),
+        ).fetchall()
+        return next((row for row in rows if _same_trade(row, trade)), None)
 
     def filter_options(self) -> dict[str, list[str]]:
         with self._connect() as connection:
@@ -575,6 +658,49 @@ def _trade_row(row: sqlite3.Row) -> dict[str, Any]:
     if "tags_json" in result:
         result["tags"] = json.loads(result.pop("tags_json") or "[]")
     return result
+
+
+def _same_trade(left: Any, right: Any) -> bool:
+    """Conservative equivalence for a minute-precision manual entry and broker fills.
+
+    Time is the strongest discriminator so repeated scalps in the same contract remain distinct.
+    The small price tolerance accommodates tick rounding without merging materially different
+    executions.
+    """
+    if _normalized_symbol(left["trading_symbol"]) != _normalized_symbol(right["trading_symbol"]):
+        return False
+    if str(left["direction"]).lower() != str(right["direction"]).lower():
+        return False
+    if abs(float(left["quantity"]) - float(right["quantity"])) > 0.000001:
+        return False
+    if not _prices_match(float(left["entry_price"]), float(right["entry_price"])):
+        return False
+    if not _prices_match(float(left["exit_price"]), float(right["exit_price"])):
+        return False
+    try:
+        opened_gap = abs(
+            (_parse_timestamp(left["opened_at"]) - _parse_timestamp(right["opened_at"]))
+            .total_seconds()
+        )
+        closed_gap = abs(
+            (_parse_timestamp(left["closed_at"]) - _parse_timestamp(right["closed_at"]))
+            .total_seconds()
+        )
+    except (TypeError, ValueError):
+        return False
+    return opened_gap <= 120 and closed_gap <= 120
+
+
+def _normalized_symbol(value: Any) -> str:
+    return "".join(character for character in str(value).upper() if character.isalnum())
+
+
+def _prices_match(left: float, right: float) -> bool:
+    return abs(left - right) <= max(0.1, max(abs(left), abs(right)) * 0.0025)
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
 def _match_round_trips(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
