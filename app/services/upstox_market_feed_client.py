@@ -14,11 +14,12 @@ from app.services.upstox_ws_client import UpstoxAuthPendingError, UpstoxWebSocke
 
 logger = logging.getLogger(__name__)
 
-# The two subscription modes this backend uses (Upstox also has "option_greeks" and "full_d30")
-# -- mirrors Android's FeedMode object exactly, since both sides speak the same Upstox wire
-# protocol for these control messages.
+# The backend requests Upstox's deepest live mode for full subscriptions. `full_d30` includes the
+# same LTPC/OHLC/Greeks payload as `full`, plus up to 30 market levels; Upstox gates this mode
+# behind Plus entitlement. Android still decides whether to render only the top five or let the
+# user expand the complete received book.
 MODE_LTPC = "ltpc"
-MODE_FULL = "full"
+MODE_FULL = "full_d30"
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,8 @@ class FeedTick:
     bid_price: Optional[float] = None
     ask_price: Optional[float] = None
     market_depth: tuple[MarketDepthLevel, ...] = ()
+    total_bid_quantity: Optional[int] = None
+    total_ask_quantity: Optional[int] = None
     one_minute_candle: Optional[FeedCandle] = None
 
 
@@ -112,6 +115,8 @@ def _decode_full_feed(instrument_key: str, full_feed: Any) -> Optional[FeedTick]
             bid_price=top_of_book.bidP if top_of_book is not None else None,
             ask_price=top_of_book.askP if top_of_book is not None else None,
             market_depth=market_depth,
+            total_bid_quantity=int(market_full_feed.tbq),
+            total_ask_quantity=int(market_full_feed.tsq),
             one_minute_candle=_one_minute_candle(market_full_feed.marketOHLC.ohlc),
         )
     if union == "indexFF":

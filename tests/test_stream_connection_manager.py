@@ -150,6 +150,8 @@ async def test_dispatch_tick_only_reaches_sessions_watching_that_instrument() ->
         bid_price=125.0,
         ask_price=126.0,
         market_depth=(MarketDepthLevel(450, 125.0, 300, 126.0),),
+        total_bid_quantity=93_950,
+        total_ask_quantity=116_950,
         one_minute_candle=FeedCandle(
             timestamp_millis=1_700_000_000_000, open=124.0, high=126.0, low=123.0, close=125.5, volume=900,
         ),
@@ -165,6 +167,8 @@ async def test_dispatch_tick_only_reaches_sessions_watching_that_instrument() ->
         "ask_quantity": 300,
         "ask_price": 126.0,
     }]
+    assert watching.sent[0]["data"]["total_bid_quantity"] == 93_950
+    assert watching.sent[0]["data"]["total_ask_quantity"] == 116_950
     assert watching.sent[0]["data"]["one_minute_candle"]["close"] == 125.5
     assert not_watching.sent == []
     del not_watching_session

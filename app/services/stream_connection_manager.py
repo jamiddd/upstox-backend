@@ -226,6 +226,8 @@ class StreamConnectionManager:
                         }
                         for level in tick.market_depth
                     ],
+                    "total_bid_quantity": tick.total_bid_quantity,
+                    "total_ask_quantity": tick.total_ask_quantity,
                     "one_minute_candle": (
                         {
                             "timestamp_millis": candle.timestamp_millis,

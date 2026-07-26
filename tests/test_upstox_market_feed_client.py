@@ -56,7 +56,13 @@ def test_decodes_full_mode_market_contract_with_bid_ask_and_candle() -> None:
         pb.Quote(bidQ=300, bidP=124.0, askQ=375, askP=126.0),
     ]
     market_level = pb.MarketLevel(bidAskQuote=quotes)
-    market_full_feed = pb.MarketFullFeed(ltpc=ltpc, marketLevel=market_level, marketOHLC=market_ohlc)
+    market_full_feed = pb.MarketFullFeed(
+        ltpc=ltpc,
+        marketLevel=market_level,
+        marketOHLC=market_ohlc,
+        tbq=93_950,
+        tsq=116_950,
+    )
     full_feed = pb.FullFeed(marketFF=market_full_feed)
     feed = pb.Feed(fullFeed=full_feed)
     response = pb.FeedResponse()
@@ -74,6 +80,8 @@ def test_decodes_full_mode_market_contract_with_bid_ask_and_candle() -> None:
         MarketDepthLevel(150, 124.5, 225, 125.5),
         MarketDepthLevel(300, 124.0, 375, 126.0),
     )
+    assert tick.total_bid_quantity == 93_950
+    assert tick.total_ask_quantity == 116_950
     assert tick.one_minute_candle == FeedCandle(
         timestamp_millis=1_721_873_700_000, open=124.0, high=126.0, low=123.5, close=125.0, volume=900,
     )
@@ -105,7 +113,11 @@ async def test_replace_full_subscription_diffs_and_preserves_common_instruments(
 
     await client.replace_full_subscription(["A", "B"])
     assert fake.sent == [
-        {"guid": fake.sent[0]["guid"], "method": "sub", "data": {"mode": "full", "instrumentKeys": ["A", "B"]}},
+        {
+            "guid": fake.sent[0]["guid"],
+            "method": "sub",
+            "data": {"mode": "full_d30", "instrumentKeys": ["A", "B"]},
+        },
     ]
 
     fake.sent.clear()
@@ -114,7 +126,7 @@ async def test_replace_full_subscription_diffs_and_preserves_common_instruments(
     # "A" removed, "B" retained without re-sending, "C" added -- exactly one unsub and one sub.
     methods = [(m["method"], m["data"]["mode"], m["data"]["instrumentKeys"]) for m in fake.sent]
     assert ("unsub", "ltpc", ["A"]) in methods
-    assert ("sub", "full", ["C"]) in methods
+    assert ("sub", "full_d30", ["C"]) in methods
 
 
 @pytest.mark.anyio
