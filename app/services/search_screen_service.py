@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from time import monotonic
 from typing import Any, Optional
 
@@ -118,13 +119,13 @@ class SearchScreenService:
         access_token: str,
         *,
         query: str,
-        limit: int = 20,
+        limit: int = 100,
     ) -> dict[str, Any]:
         """Return actual CE/PE/FUT instruments for canonical manual-journal symbol selection."""
         normalized_query = query.strip()
         if len(normalized_query) < 2:
             return {"query": normalized_query, "results": []}
-        safe_limit = min(max(limit, 1), 30)
+        safe_limit = min(max(limit, 1), 100)
         payload = await self.upstox.search_instruments(
             access_token,
             query=normalized_query,
@@ -150,6 +151,9 @@ class SearchScreenService:
                         "name": _string_value(item, "name"),
                         "instrument_type": instrument_type,
                         "exchange": _exchange_from_key(instrument_key) or _string_value(item, "exchange"),
+                        "underlying_symbol": _string_value(item, "underlying_symbol"),
+                        "expiry": _expiry_value(item),
+                        "strike_price": _number_value(item, "strike_price"),
                     }
                 )
                 if len(results) >= safe_limit:
@@ -423,6 +427,17 @@ def _number_value(payload: dict[str, Any], name: str) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return 0.0
+
+
+def _expiry_value(payload: dict[str, Any]) -> str:
+    """Normalize Upstox search's expiry, observed as either ISO text or epoch milliseconds."""
+    value = payload.get("expiry")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and value > 0:
+        seconds = value / 1000 if value > 10_000_000_000 else value
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).date().isoformat()
+    return ""
 
 
 def _tick_size(payload: dict[str, Any]) -> float:

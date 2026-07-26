@@ -731,7 +731,7 @@ async def search_underlyings(
 @protected_router.get("/search/contracts")
 async def search_contracts(
     query: str = Query(min_length=2, max_length=50),
-    limit: int = Query(default=20, ge=1, le=30),
+    limit: int = Query(default=100, ge=1, le=100),
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
