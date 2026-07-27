@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.generated import MarketDataFeed_pb2 as pb
+from app.services import upstox_market_feed_client as market_feed_client_module
 from app.services.upstox_market_feed_client import (
     FeedCandle,
     FeedTick,
@@ -10,6 +11,21 @@ from app.services.upstox_market_feed_client import (
     UpstoxMarketFeedClient,
     decode_feed_response,
 )
+
+
+class _FakeClock:
+    """Injectable stand-in for time.monotonic(), same reasoning as
+    market_hours.is_market_open's own injectable `now` -- lets staleness tests control elapsed
+    time exactly instead of racing the real clock."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.value = start
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
 
 
 class _FakeUnderlyingClient:
@@ -171,3 +187,152 @@ async def test_unsubscribe_removes_from_both_desired_sets() -> None:
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_resend_stale_subscriptions_does_not_nudge_freshly_subscribed_instrument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+
+    await client.replace_full_subscription(["A"])
+    fake.sent.clear()
+
+    clock.advance(10.0)  # under the 30s threshold used below
+    nudged = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    assert nudged == []
+    assert fake.sent == []
+
+
+@pytest.mark.anyio
+async def test_resend_stale_subscriptions_does_not_nudge_recently_ticked_instrument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.replace_full_subscription(["A"])
+
+    clock.advance(100.0)  # well past the threshold, but a tick just arrived
+    client._on_message(_full_feed_message("A", ltp=100.0))
+    fake.sent.clear()
+
+    nudged = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    assert nudged == []
+    assert fake.sent == []
+
+
+@pytest.mark.anyio
+async def test_resend_stale_subscriptions_nudges_stale_full_mode_instrument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.replace_full_subscription(["A"])
+    fake.sent.clear()
+
+    clock.advance(30.0)
+    nudged = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    assert nudged == ["A"]
+    assert fake.sent == [
+        {
+            "guid": fake.sent[0]["guid"],
+            "method": "sub",
+            "data": {"mode": "full_d30", "instrumentKeys": ["A"]},
+        },
+    ]
+
+
+@pytest.mark.anyio
+async def test_resend_stale_subscriptions_nudges_stale_ltpc_instrument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.subscribe_ltpc(["A"])
+    fake.sent.clear()
+
+    clock.advance(30.0)
+    nudged = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    assert nudged == ["A"]
+    assert fake.sent == [
+        {
+            "guid": fake.sent[0]["guid"],
+            "method": "sub",
+            "data": {"mode": "ltpc", "instrumentKeys": ["A"]},
+        },
+    ]
+
+
+@pytest.mark.anyio
+async def test_resend_stale_subscriptions_nudges_once_via_full_when_desired_in_both_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.replace_full_subscription(["A"])
+    await client.subscribe_ltpc(["A"])
+    fake.sent.clear()
+
+    clock.advance(30.0)
+    nudged = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    assert nudged == ["A"]
+    assert len(fake.sent) == 1
+    assert fake.sent[0]["data"]["mode"] == "full_d30"
+
+
+@pytest.mark.anyio
+async def test_resend_stale_subscriptions_does_not_immediately_renudge_same_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.replace_full_subscription(["A"])
+
+    clock.advance(30.0)
+    first_nudge = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+    assert first_nudge == ["A"]
+
+    clock.advance(1.0)  # well under another full 30s window since the nudge
+    second_check = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    assert second_check == []
+
+
+@pytest.mark.anyio
+async def test_resend_stale_subscriptions_is_noop_when_disconnected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.replace_full_subscription(["A"])
+    fake.sent.clear()
+    fake.connected = False
+    clock.advance(100.0)
+
+    nudged = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    assert nudged == []
+    assert fake.sent == []
+
+
+def _full_feed_message(instrument_key: str, *, ltp: float) -> bytes:
+    ltpc = pb.LTPC(ltp=ltp)
+    market_full_feed = pb.MarketFullFeed(ltpc=ltpc)
+    full_feed = pb.FullFeed(marketFF=market_full_feed)
+    feed = pb.Feed(fullFeed=full_feed)
+    response = pb.FeedResponse()
+    response.feeds[instrument_key].CopyFrom(feed)
+    return response.SerializeToString()

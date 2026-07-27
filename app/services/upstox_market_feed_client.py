@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -169,6 +170,13 @@ class UpstoxMarketFeedClient:
         self._on_tick = on_tick
         self._desired_full: list[str] = []
         self._desired_ltpc: list[str] = []
+        # Per-instrument last-tick-seen time (monotonic -- immune to wall-clock/NTP jumps, same
+        # convention as tracked_instruments_poller.py's own last-polled tracking). Backs
+        # resend_stale_subscriptions' self-heal for a silently-dropped single instrument, which the
+        # connection-wide stale-frame watchdog in UpstoxWebSocketClient can't detect on its own
+        # (that one only notices when NO instrument has ticked in a while, not when a single
+        # subscribed instrument specifically goes quiet while everything else keeps flowing).
+        self._last_seen_monotonic: dict[str, float] = {}
         self._client = UpstoxWebSocketClient(
             name="UpstoxMarketFeedClient",
             authorize=self._authorize,
@@ -199,11 +207,18 @@ class UpstoxMarketFeedClient:
         return data["authorized_redirect_uri"]
 
     def _on_message(self, message: Any) -> None:
-        # Upstox always sends market data as binary protobuf frames.
+        # Upstox always sends market data as binary protobuf frames -- a non-binary frame is the
+        # shape Upstox uses for sub/unsub acks and rejections (e.g. missing Plus entitlement for
+        # full_d30, exceeding its 50-instrument cap, a bad instrument key, rate limiting). This
+        # backend has no other visibility into those, so logging the actual content (not just that
+        # one arrived) is what makes a real rejection diagnosable instead of silently invisible --
+        # see resend_stale_subscriptions for the self-heal this is paired with. Truncated
+        # defensively in case Upstox ever sends something unexpectedly large as a text frame.
         if not isinstance(message, (bytes, bytearray)):
-            logger.warning("Unexpected non-binary frame from market feed")
+            logger.warning("Unexpected non-binary frame from market feed: %r", str(message)[:2000])
             return
         for tick in decode_feed_response(bytes(message)):
+            self._last_seen_monotonic[tick.instrument_key] = time.monotonic()
             self._on_tick(tick)
 
     def _desired_subscription_messages(self) -> list[dict[str, Any]]:
@@ -233,18 +248,78 @@ class UpstoxMarketFeedClient:
                 await self._client.send_json(_control_message("sub", MODE_LTPC, retained_ltpc))
         if added:
             await self._client.send_json(_control_message("sub", MODE_FULL, added))
+            # Seed rather than leave unset -- a just-subscribed instrument hasn't had a chance to
+            # tick yet, and resend_stale_subscriptions would otherwise wrongly flag it stale before
+            # the check interval even gives Upstox a chance to start sending it.
+            now = time.monotonic()
+            for key in added:
+                self._last_seen_monotonic.setdefault(key, now)
 
     async def subscribe_ltpc(self, instrument_keys: list[str]) -> None:
         if not instrument_keys:
             return
         self._desired_ltpc = instrument_keys
         await self._client.send_json(_control_message("sub", MODE_LTPC, instrument_keys))
+        # Same seeding reasoning as replace_full_subscription's `added` handling above.
+        now = time.monotonic()
+        for key in instrument_keys:
+            self._last_seen_monotonic.setdefault(key, now)
 
     async def unsubscribe(self, instrument_keys: list[str]) -> None:
         to_remove = set(instrument_keys)
         self._desired_full = [key for key in self._desired_full if key not in to_remove]
         self._desired_ltpc = [key for key in self._desired_ltpc if key not in to_remove]
+        # Stop tracking staleness for anything no longer desired at all -- keeps this dict from
+        # growing unboundedly as positions/contracts rotate in and out over a long-running process.
+        for key in to_remove:
+            self._last_seen_monotonic.pop(key, None)
         await self._client.send_json(_control_message("unsub", MODE_LTPC, list(instrument_keys)))
+
+    async def resend_stale_subscriptions(self, stale_after_seconds: float) -> list[str]:
+        """Best-effort self-heal for a silently-dropped single-instrument subscription.
+
+        Upstox's sub/unsub control messages are fire-and-forget (see `_on_message`'s own doc
+        comment) -- this backend has no way to know a specific instrument's subscription was
+        rejected or otherwise dropped, short of noticing the symptom: no ticks for something we
+        asked for. `UpstoxWebSocketClient`'s own connection-wide stale-frame watchdog can't catch
+        this either, since it only resets on ANY frame from ANY instrument -- one instrument going
+        silent while everything else keeps ticking normally never trips it.
+
+        Re-sends a plain `sub` for whatever's gone quiet longer than [stale_after_seconds] -- the
+        same wire message `replace_full_subscription`/`subscribe_ltpc` already send, so Upstox
+        sees an ordinary duplicate subscribe, nothing exotic. Resets that key's timestamp after
+        nudging it so this stays a lightweight, self-limiting mechanism: a genuinely stuck
+        instrument gets nudged at most once per [stale_after_seconds] window, not on every check.
+
+        Returns the nudged keys (both modes combined) purely so the caller can log which
+        instruments actually needed a self-heal -- the confirmation signal that this mechanism is
+        catching real incidents rather than never firing.
+        """
+        if not self._client.connected:
+            return []
+
+        now = time.monotonic()
+
+        def is_stale(key: str) -> bool:
+            return now - self._last_seen_monotonic.get(key, now) >= stale_after_seconds
+
+        stale_full = [key for key in self._desired_full if is_stale(key)]
+        stale_full_set = set(stale_full)
+        # Full wins per key if somehow stale in both -- same precedence
+        # FeedSubscriptionManager._apply already uses when a key is desired in both modes.
+        stale_ltpc = [
+            key for key in self._desired_ltpc if key not in stale_full_set and is_stale(key)
+        ]
+
+        if stale_full:
+            await self._client.send_json(_control_message("sub", MODE_FULL, stale_full))
+        if stale_ltpc:
+            await self._client.send_json(_control_message("sub", MODE_LTPC, stale_ltpc))
+
+        nudged = stale_full + stale_ltpc
+        for key in nudged:
+            self._last_seen_monotonic[key] = now
+        return nudged
 
 
 def _control_message(method: str, mode: str, instrument_keys: list[str]) -> dict[str, Any]:

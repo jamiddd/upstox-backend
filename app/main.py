@@ -6,6 +6,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,6 +15,7 @@ from fastapi.responses import JSONResponse
 from app.api.routes import router as api_router
 from app.api.stream_routes import router as stream_router
 from app.core.config import get_settings
+from app.core.market_hours import is_market_open
 from app.services.auth_watchdog import run_auth_watchdog
 from app.services.candle_cache_store import CandleCacheStore
 from app.services.fcm_service import FcmService
@@ -50,12 +52,37 @@ from app.services.upstox_service import UpstoxService
 # `docker compose logs`. This is the one place guaranteed to run before any other module's
 # logger.* call, since every route/service is imported above and reachable only through this
 # app.
+#
+# Also attaches a RotatingFileHandler under /data (the same Docker-volume-backed directory every
+# other store in this app already persists to -- see Settings' other *_path fields) so a past
+# incident's logs survive container restarts/recreates instead of only living in Docker's own log
+# buffer. Rotating (not a bare FileHandler) since this is a long-running always-on process with
+# frequent logger.info calls -- an unbounded file would eventually fill the volume.
+#
+# Every other *_path field in Settings is only touched lazily, when whatever store owns it is
+# actually used -- this is the first thing in the app to touch the filesystem eagerly at import
+# time, which broke local dev/tests (no /data mount outside the container). File logging is a
+# nice-to-have, not something worth failing app startup over, so this falls back to stream-only
+# logging if the directory can't be created for any reason.
+_log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    _settings_for_logging = get_settings()
+    _settings_for_logging.log_file_path.parent.mkdir(parents=True, exist_ok=True)
+    _file_handler = RotatingFileHandler(
+        _settings_for_logging.log_file_path, maxBytes=10_000_000, backupCount=5,
+    )
+    _file_handler.setFormatter(logging.Formatter(_log_format))
+    _log_handlers.append(_file_handler)
+except OSError:
+    pass
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format=_log_format,
     # uvicorn may have already attached its own handler to the root logger by the time this
     # module imports (depends on how it's launched) -- plain basicConfig() is a no-op once any
     # handler exists, force=True guarantees this config wins regardless.
+    handlers=_log_handlers,
     force=True,
 )
 
@@ -70,6 +97,16 @@ _SUBSCRIPTION_REFRESH_INTERVAL_SECONDS = 60.0
 # already triggers an immediate one on every real order/position change; see
 # _run_position_tracker_refresh's own doc comment for what this interval actually catches.
 _POSITION_TRACKER_REFRESH_INTERVAL_SECONDS = 15.0
+
+# How often _run_market_feed_staleness_check wakes up to look for a silently-dropped single
+# instrument subscription.
+_MARKET_FEED_STALENESS_CHECK_INTERVAL_SECONDS = 20.0
+# Per-instrument threshold for UpstoxMarketFeedClient.resend_stale_subscriptions -- deliberately a
+# DIFFERENT, independent concern from UpstoxWebSocketClient's own connection-wide
+# _STALE_AFTER_SECONDS=30 watchdog. That one detects "no frames at all from the whole connection";
+# this one detects "no frames for one specific subscribed instrument while everything else on the
+# connection is fine" -- do not conflate the two or import one into the other.
+_MARKET_FEED_INSTRUMENT_STALE_AFTER_SECONDS = 45.0
 
 # How many consecutive disconnected/auth-pending transitions one of the backend's own Upstox feed
 # connections can have before it's worth a notification -- avoids notifying on a single transient
@@ -306,6 +343,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     position_tracker_refresh_task = asyncio.create_task(
         _run_position_tracker_refresh(position_tracker, subscription_manager),
     )
+    market_feed_staleness_task = asyncio.create_task(
+        _run_market_feed_staleness_check(market_feed_client),
+    )
     max_loss_watcher_task = asyncio.create_task(
         run_max_loss_watcher_fallback(
             token_store=max_loss_watcher_deps.token_store,
@@ -336,6 +376,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_loss_watcher_task.cancel()
         subscription_refresh_task.cancel()
         position_tracker_refresh_task.cancel()
+        market_feed_staleness_task.cancel()
         journal_reconciler_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await poller_task
@@ -353,6 +394,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await subscription_refresh_task
         with contextlib.suppress(asyncio.CancelledError):
             await position_tracker_refresh_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await market_feed_staleness_task
         with contextlib.suppress(asyncio.CancelledError):
             await journal_reconciler_task
         await market_feed_client.stop()
@@ -390,6 +433,28 @@ async def _run_position_tracker_refresh(
             raise
         except Exception:
             logger.warning("Position P&L tracker refresh failed unexpectedly", exc_info=True)
+
+
+async def _run_market_feed_staleness_check(market_feed_client: UpstoxMarketFeedClient) -> None:
+    """Best-effort self-heal for a silently-dropped single-instrument subscription -- see
+    UpstoxMarketFeedClient.resend_stale_subscriptions' own doc comment for why Upstox's sub/unsub
+    acks/rejections are otherwise invisible to this backend, and why the connection-wide
+    stale-frame watchdog in UpstoxWebSocketClient can't catch this on its own. Market-hours gated
+    since there's nothing subscribed worth nudging outside trading hours."""
+    while True:
+        await asyncio.sleep(_MARKET_FEED_STALENESS_CHECK_INTERVAL_SECONDS)
+        try:
+            if not is_market_open():
+                continue
+            nudged = await market_feed_client.resend_stale_subscriptions(
+                _MARKET_FEED_INSTRUMENT_STALE_AFTER_SECONDS,
+            )
+            if nudged:
+                logger.warning("Market feed self-heal: resubscribed stale instrument(s) %s", nudged)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Market feed staleness check failed unexpectedly", exc_info=True)
 
 
 def _persist_completed_candle(

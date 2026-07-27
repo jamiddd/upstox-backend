@@ -30,6 +30,7 @@ class Settings:
     journal_database_path: Path = Path("/data/journal.sqlite3")
     device_token_path: Path = Path("/data/device_token.json")
     max_loss_settings_path: Path = Path("/data/max_loss_settings.json")
+    log_file_path: Path = Path("/data/logs/app.log")
     notification_retention_days: int = 90
     firebase_service_account_path: Path = Path("/data/firebase_service_account.json")
     upstox_api_base_url: str = "https://api.upstox.com/v2"
@@ -82,6 +83,7 @@ class Settings:
             max_loss_settings_path=Path(
                 os.getenv("MAX_LOSS_SETTINGS_PATH", "/data/max_loss_settings.json"),
             ),
+            log_file_path=Path(os.getenv("LOG_FILE_PATH", "/data/logs/app.log")),
             notification_retention_days=max(
                 1, int(os.getenv("NOTIFICATION_RETENTION_DAYS", "90")),
             ),

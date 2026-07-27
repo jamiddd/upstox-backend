@@ -80,7 +80,12 @@ class UpstoxPortfolioFeedClient:
         try:
             payload = json.loads(text)
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Failed to parse portfolio feed message", exc_info=True)
+            # See UpstoxMarketFeedClient._on_message's own doc comment on why logging the actual
+            # content (not just that a failure happened) matters for diagnosing a real Upstox-side
+            # rejection/error frame instead of it being silently invisible.
+            logger.warning(
+                "Failed to parse portfolio feed message: %r", str(text)[:2000], exc_info=True,
+            )
             return
         if not isinstance(payload, dict):
             return
