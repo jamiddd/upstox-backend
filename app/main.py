@@ -236,8 +236,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.warning("Could not initialize the live candle cache store", exc_info=True)
         candle_cache_store = None
     candle_builder = LiveCandleBuilder(
-        on_candle_completed=lambda instrument_key, candle: _persist_completed_candle(
-            candle_cache_store, instrument_key, candle,
+        # FIX: this callback fires synchronously, inline, from inside the market feed's own
+        # WebSocket read loop (UpstoxWebSocketClient._connect_once -> _on_message -> ... ->
+        # LiveCandleBuilder.handle_tick) -- calling _persist_completed_candle directly here used
+        # to run CandleCacheStore.save's blocking sqlite3.connect/executemany right there. Python's
+        # single-threaded event loop means a slow or stuck disk write didn't just delay this one
+        # candle -- it froze EVERY coroutine in the process, including the read loop's own
+        # stale-frame watchdog (nothing could even notice the freeze to reconnect), matching a
+        # real production report of all live prices freezing with only a full container restart
+        # recovering it. asyncio.to_thread moves the actual blocking I/O off the event loop
+        # entirely; create_task (same fire-and-forget posture _on_market_tick's own
+        # dispatch_tick/check_max_loss_now calls already use below) schedules it without blocking
+        # the tick that triggered it.
+        on_candle_completed=lambda instrument_key, candle: asyncio.create_task(
+            asyncio.to_thread(_persist_completed_candle, candle_cache_store, instrument_key, candle),
         ),
     )
     order_fill_detector = OrderFillDetector()
