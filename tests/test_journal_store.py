@@ -74,3 +74,35 @@ def test_context_can_be_recorded_empty_after_signal_failure(tmp_path) -> None:
     assert row["context"] == {}
     assert row["contract_ltp"] is None
 
+
+def test_latest_placement_context_returns_most_recent_by_instrument(tmp_path) -> None:
+    store = JournalStore(_settings(tmp_path))
+    store.record_context(
+        order_id="order-a",
+        trigger="placement",
+        instrument_key="NSE_FO|789",
+        underlying_key="NSE_INDEX|Nifty 50",
+        expiry_date="2026-07-30",
+        contract_ltp=100.0,
+        context={"tags": ["first"]},
+        captured_at=datetime(2026, 7, 26, 4, 0, 0, tzinfo=timezone.utc),
+    )
+    store.record_context(
+        order_id="order-b",
+        trigger="placement",
+        instrument_key="NSE_FO|789",
+        underlying_key="NSE_INDEX|Nifty 50",
+        expiry_date="2026-07-30",
+        contract_ltp=110.0,
+        context={"tags": ["second"]},
+        captured_at=datetime(2026, 7, 26, 4, 30, 0, tzinfo=timezone.utc),
+    )
+
+    latest = store.latest_placement_context("NSE_FO|789")
+
+    assert latest is not None
+    assert latest["order_id"] == "order-b"
+    assert latest["contract_ltp"] == 110.0
+    assert latest["context"] == {"tags": ["second"]}
+    assert store.latest_placement_context("NSE_FO|unknown") is None
+

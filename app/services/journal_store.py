@@ -216,6 +216,26 @@ class JournalStore:
         result["context"] = json.loads(result.pop("context_json"))
         return result
 
+    def latest_placement_context(self, instrument_key: str) -> Optional[dict[str, Any]]:
+        """Most recent placement for a contract, used when a GTT fill gets a new broker order ID."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT order_id, trigger, instrument_key, underlying_key, expiry_date,
+                       contract_ltp, captured_at, context_json
+                FROM trade_context
+                WHERE instrument_key = ? AND trigger = 'placement'
+                ORDER BY captured_at DESC, id DESC
+                LIMIT 1
+                """,
+                (instrument_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["context"] = json.loads(result.pop("context_json"))
+        return result
+
     def upsert_fill(self, fill: dict[str, Any]) -> bool:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         raw = json.dumps(fill.get("raw_payload", fill), separators=(",", ":"), sort_keys=True, default=str)
@@ -756,23 +776,3 @@ def _match_round_trips(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
         })
         sequence = []
     return results
-
-    def latest_placement_context(self, instrument_key: str) -> Optional[dict[str, Any]]:
-        """Most recent placement for a contract, used when a GTT fill gets a new broker order ID."""
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT order_id, trigger, instrument_key, underlying_key, expiry_date,
-                       contract_ltp, captured_at, context_json
-                FROM trade_context
-                WHERE instrument_key = ? AND trigger = 'placement'
-                ORDER BY captured_at DESC, id DESC
-                LIMIT 1
-                """,
-                (instrument_key,),
-            ).fetchone()
-        if row is None:
-            return None
-        result = dict(row)
-        result["context"] = json.loads(result.pop("context_json"))
-        return result
