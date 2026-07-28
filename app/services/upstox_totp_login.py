@@ -167,16 +167,36 @@ def _generate_request_id() -> str:
     return "WPRO-" + "".join(random.choices(characters, k=10))
 
 
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
 def _build_headers(request_id: str) -> dict[str, str]:
+    # Matches the reference implementation's full browser-shaped header set, not just the
+    # minimal accept/content-type/origin/referer/user-agent/x-request-id subset this started
+    # with -- Upstox's login endpoints appear to reject requests missing these (a generic
+    # "Something went wrong" error at otp/generate, not a specific header-missing message), even
+    # with curl_cffi's Chrome TLS impersonation already in place.
     return {
         "accept": "*/*",
+        "accept-language": "en-GB,en;q=0.9",
         "content-type": "application/json",
         "origin": _LOGIN_HOST,
+        "priority": "u=1, i",
         "referer": _LOGIN_HOST,
-        "user-agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
+        "sec-ch-ua": '"Chromium";v="131", "Not=A?Brand";v="24", "Google Chrome";v="131"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "user-agent": _USER_AGENT,
+        "x-device-details": (
+            "platform=WEB|osName=Mac OS/10.15.7|osVersion=Chrome/131.0.0.0|appVersion=4.0.0|"
+            "modelName=Chrome|manufacturer=Apple|uuid=3Z1IVTlV4rUUGbNp8KP0|"
+            f"userAgent=Upstox 3.0 {_USER_AGENT}"
         ),
         "x-request-id": request_id,
     }
