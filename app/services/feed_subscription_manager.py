@@ -118,3 +118,18 @@ class FeedSubscriptionManager:
             if ltpc_union:
                 await self._market_feed_client.subscribe_ltpc(sorted(ltpc_union))
             self._previous_ltpc_union = ltpc_union
+
+    def debug_snapshot(self) -> dict[str, object]:
+        """Read-only view of what's feeding the full/ltpc union -- see `api/routes.py`'s
+        `GET /api/debug/feed-status`. Broken down by source so it's visible *why* a given
+        instrument is (or isn't) in the union, not just the final merged set."""
+        return {
+            "tracked_instruments": sorted(self._tracked_store.load()),
+            "position_instruments": sorted(self._position_instruments),
+            "client_full_by_session": {
+                session_id: sorted(keys) for session_id, keys in self._client_full.items()
+            },
+            "client_ltpc_by_session": {
+                session_id: sorted(keys) for session_id, keys in self._client_ltpc.items()
+            },
+        }

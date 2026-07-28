@@ -154,6 +154,23 @@ async def test_closed_position_drops_out_of_ltpc_subscription() -> None:
 
 
 @pytest.mark.anyio
+async def test_debug_snapshot_breaks_down_by_source() -> None:
+    client = _FakeMarketFeedClient()
+    manager = FeedSubscriptionManager(
+        market_feed_client=client, tracked_store=_FakeTrackedStore(["NSE_INDEX|Nifty 50"]),
+    )
+    await manager.set_client_subscription("session-1", full=["NSE_FO|111"], ltpc=["NSE_FO|222"])
+    await manager.set_open_position_instruments({"NSE_FO|333"})
+
+    snapshot = manager.debug_snapshot()
+
+    assert snapshot["tracked_instruments"] == ["NSE_INDEX|Nifty 50"]
+    assert snapshot["position_instruments"] == ["NSE_FO|333"]
+    assert snapshot["client_full_by_session"] == {"session-1": ["NSE_FO|111"]}
+    assert snapshot["client_ltpc_by_session"] == {"session-1": ["NSE_FO|222"]}
+
+
+@pytest.mark.anyio
 async def test_unchanged_ltpc_set_does_not_resend() -> None:
     client = _FakeMarketFeedClient()
     manager = FeedSubscriptionManager(market_feed_client=client, tracked_store=_FakeTrackedStore([]))

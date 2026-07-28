@@ -328,6 +328,31 @@ async def test_resend_stale_subscriptions_is_noop_when_disconnected(
     assert fake.sent == []
 
 
+@pytest.mark.anyio
+async def test_debug_snapshot_reports_desired_sets_and_tick_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, _ = _client()
+    await client.replace_full_subscription(["A"])
+    await client.subscribe_ltpc(["B"])
+    clock.advance(5.0)
+    client._on_message(_full_feed_message("A", ltp=100.0))
+    clock.advance(2.0)
+
+    snapshot = client.debug_snapshot()
+
+    assert snapshot["connected"] is True
+    assert snapshot["desired_full"] == ["A"]
+    assert snapshot["desired_full_count"] == 1
+    assert snapshot["desired_ltpc"] == ["B"]
+    # A ticked 2s ago (after the 5s advance); B never ticked, seeded at subscribe time, so it
+    # reads as stale by the full 7s elapsed since then.
+    assert snapshot["seconds_since_last_tick"]["A"] == pytest.approx(2.0)
+    assert snapshot["seconds_since_last_tick"]["B"] == pytest.approx(7.0)
+
+
 def _full_feed_message(instrument_key: str, *, ltp: float) -> bytes:
     ltpc = pb.LTPC(ltp=ltp)
     market_full_feed = pb.MarketFullFeed(ltpc=ltpc)

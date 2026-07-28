@@ -169,6 +169,25 @@ def get_status() -> dict[str, str]:
     return {"status": "ready"}
 
 
+@protected_router.get("/debug/feed-status")
+def get_feed_status(request: Request) -> dict[str, Any]:
+    """Read-only snapshot of the market-feed connection/subscription state -- lets a reported
+    "this contract's price is frozen" incident be cross-checked directly against the backend's
+    own view (is it still in the desired set, how long since its own last tick, how close the
+    full-mode union is to Upstox's 50-key cap) without needing server/log file access."""
+    market_feed_client = getattr(request.app.state, "market_feed_client", None)
+    subscription_manager = getattr(request.app.state, "feed_subscription_manager", None)
+    if market_feed_client is None or subscription_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"status": "error", "message": "Market feed not initialized yet"},
+        )
+    return {
+        "market_feed": market_feed_client.debug_snapshot(),
+        "subscription_manager": subscription_manager.debug_snapshot(),
+    }
+
+
 @protected_router.get("/auth/login-url")
 def get_login_url(
     state: Optional[str] = None,

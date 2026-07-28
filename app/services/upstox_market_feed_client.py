@@ -321,6 +321,25 @@ class UpstoxMarketFeedClient:
             self._last_seen_monotonic[key] = now
         return nudged
 
+    def debug_snapshot(self) -> dict[str, Any]:
+        """Read-only diagnostic view of this client's current state -- see `api/routes.py`'s
+        `GET /api/debug/feed-status`, added so a reported "frozen contract" can be cross-checked
+        against the backend's own view of what's desired and each key's own last-tick age,
+        without needing direct server/log access."""
+        now = time.monotonic()
+        seconds_since_last_tick = {
+            key: round(now - seen, 1) for key, seen in self._last_seen_monotonic.items()
+        }
+        return {
+            "connected": self.connected,
+            "desired_full": list(self._desired_full),
+            "desired_full_count": len(self._desired_full),
+            "desired_ltpc": list(self._desired_ltpc),
+            "seconds_since_last_tick": dict(
+                sorted(seconds_since_last_tick.items(), key=lambda item: -item[1]),
+            ),
+        }
+
 
 def _control_message(method: str, mode: str, instrument_keys: list[str]) -> dict[str, Any]:
     """Same JSON shape as Android's `FeedControlMessage`/`FeedSubscriptionData`."""
