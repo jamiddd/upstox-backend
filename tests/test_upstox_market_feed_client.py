@@ -292,6 +292,63 @@ async def test_resend_stale_subscriptions_nudges_once_via_full_when_desired_in_b
 
 
 @pytest.mark.anyio
+async def test_resend_stale_subscriptions_escalates_to_unsub_after_repeated_staleness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.replace_full_subscription(["A"])
+    fake.sent.clear()
+
+    # First two nudges stay plain re-subs -- a fresh incident shouldn't escalate immediately.
+    clock.advance(30.0)
+    await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+    clock.advance(30.0)
+    await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+    assert all(sent["method"] == "sub" for sent in fake.sent)
+    fake.sent.clear()
+
+    # Third consecutive nudge (still stale despite two plain resends) escalates.
+    clock.advance(30.0)
+    nudged = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    assert nudged == ["A"]
+    assert [sent["method"] for sent in fake.sent] == ["unsub", "sub"]
+    assert fake.sent[0]["data"] == {"mode": "ltpc", "instrumentKeys": ["A"]}
+    assert fake.sent[1]["data"] == {"mode": "full_d30", "instrumentKeys": ["A"]}
+
+
+@pytest.mark.anyio
+async def test_resend_stale_subscriptions_escalation_streak_resets_after_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.replace_full_subscription(["A"])
+
+    clock.advance(30.0)
+    await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+    clock.advance(30.0)
+    await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    # A real tick arrives and stays fresh through the next check -- no longer stale at all, so
+    # the escalation streak clears rather than carrying into some later, unrelated incident.
+    client._on_message(_full_feed_message("A", ltp=100.0))
+    nudged = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+    assert nudged == []
+    fake.sent.clear()
+
+    # Goes stale again later -- starts over as a fresh, ordinary (non-escalated) incident.
+    clock.advance(30.0)
+    nudged = await client.resend_stale_subscriptions(stale_after_seconds=30.0)
+
+    assert nudged == ["A"]
+    assert [sent["method"] for sent in fake.sent] == ["sub"]
+
+
+@pytest.mark.anyio
 async def test_resend_stale_subscriptions_does_not_immediately_renudge_same_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

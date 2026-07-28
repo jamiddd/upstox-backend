@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 MODE_LTPC = "ltpc"
 MODE_FULL = "full_d30"
 
+# How many consecutive resend_stale_subscriptions passes the same key can need a plain re-`sub`
+# before escalating to an explicit unsub-then-sub -- see that function's own doc comment.
+_ESCALATE_AFTER_NUDGES = 2
+
 
 @dataclass(frozen=True)
 class FeedCandle:
@@ -177,6 +181,12 @@ class UpstoxMarketFeedClient:
         # (that one only notices when NO instrument has ticked in a while, not when a single
         # subscribed instrument specifically goes quiet while everything else keeps flowing).
         self._last_seen_monotonic: dict[str, float] = {}
+        # How many *consecutive* resend_stale_subscriptions passes a key has needed nudging in a
+        # row -- backs that function's own escalation from a plain duplicate `sub` (cheap, fixes a
+        # transient drop) to an explicit unsub-then-sub (see its own doc comment for why that's
+        # sometimes needed). Cleared the moment a key stops being stale, so an old streak never
+        # carries into some later, unrelated incident.
+        self._consecutive_nudge_count: dict[str, int] = {}
         self._client = UpstoxWebSocketClient(
             name="UpstoxMarketFeedClient",
             authorize=self._authorize,
@@ -246,6 +256,18 @@ class UpstoxMarketFeedClient:
             retained_ltpc = [key for key in removed if key in self._desired_ltpc]
             if retained_ltpc:
                 await self._client.send_json(_control_message("sub", MODE_LTPC, retained_ltpc))
+            # FIX: only genuinely-dropped keys (not staying on in ltpc mode) had their staleness
+            # tracking cleaned up here before -- actually never did at all, so a key that rotated
+            # out of a shifting window (e.g. the chart's own neighbor-strike window following
+            # smart-strike selection) lingered in these dicts indefinitely, showing up as
+            # permanently "stale" clutter in `debug_snapshot()` even though it's no longer desired
+            # at all. `unsubscribe()` already does this same cleanup for its own callers.
+            retained_ltpc_set = set(retained_ltpc)
+            for key in removed:
+                if key in retained_ltpc_set:
+                    continue
+                self._last_seen_monotonic.pop(key, None)
+                self._consecutive_nudge_count.pop(key, None)
         if added:
             await self._client.send_json(_control_message("sub", MODE_FULL, added))
             # Seed rather than leave unset -- a just-subscribed instrument hasn't had a chance to
@@ -269,10 +291,11 @@ class UpstoxMarketFeedClient:
         to_remove = set(instrument_keys)
         self._desired_full = [key for key in self._desired_full if key not in to_remove]
         self._desired_ltpc = [key for key in self._desired_ltpc if key not in to_remove]
-        # Stop tracking staleness for anything no longer desired at all -- keeps this dict from
+        # Stop tracking staleness for anything no longer desired at all -- keeps these dicts from
         # growing unboundedly as positions/contracts rotate in and out over a long-running process.
         for key in to_remove:
             self._last_seen_monotonic.pop(key, None)
+            self._consecutive_nudge_count.pop(key, None)
         await self._client.send_json(_control_message("unsub", MODE_LTPC, list(instrument_keys)))
 
     async def resend_stale_subscriptions(self, stale_after_seconds: float) -> list[str]:
@@ -285,11 +308,17 @@ class UpstoxMarketFeedClient:
         this either, since it only resets on ANY frame from ANY instrument -- one instrument going
         silent while everything else keeps ticking normally never trips it.
 
-        Re-sends a plain `sub` for whatever's gone quiet longer than [stale_after_seconds] -- the
-        same wire message `replace_full_subscription`/`subscribe_ltpc` already send, so Upstox
-        sees an ordinary duplicate subscribe, nothing exotic. Resets that key's timestamp after
-        nudging it so this stays a lightweight, self-limiting mechanism: a genuinely stuck
-        instrument gets nudged at most once per [stale_after_seconds] window, not on every check.
+        First nudge for a key is a plain re-`sub` -- the same wire message
+        `replace_full_subscription`/`subscribe_ltpc` already send, so Upstox sees an ordinary
+        duplicate subscribe, nothing exotic, and a transient drop clears. FIX: confirmed live
+        (via `GET /api/debug/feed-status`) that a persistently-stuck instrument can go a full
+        subsequent stale window with *still* zero ticks after a plain re-`sub` -- Upstox appears to
+        silently dedupe a repeated subscribe for something it (wrongly) still thinks is already
+        active. Once the *same* key has needed nudging [_ESCALATE_AFTER_NUDGES] times in a row,
+        this escalates to an explicit `unsub` before the re-`sub` -- a stronger reset than a bare
+        duplicate subscribe. Resets each nudged key's timestamp (and bumps its consecutive-nudge
+        streak) so this stays self-limiting: nudged at most once per [stale_after_seconds] window,
+        not on every check, and the streak resets the moment a key stops being stale.
 
         Returns the nudged keys (both modes combined) purely so the caller can log which
         instruments actually needed a self-heal -- the confirmation signal that this mechanism is
@@ -310,15 +339,46 @@ class UpstoxMarketFeedClient:
         stale_ltpc = [
             key for key in self._desired_ltpc if key not in stale_full_set and is_stale(key)
         ]
-
-        if stale_full:
-            await self._client.send_json(_control_message("sub", MODE_FULL, stale_full))
-        if stale_ltpc:
-            await self._client.send_json(_control_message("sub", MODE_LTPC, stale_ltpc))
-
         nudged = stale_full + stale_ltpc
+        nudged_set = set(nudged)
+
+        # A key that's recovered (no longer stale) shouldn't carry its escalation streak into
+        # some future, unrelated staleness incident.
+        for key in list(self._consecutive_nudge_count):
+            if key not in nudged_set:
+                del self._consecutive_nudge_count[key]
+
+        escalate_set = {
+            key for key in nudged
+            if self._consecutive_nudge_count.get(key, 0) >= _ESCALATE_AFTER_NUDGES
+        }
+        escalate_full = [key for key in stale_full if key in escalate_set]
+        escalate_ltpc = [key for key in stale_ltpc if key in escalate_set]
+        plain_full = [key for key in stale_full if key not in escalate_set]
+        plain_ltpc = [key for key in stale_ltpc if key not in escalate_set]
+
+        if escalate_full or escalate_ltpc:
+            logger.warning(
+                "Market feed self-heal: escalating to unsub+resub for %s (still stale after a "
+                "plain resend)",
+                escalate_full + escalate_ltpc,
+            )
+            await self._client.send_json(
+                _control_message("unsub", MODE_LTPC, escalate_full + escalate_ltpc),
+            )
+            if escalate_full:
+                await self._client.send_json(_control_message("sub", MODE_FULL, escalate_full))
+            if escalate_ltpc:
+                await self._client.send_json(_control_message("sub", MODE_LTPC, escalate_ltpc))
+        if plain_full:
+            await self._client.send_json(_control_message("sub", MODE_FULL, plain_full))
+        if plain_ltpc:
+            await self._client.send_json(_control_message("sub", MODE_LTPC, plain_ltpc))
+
         for key in nudged:
             self._last_seen_monotonic[key] = now
+            self._consecutive_nudge_count[key] = self._consecutive_nudge_count.get(key, 0) + 1
+
         return nudged
 
     def debug_snapshot(self) -> dict[str, Any]:
