@@ -301,6 +301,22 @@ class JournalStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def total_charges_for_date(self, trading_date: str) -> float:
+        """Sum of every fill's `computed_charges` for [trading_date] -- used by
+        `MainScreenService`'s closing-balance formula (see that module's own doc comment) to
+        deduct today's actual brokerage/STT/exchange fees, which Upstox's own position `pnl`
+        figures never include. Reads `trade_fills` directly rather than `journal_trades`'
+        round-trip-matched `computed_charges`, so a fill that hasn't (yet, or ever will) resolve
+        into a matched round trip still counts -- every fill incurred a real charge regardless of
+        whether the FIFO matcher has paired it with an exit yet.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(computed_charges), 0) AS total FROM trade_fills WHERE trade_date = ?",
+                (trading_date,),
+            ).fetchone()
+        return float(row["total"]) if row is not None else 0.0
+
     def rebuild_session(self, trading_date: str) -> list[str]:
         """FIFO-match a session. Annotated trades whose fill set changes are protected."""
         fills = self.fills_for_session(trading_date)

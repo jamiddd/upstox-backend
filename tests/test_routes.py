@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.api.dependencies import (
     get_candle_cache_store,
+    get_journal_store,
     get_notification_service,
     get_oi_snapshot_store,
     get_signal_snapshot_store,
@@ -25,6 +26,7 @@ from app.services import instrument_rules_service
 from app.services.instrument_rules_service import _MasterCache
 from app.services.main_screen_service import MainScreenService, _CACHE
 from app.services.account_snapshot_store import AccountSnapshot, AccountSnapshotStore
+from app.services.journal_store import JournalStore
 from app.services import oi_analysis_service
 from app.services.oi_snapshot_store import OiStrikeDiff, OiStrikesDiff, SnapshotNotFoundError
 from app.services import search_screen_service
@@ -884,6 +886,13 @@ def _client(token_store: Optional[FakeTokenStore] = None) -> TestClient:
     # create Settings.oi_database_path's parent directory, which doesn't exist in this sandbox.
     app.dependency_overrides[get_oi_snapshot_store] = lambda: None
     app.dependency_overrides[get_candle_cache_store] = lambda: None
+    # Same reasoning -- /main/bootstrap and /main/summary now depend on this too (for
+    # closing_balance's charges deduction, see MainScreenService.summary's own doc comment), and
+    # the real dependency tries to create Settings.journal_database_path's parent directory,
+    # which doesn't exist in this sandbox. MainScreenService treats journal_store=None as "skip
+    # the charges deduction" (todays_charges falls back to 0.0), so bootstrap/summary tests below
+    # that don't care about that precision are unaffected.
+    app.dependency_overrides[get_journal_store] = lambda: None
     app.dependency_overrides[get_notification_service] = FakeNotificationService
     return TestClient(app)
 
@@ -1867,6 +1876,45 @@ def test_main_summary_returns_balance_pnl_and_closing_balance() -> None:
         "payin_amount": 1900.0,
         "funds_unavailable_note": None,
     }
+
+
+def test_main_summary_closing_balance_deducts_todays_charges(tmp_path: Path) -> None:
+    """closing_balance = opening + payin + profit_loss - todays_charges (see
+    MainScreenService.summary's own doc comment) -- Upstox's own position pnl figure never
+    includes brokerage/STT/exchange charges, so those must be subtracted separately using the
+    journal's own recorded fills for today."""
+    journal_store = JournalStore(
+        Settings(
+            upstox_api_key="k", upstox_api_secret="s",
+            upstox_redirect_url="https://example.com/api/auth/callback",
+            upstox_environment="sandbox", mobile_api_key="mobile-secret",
+            token_encryption_key="", token_store_path=tmp_path / "token.enc",
+            journal_database_path=tmp_path / "journal.sqlite3",
+        ),
+    )
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    journal_store.upsert_fill({
+        "fill_id": "fill-1", "order_id": "order-1", "instrument_key": "NSE_FO|123",
+        "trading_symbol": "NIFTY26JUL25000CE", "transaction_type": "BUY", "quantity": 75,
+        "price": 100.0, "executed_at": f"{today}T04:00:00+00:00", "trade_date": today,
+        "exchange": "NFO", "segment": "FO", "option_type": "CE", "strike_price": 25000.0,
+        "expiry": "2026-07-30", "computed_charges": 45.5,
+    })
+
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        response = client.get(
+            "/api/main/summary",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    # Same fixture as test_main_summary_returns_balance_pnl_and_closing_balance (100000 + 1900 +
+    # 400 = 102300 before charges) minus the 45.5 charge recorded above.
+    assert response.json()["closing_balance"] == 102254.5
 
 
 def test_get_funds_and_margin_returns_raw_upstox_payload() -> None:

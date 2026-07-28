@@ -412,11 +412,12 @@ async def main_bootstrap(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
+    journal_store: JournalStore = Depends(get_journal_store),
 ) -> dict[str, Any]:
     """Return screen-ready initial data for the option trading main screen."""
     access_token = _load_access_token(token_store)
     try:
-        return await MainScreenService(service, AccountSnapshotStore(settings)).bootstrap(
+        return await MainScreenService(service, AccountSnapshotStore(settings), journal_store).bootstrap(
             access_token,
             underlying_key=underlying_key,
             expiry_date=expiry_date,
@@ -491,11 +492,12 @@ async def main_summary(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
+    journal_store: JournalStore = Depends(get_journal_store),
 ) -> dict[str, Any]:
     """Return opening balance, current P&L, and closing balance."""
     access_token = _load_access_token(token_store)
     try:
-        return await MainScreenService(service, AccountSnapshotStore(settings)).summary(access_token)
+        return await MainScreenService(service, AccountSnapshotStore(settings), journal_store).summary(access_token)
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

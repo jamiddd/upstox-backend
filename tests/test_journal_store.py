@@ -106,3 +106,34 @@ def test_latest_placement_context_returns_most_recent_by_instrument(tmp_path) ->
     assert latest["context"] == {"tags": ["second"]}
     assert store.latest_placement_context("NSE_FO|unknown") is None
 
+
+def _fill(fill_id: str, trade_date: str, computed_charges: float) -> dict:
+    return {
+        "fill_id": fill_id,
+        "order_id": f"order-{fill_id}",
+        "instrument_key": "NSE_FO|123",
+        "trading_symbol": "NIFTY26JUL25000CE",
+        "transaction_type": "BUY",
+        "quantity": 75,
+        "price": 100.0,
+        "executed_at": f"{trade_date}T04:00:00+00:00",
+        "trade_date": trade_date,
+        "exchange": "NFO",
+        "segment": "FO",
+        "option_type": "CE",
+        "strike_price": 25000.0,
+        "expiry": "2026-07-30",
+        "computed_charges": computed_charges,
+    }
+
+
+def test_total_charges_for_date_sums_only_that_dates_fills(tmp_path) -> None:
+    store = JournalStore(_settings(tmp_path))
+    store.upsert_fill(_fill("fill-1", "2026-07-26", 12.5))
+    store.upsert_fill(_fill("fill-2", "2026-07-26", 7.25))
+    store.upsert_fill(_fill("fill-3", "2026-07-25", 999.0))  # a different day -- must not count
+
+    assert store.total_charges_for_date("2026-07-26") == 19.75
+    assert store.total_charges_for_date("2026-07-25") == 999.0
+    assert store.total_charges_for_date("2026-07-27") == 0.0
+

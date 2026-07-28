@@ -73,14 +73,17 @@ async def test_successful_snapshot_records_info_notification(
             return "token"
 
     class FakeService:
-        def __init__(self, upstox) -> None:
+        def __init__(self, upstox, *args, **kwargs) -> None:
             pass
 
         async def summary(self, access_token: str):
+            # closing_balance is now what the scheduler persists directly (see
+            # account_snapshot_scheduler's own updated comment) -- available_margin/margin_used
+            # are still part of a real summary payload but no longer read by the scheduler itself.
             return {
                 "available_margin": 100_000,
                 "margin_used": 2_500,
-                "closing_balance": 0,
+                "closing_balance": 102_500,
                 "funds_unavailable_note": None,
             }
 
@@ -88,6 +91,10 @@ async def test_successful_snapshot_records_info_notification(
     monkeypatch.setattr(account_snapshot_scheduler, "EncryptedTokenStore", FakeTokenStore)
     monkeypatch.setattr(account_snapshot_scheduler, "MainScreenService", FakeService)
     monkeypatch.setattr(account_snapshot_scheduler, "UpstoxService", lambda settings: object())
+    # Not the subject of this test -- MainScreenService itself is faked above, so the real
+    # JournalStore this would otherwise construct (touching disk at settings.journal_database_path)
+    # is never actually used for anything.
+    monkeypatch.setattr(account_snapshot_scheduler, "JournalStore", lambda settings: object())
     monkeypatch.setattr(account_snapshot_scheduler, "datetime", FixedDateTime)
     monkeypatch.setattr(account_snapshot_scheduler, "_POLL_SECONDS", 0.0)
     notifications = FakeNotifications()
@@ -107,6 +114,69 @@ async def test_successful_snapshot_records_info_notification(
         "title": "Account snapshot captured",
         "message": "Estimated balance of 102500.00 recorded for 2026-07-25.",
     }]
+
+
+@pytest.mark.anyio
+async def test_persists_closing_balance_not_raw_broker_margin_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: the scheduler used to prefer available_margin + margin_used (a raw
+    broker snapshot with no today's-P&L/charges awareness) whenever that sum was positive, only
+    falling back to closing_balance when it wasn't -- backwards from "the balance after today".
+    available_margin + margin_used is deliberately much larger than closing_balance here so the
+    old behavior (asserting 250_000) would fail this test."""
+    saved = []
+
+    class FakeStore:
+        def __init__(self, settings: Settings) -> None:
+            pass
+
+        def load(self):
+            return saved[-1] if saved else None
+
+        def save(self, snapshot):
+            saved.append(snapshot)
+
+    class FakeTokenStore:
+        def __init__(self, settings: Settings) -> None:
+            pass
+
+        def has_token(self) -> bool:
+            return True
+
+        def load_access_token(self) -> str:
+            return "token"
+
+    class FakeService:
+        def __init__(self, upstox, *args, **kwargs) -> None:
+            pass
+
+        async def summary(self, access_token: str):
+            return {
+                "available_margin": 200_000,
+                "margin_used": 50_000,
+                "closing_balance": 102_254.5,
+                "funds_unavailable_note": None,
+            }
+
+    monkeypatch.setattr(account_snapshot_scheduler, "AccountSnapshotStore", FakeStore)
+    monkeypatch.setattr(account_snapshot_scheduler, "EncryptedTokenStore", FakeTokenStore)
+    monkeypatch.setattr(account_snapshot_scheduler, "MainScreenService", FakeService)
+    monkeypatch.setattr(account_snapshot_scheduler, "UpstoxService", lambda settings: object())
+    monkeypatch.setattr(account_snapshot_scheduler, "JournalStore", lambda settings: object())
+    monkeypatch.setattr(account_snapshot_scheduler, "datetime", FixedDateTime)
+    monkeypatch.setattr(account_snapshot_scheduler, "_POLL_SECONDS", 0.0)
+    notifications = FakeNotifications()
+
+    task = asyncio.create_task(run_account_snapshot_scheduler(_settings(tmp_path), notifications))
+    for _ in range(6):
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(saved) == 1
+    assert saved[0].estimated_balance == 102_254.5
 
 
 @pytest.mark.anyio
@@ -131,7 +201,7 @@ async def test_repeated_snapshot_failure_notifies_only_once_per_day(
             return "token"
 
     class FailingService:
-        def __init__(self, upstox) -> None:
+        def __init__(self, upstox, *args, **kwargs) -> None:
             pass
 
         async def summary(self, access_token: str):
@@ -141,6 +211,7 @@ async def test_repeated_snapshot_failure_notifies_only_once_per_day(
     monkeypatch.setattr(account_snapshot_scheduler, "EncryptedTokenStore", FakeTokenStore)
     monkeypatch.setattr(account_snapshot_scheduler, "MainScreenService", FailingService)
     monkeypatch.setattr(account_snapshot_scheduler, "UpstoxService", lambda settings: object())
+    monkeypatch.setattr(account_snapshot_scheduler, "JournalStore", lambda settings: object())
     monkeypatch.setattr(account_snapshot_scheduler, "datetime", FixedDateTime)
     monkeypatch.setattr(account_snapshot_scheduler, "_POLL_SECONDS", 0.0)
     notifications = FakeNotifications()

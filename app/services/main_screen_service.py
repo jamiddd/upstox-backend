@@ -10,6 +10,7 @@ from typing import Any, Optional
 from app.core.exceptions import UpstoxApiError
 from app.services.upstox_service import UpstoxService
 from app.services.account_snapshot_store import AccountSnapshotStore
+from app.services.journal_store import JournalStore
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +35,14 @@ class MainScreenService:
         self,
         upstox_service: UpstoxService,
         account_snapshot_store: AccountSnapshotStore | None = None,
+        journal_store: JournalStore | None = None,
     ) -> None:
         self.upstox = upstox_service
         self.account_snapshot_store = account_snapshot_store
+        # Optional -- only needed for closing_balance's charges deduction (see summary()'s own
+        # doc comment). None in any test/call site that doesn't care about that precision, same
+        # optionality posture as account_snapshot_store above.
+        self.journal_store = journal_store
 
     async def bootstrap(
         self,
@@ -292,9 +298,16 @@ class MainScreenService:
         - `payin_amount` is `cash.added_today + cash.withdrawn_today` (the latter already
           negative) -- net cash movement today, which is exactly the "I added money mid-day"
           case `available_margin`/`closing_balance` should (and now do) reflect.
-        - `closing_balance` = `opening_balance + payin_amount + profit_loss` -- extended from the
-          original `opening_balance + profit_loss` to also account for today's net cash
-          movement, since a mid-day deposit is real money added to the account, not "profit".
+        - `closing_balance` = `opening_balance + payin_amount + profit_loss - todays_charges` --
+          extended from the original `opening_balance + profit_loss` to also account for today's
+          net cash movement (a mid-day deposit is real money added to the account, not "profit")
+          and, separately, today's actual brokerage/STT/exchange charges. `profit_loss` is
+          Upstox's own raw per-position `pnl` figure (see `_positions_pnl`), which is price-based
+          only -- it never has charges netted out of it -- so without this deduction
+          `closing_balance` overstated the account's true worth by the day's total charges.
+          `todays_charges` comes from `JournalStore.total_charges_for_date` (0.0 when no
+          `journal_store` was supplied to this service, e.g. in tests that don't care about this
+          precision).
 
         FIX: Upstox's funds-and-margin endpoint has a documented daily maintenance window
         (~12:00 AM - 5:30 AM IST, Upstox error code UDAPI100072, "The Funds service is
@@ -329,11 +342,16 @@ class MainScreenService:
         available_margin = _available_margin_total(funds_payload)
         margin_used = _margin_used_total(funds_payload)
         payin_amount = _net_cash_added_today(funds_payload)
+        todays_charges = (
+            self.journal_store.total_charges_for_date(datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat())
+            if self.journal_store is not None
+            else 0.0
+        )
 
         summary: dict[str, Any] = {
             "opening_balance": opening_balance,
             "profit_loss": profit_loss,
-            "closing_balance": opening_balance + payin_amount + profit_loss,
+            "closing_balance": opening_balance + payin_amount + profit_loss - todays_charges,
             "available_margin": available_margin,
             "margin_used": margin_used,
             "payin_amount": payin_amount,
