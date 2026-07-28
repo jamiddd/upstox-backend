@@ -1,7 +1,18 @@
 from __future__ import annotations
 
+import logging
+
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_market_feed_client import UpstoxMarketFeedClient
+
+logger = logging.getLogger(__name__)
+
+# Upstox's own full_d30 cap (see UpstoxMarketFeedClient._on_message's own doc comment) -- nothing
+# here enforces it, this is purely so a union approaching it shows up in logs *before* Upstox
+# starts rejecting subscriptions, rather than only being diagnosable after the fact from a
+# rejection frame.
+_FULL_MODE_CAP = 50
+_FULL_MODE_CAP_WARN_THRESHOLD = 40
 
 
 class FeedSubscriptionManager:
@@ -80,6 +91,20 @@ class FeedSubscriptionManager:
         full_union: set[str] = set(self._tracked_store.load())
         for keys in self._client_full.values():
             full_union |= keys
+
+        if len(full_union) >= _FULL_MODE_CAP:
+            logger.warning(
+                "Full-mode subscription union at %d instruments, at/over Upstox's %d cap -- "
+                "expect rejected subscriptions",
+                len(full_union),
+                _FULL_MODE_CAP,
+            )
+        elif len(full_union) >= _FULL_MODE_CAP_WARN_THRESHOLD:
+            logger.info(
+                "Full-mode subscription union at %d/%d instruments, approaching Upstox's cap",
+                len(full_union),
+                _FULL_MODE_CAP,
+            )
 
         ltpc_union: set[str] = set(self._position_instruments)
         for keys in self._client_ltpc.values():

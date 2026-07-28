@@ -113,6 +113,12 @@ _MARKET_FEED_INSTRUMENT_STALE_AFTER_SECONDS = 45.0
 # reconnect, which is routine and self-healing.
 _FEED_FAILURE_NOTIFY_THRESHOLD = 3
 
+# How many consecutive _run_market_feed_staleness_check passes (each _MARKET_FEED_STALENESS_CHECK_
+# INTERVAL_SECONDS apart) a single instrument can need re-subscribing before it's worth a
+# notification -- see _MarketFeedStalenessNotifier's own doc comment for why a resend alone can't
+# fix a persistent Upstox-side rejection.
+_MARKET_FEED_STALENESS_NOTIFY_THRESHOLD = 3
+
 
 @dataclass
 class _MaxLossWatcherDeps:
@@ -173,6 +179,64 @@ class _FeedStateNotifier:
                 message=message,
             )
         )
+
+
+class _MarketFeedStalenessNotifier:
+    """Escalates a single instrument's market-feed staleness to a real notification once
+    `resend_stale_subscriptions` has had to nudge it repeatedly, rather than only ever logging a
+    warning on every `_run_market_feed_staleness_check` pass forever. A resend is a plain duplicate
+    `sub` -- it fixes a transient drop, but if Upstox keeps rejecting the same key (missing
+    full_d30/Plus entitlement, exceeding the 50-instrument cap, generic rate limiting -- see
+    `UpstoxMarketFeedClient._on_message`'s own doc comment), nudging it does nothing and today
+    that was invisible outside the log file. Fires at most one notification per ongoing incident
+    per key (not one per check), and a single "recovered" notification once a previously-notified
+    key stops needing nudging.
+    """
+
+    def __init__(self, *, notification_service: NotificationService) -> None:
+        self._notification_service = notification_service
+        self._consecutive_nudges: dict[str, int] = {}
+        self._notified: set[str] = set()
+
+    def handle(self, nudged: list[str]) -> None:
+        nudged_set = set(nudged)
+
+        for key in nudged_set:
+            count = self._consecutive_nudges.get(key, 0) + 1
+            self._consecutive_nudges[key] = count
+            if count >= _MARKET_FEED_STALENESS_NOTIFY_THRESHOLD and key not in self._notified:
+                self._notified.add(key)
+                asyncio.create_task(
+                    self._notification_service.record(
+                        category="feed",
+                        severity="warning",
+                        title="Market feed subscription stalled",
+                        message=(
+                            f"{key} has needed re-subscribing {count} times in a row and still "
+                            "isn't receiving ticks -- likely a persistent Upstox-side rejection "
+                            "(entitlement, the 50-instrument full-mode cap, or rate limiting)."
+                        ),
+                    )
+                )
+
+        # Anything that stopped needing a nudge this round: reset its streak, and notify recovery
+        # only if it had actually escalated (a key that was nudged once or twice but never crossed
+        # the threshold was never reported stalled in the first place, so no recovery to report).
+        for key in list(self._consecutive_nudges):
+            if key in nudged_set:
+                continue
+            self._consecutive_nudges.pop(key, None)
+            was_notified = key in self._notified
+            self._notified.discard(key)
+            if was_notified:
+                asyncio.create_task(
+                    self._notification_service.record(
+                        category="feed",
+                        severity="info",
+                        title="Market feed subscription recovered",
+                        message=f"{key} is receiving ticks again.",
+                    )
+                )
 
 
 @contextlib.asynccontextmanager
@@ -355,8 +419,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     position_tracker_refresh_task = asyncio.create_task(
         _run_position_tracker_refresh(position_tracker, subscription_manager),
     )
+    market_feed_staleness_notifier = _MarketFeedStalenessNotifier(
+        notification_service=notification_service,
+    )
     market_feed_staleness_task = asyncio.create_task(
-        _run_market_feed_staleness_check(market_feed_client),
+        _run_market_feed_staleness_check(market_feed_client, market_feed_staleness_notifier),
     )
     max_loss_watcher_task = asyncio.create_task(
         run_max_loss_watcher_fallback(
@@ -447,12 +514,17 @@ async def _run_position_tracker_refresh(
             logger.warning("Position P&L tracker refresh failed unexpectedly", exc_info=True)
 
 
-async def _run_market_feed_staleness_check(market_feed_client: UpstoxMarketFeedClient) -> None:
+async def _run_market_feed_staleness_check(
+    market_feed_client: UpstoxMarketFeedClient,
+    staleness_notifier: _MarketFeedStalenessNotifier,
+) -> None:
     """Best-effort self-heal for a silently-dropped single-instrument subscription -- see
     UpstoxMarketFeedClient.resend_stale_subscriptions' own doc comment for why Upstox's sub/unsub
     acks/rejections are otherwise invisible to this backend, and why the connection-wide
     stale-frame watchdog in UpstoxWebSocketClient can't catch this on its own. Market-hours gated
-    since there's nothing subscribed worth nudging outside trading hours."""
+    since there's nothing subscribed worth nudging outside trading hours. staleness_notifier gets
+    the nudged list on every pass (even when empty) so it can also detect recovery -- see its own
+    doc comment for why a resend alone can't fix a persistent rejection."""
     while True:
         await asyncio.sleep(_MARKET_FEED_STALENESS_CHECK_INTERVAL_SECONDS)
         try:
@@ -463,6 +535,7 @@ async def _run_market_feed_staleness_check(market_feed_client: UpstoxMarketFeedC
             )
             if nudged:
                 logger.warning("Market feed self-heal: resubscribed stale instrument(s) %s", nudged)
+            staleness_notifier.handle(nudged)
         except asyncio.CancelledError:
             raise
         except Exception:
