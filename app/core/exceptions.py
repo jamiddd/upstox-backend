@@ -19,6 +19,13 @@ class UpstoxAuthRequiredError(RuntimeError):
     """Raised when an Upstox-backed route is called before login."""
 
 
+class UpstoxAutoLoginError(RuntimeError):
+    """Raised when the automated TOTP-based Upstox login sequence fails at any step (see
+    UpstoxTotpLoginService) -- distinct from UpstoxApiError since these come from Upstox's
+    undocumented internal login endpoints, not the public REST API, and carry a step-specific
+    message so a broken step is diagnosable from the notification/log alone."""
+
+
 class UpstoxApiError(RuntimeError):
     """Wrap an error response returned by Upstox."""
 

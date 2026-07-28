@@ -23,8 +23,18 @@ class Settings:
     mobile_api_key: str
     token_encryption_key: str
     token_store_path: Path
+    # Credentials for the fully-automated TOTP login (UpstoxTotpLoginService/auto_login_scheduler)
+    # -- Upstox mobile number, the TOTP secret (base32, from the same authenticator-app setup a
+    # human would use), and the account's transaction PIN. Deliberately NOT the account's actual
+    # login password -- the reverse-engineered login sequence never uses it (mobile number + TOTP
+    # + PIN is sufficient). Plain env vars, same as every other secret in this file (upstox_api_secret,
+    # mobile_api_key) -- only the resulting access token gets Fernet-encrypted at rest.
+    upstox_totp_username: str = ""
+    upstox_totp_secret: str = ""
+    upstox_totp_pin: str = ""
     tracked_instruments_path: Path = Path("/data/tracked_instruments.json")
     account_snapshot_path: Path = Path("/data/account_snapshot.json")
+    auto_login_state_path: Path = Path("/data/auto_login_state.json")
     oi_database_path: Path = Path("/data/oi_snapshots.sqlite3")
     notification_database_path: Path = Path("/data/notifications.sqlite3")
     journal_database_path: Path = Path("/data/journal.sqlite3")
@@ -60,6 +70,9 @@ class Settings:
             upstox_redirect_url=os.getenv("UPSTOX_REDIRECT_URL", ""),
             upstox_environment=os.getenv("UPSTOX_ENVIRONMENT", "sandbox"),
             mobile_api_key=os.getenv("MOBILE_API_KEY", ""),
+            upstox_totp_username=os.getenv("UPSTOX_TOTP_USERNAME", ""),
+            upstox_totp_secret=os.getenv("UPSTOX_TOTP_SECRET", ""),
+            upstox_totp_pin=os.getenv("UPSTOX_TOTP_PIN", ""),
             token_encryption_key=os.getenv("TOKEN_ENCRYPTION_KEY", ""),
             token_store_path=Path(os.getenv("TOKEN_STORE_PATH", "/data/upstox_token.enc")),
             tracked_instruments_path=Path(
@@ -67,6 +80,9 @@ class Settings:
             ),
             account_snapshot_path=Path(
                 os.getenv("ACCOUNT_SNAPSHOT_PATH", "/data/account_snapshot.json"),
+            ),
+            auto_login_state_path=Path(
+                os.getenv("AUTO_LOGIN_STATE_PATH", "/data/auto_login_state.json"),
             ),
             oi_database_path=Path(
                 os.getenv("OI_DATABASE_PATH", "/data/oi_snapshots.sqlite3"),
@@ -138,6 +154,23 @@ class Settings:
         parsed = urlparse(self.upstox_redirect_url)
         if not parsed.scheme or not parsed.netloc:
             raise AppConfigError("UPSTOX_REDIRECT_URL must be an absolute URL")
+
+    def require_upstox_totp_login(self) -> None:
+        """Ensure the automated TOTP login's own credentials are configured, on top of the
+        regular OAuth app credentials (UpstoxTotpLoginService also needs client_id/client_secret/
+        redirect_url, checked separately by require_upstox_oauth)."""
+        self.require_upstox_oauth()
+        missing = [
+            name
+            for name, value in (
+                ("UPSTOX_TOTP_USERNAME", self.upstox_totp_username),
+                ("UPSTOX_TOTP_SECRET", self.upstox_totp_secret),
+                ("UPSTOX_TOTP_PIN", self.upstox_totp_pin),
+            )
+            if not value
+        ]
+        if missing:
+            raise AppConfigError(f"Missing Upstox TOTP login settings: {', '.join(missing)}")
 
 
 def get_settings() -> Settings:

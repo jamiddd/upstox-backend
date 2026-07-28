@@ -17,6 +17,8 @@ from app.api.stream_routes import router as stream_router
 from app.core.config import get_settings
 from app.core.market_hours import is_market_open
 from app.services.auth_watchdog import run_auth_watchdog
+from app.services.auth_watchdog import run_auth_watchdog                                                      
+from app.services.auto_login_scheduler import run_auto_login_scheduler    
 from app.services.candle_cache_store import CandleCacheStore
 from app.services.fcm_service import FcmService
 from app.services.feed_subscription_manager import FeedSubscriptionManager
@@ -403,6 +405,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.journal_reconciler = journal_reconciler
     journal_reconciler_task = asyncio.create_task(run_journal_reconciler(journal_reconciler))
     asyncio.create_task(journal_reconciler.reconcile())
+
+
+    app.state.journal_reconciler = journal_reconciler                                                         
+    journal_reconciler_task = asyncio.create_task(run_journal_reconciler(journal_reconciler))                 
+    asyncio.create_task(journal_reconciler.reconcile())                                                       
+    auto_login_task = asyncio.create_task(                                                                    
+        run_auto_login_scheduler(settings, notification_service, journal_reconciler),                         
+    ) 
+
 
     # Best-effort initial fill so open positions are already subscribed (and their live P&L
     # already known) before the very first tick, not just from whenever the periodic refresh

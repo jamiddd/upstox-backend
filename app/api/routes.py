@@ -33,6 +33,7 @@ from app.core.exceptions import (
     TrackedInstrumentsStoreError,
     UpstoxApiError,
     UpstoxAuthRequiredError,
+    UpstoxAutoLoginError,
 )
 from app.services.token_store import EncryptedTokenStore
 from app.services.candle_service import CandleService
@@ -64,6 +65,7 @@ from app.services.smart_order_service import SmartOrderService
 from app.services.underlying_signals_service import UnderlyingSignalsService
 from app.services.trade_context_service import TradeContextService, extract_order_ids
 from app.services.usd_inr_service import UsdInrService
+from app.services.upstox_totp_login import UpstoxTotpLoginService
 
 public_router = APIRouter()
 protected_router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
@@ -271,6 +273,35 @@ def logout(
     except TokenStoreError as exc:
         raise _http_error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
     return {"status": "logged_out"}
+
+@protected_router.post("/auth/auto-login")                                                                    
+async def auto_login(                                                                                         
+      request: Request,                                                                                         
+      service: UpstoxService = Depends(get_upstox_service),                                                     
+      token_store: EncryptedTokenStore = Depends(get_token_store),                                              
+      settings: Settings = Depends(get_settings),                                                               
+) -> dict[str, str]:                                                                                          
+      """Manually trigger the same automated TOTP login `auto_login_scheduler` runs every morning               
+      (see `UpstoxTotpLoginService`) -- for testing, and as an on-demand "retry now" affordance                 
+      without waiting for the next scheduled attempt. Does not count against                                    
+      `auto_login_scheduler`'s own daily attempt cap, since a human explicitly asking for this                  
+      isn't the "something is silently broken and retrying" case that cap guards against.                       
+      """                                                                                                       
+      login_service = UpstoxTotpLoginService(settings, service)                                                 
+      try:                                                                                                      
+          token_payload = await login_service.login()                                                           
+      except (AppConfigError, UpstoxAutoLoginError) as exc:                                                     
+          raise _http_error(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc                                     
+      except UpstoxApiError as exc:                                                                             
+          raise _upstox_http_error(exc) from exc                                                                
+      try:                                                                                                      
+          token_store.save(token_payload)                                                                       
+      except TokenStoreError as exc:                                                                            
+          raise _http_error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc                           
+      reconciler = getattr(request.app.state, "journal_reconciler", None)                                       
+      if reconciler is not None:                                                                                
+          asyncio.create_task(reconciler.reconcile())                                                           
+      return {"status": "authenticated"} 
 
 
 @protected_router.get("/market/ltp")

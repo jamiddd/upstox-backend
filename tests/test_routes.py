@@ -977,6 +977,67 @@ def test_auth_callback_does_not_require_mobile_api_key() -> None:
     assert token_store.saved == {"access_token": "token-for-redirect-code"}
 
 
+def test_auto_login_saves_token_and_triggers_reconcile(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """POST /auth/auto-login runs UpstoxTotpLoginService.login() and saves the result exactly
+    like the manual OAuth callback does, plus triggers a journal reconcile the same way."""
+    from app.api import routes
+
+    class FakeLoginService:
+        def __init__(self, settings: Any, service: Any) -> None:
+            pass
+
+        async def login(self) -> dict[str, Any]:
+            return {"access_token": "totp-token"}
+
+    monkeypatch.setattr(routes, "UpstoxTotpLoginService", FakeLoginService)
+
+    reconciler_calls = 0
+
+    class FakeReconciler:
+        async def reconcile(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            nonlocal reconciler_calls
+            reconciler_calls += 1
+            return {"status": "current"}
+
+    token_store = FakeTokenStore(token=None)
+    client = _client(token_store)
+    app.state.journal_reconciler = FakeReconciler()
+    try:
+        response = client.post("/api/auth/auto-login", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+        del app.state.journal_reconciler
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "authenticated"}
+    assert token_store.saved == {"access_token": "totp-token"}
+    assert reconciler_calls == 1
+
+
+def test_auto_login_returns_502_when_login_service_fails(monkeypatch: "pytest.MonkeyPatch") -> None:
+    from app.api import routes
+    from app.core.exceptions import UpstoxAutoLoginError
+
+    class FailingLoginService:
+        def __init__(self, settings: Any, service: Any) -> None:
+            pass
+
+        async def login(self) -> dict[str, Any]:
+            raise UpstoxAutoLoginError("otp/generate: Upstox rejected the request")
+
+    monkeypatch.setattr(routes, "UpstoxTotpLoginService", FailingLoginService)
+
+    token_store = FakeTokenStore(token=None)
+    client = _client(token_store)
+    try:
+        response = client.post("/api/auth/auto-login", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 502
+    assert token_store.saved is None
+
+
 def test_market_route_uses_stored_token() -> None:
     """Proxy market data calls through the Upstox service."""
     client = _client(FakeTokenStore(token="stored-token"))
