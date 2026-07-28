@@ -132,7 +132,7 @@ async def test_replace_full_subscription_diffs_and_preserves_common_instruments(
         {
             "guid": fake.sent[0]["guid"],
             "method": "sub",
-            "data": {"mode": "full_d30", "instrumentKeys": ["A", "B"]},
+            "data": {"mode": "full", "instrumentKeys": ["A", "B"]},
         },
     ]
 
@@ -142,7 +142,7 @@ async def test_replace_full_subscription_diffs_and_preserves_common_instruments(
     # "A" removed, "B" retained without re-sending, "C" added -- exactly one unsub and one sub.
     methods = [(m["method"], m["data"]["mode"], m["data"]["instrumentKeys"]) for m in fake.sent]
     assert ("unsub", "ltpc", ["A"]) in methods
-    assert ("sub", "full_d30", ["C"]) in methods
+    assert ("sub", "full", ["C"]) in methods
 
 
 @pytest.mark.anyio
@@ -244,7 +244,7 @@ async def test_resend_stale_subscriptions_nudges_stale_full_mode_instrument(
         {
             "guid": fake.sent[0]["guid"],
             "method": "sub",
-            "data": {"mode": "full_d30", "instrumentKeys": ["A"]},
+            "data": {"mode": "full", "instrumentKeys": ["A"]},
         },
     ]
 
@@ -288,7 +288,7 @@ async def test_resend_stale_subscriptions_nudges_once_via_full_when_desired_in_b
 
     assert nudged == ["A"]
     assert len(fake.sent) == 1
-    assert fake.sent[0]["data"]["mode"] == "full_d30"
+    assert fake.sent[0]["data"]["mode"] == "full"
 
 
 @pytest.mark.anyio
@@ -316,7 +316,7 @@ async def test_resend_stale_subscriptions_escalates_to_unsub_after_repeated_stal
     assert nudged == ["A"]
     assert [sent["method"] for sent in fake.sent] == ["unsub", "sub"]
     assert fake.sent[0]["data"] == {"mode": "ltpc", "instrumentKeys": ["A"]}
-    assert fake.sent[1]["data"] == {"mode": "full_d30", "instrumentKeys": ["A"]}
+    assert fake.sent[1]["data"] == {"mode": "full", "instrumentKeys": ["A"]}
 
 
 @pytest.mark.anyio

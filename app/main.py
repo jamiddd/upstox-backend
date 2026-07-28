@@ -185,8 +185,8 @@ class _MarketFeedStalenessNotifier:
     """Escalates a single instrument's market-feed staleness to a real notification once
     `resend_stale_subscriptions` has had to nudge it repeatedly, rather than only ever logging a
     warning on every `_run_market_feed_staleness_check` pass forever. A resend is a plain duplicate
-    `sub` -- it fixes a transient drop, but if Upstox keeps rejecting the same key (missing
-    full_d30/Plus entitlement, exceeding the 50-instrument cap, generic rate limiting -- see
+    `sub` -- it fixes a transient drop, but if Upstox keeps rejecting the same key (exceeding the
+    full-mode combined-category cap, generic rate limiting -- see
     `UpstoxMarketFeedClient._on_message`'s own doc comment), nudging it does nothing and today
     that was invisible outside the log file. Fires at most one notification per ongoing incident
     per key (not one per check), and a single "recovered" notification once a previously-notified

@@ -15,12 +15,12 @@ from app.services.upstox_ws_client import UpstoxAuthPendingError, UpstoxWebSocke
 
 logger = logging.getLogger(__name__)
 
-# The backend requests Upstox's deepest live mode for full subscriptions. `full_d30` includes the
-# same LTPC/OHLC/Greeks payload as `full`, plus up to 30 market levels; Upstox gates this mode
-# behind Plus entitlement. Android still decides whether to render only the top five or let the
-# user expand the complete received book.
+# The backend requests Upstox's normal (non-Plus) full-depth mode: LTPC/OHLC/Greeks payload plus
+# the top 5 market levels. Upstox Plus's `full_d30` tier (up to 30 levels, 50-instrument-key cap)
+# was tried and reverted -- see git history -- may revisit later once its subscription-leak
+# hardening is done.
 MODE_LTPC = "ltpc"
-MODE_FULL = "full_d30"
+MODE_FULL = "full"
 
 # How many consecutive resend_stale_subscriptions passes the same key can need a plain re-`sub`
 # before escalating to an explicit unsub-then-sub -- see that function's own doc comment.
@@ -218,12 +218,12 @@ class UpstoxMarketFeedClient:
 
     def _on_message(self, message: Any) -> None:
         # Upstox always sends market data as binary protobuf frames -- a non-binary frame is the
-        # shape Upstox uses for sub/unsub acks and rejections (e.g. missing Plus entitlement for
-        # full_d30, exceeding its 50-instrument cap, a bad instrument key, rate limiting). This
-        # backend has no other visibility into those, so logging the actual content (not just that
-        # one arrived) is what makes a real rejection diagnosable instead of silently invisible --
-        # see resend_stale_subscriptions for the self-heal this is paired with. Truncated
-        # defensively in case Upstox ever sends something unexpectedly large as a text frame.
+        # shape Upstox uses for sub/unsub acks and rejections (e.g. exceeding the full-mode
+        # combined-category cap, a bad instrument key, rate limiting). This backend has no other
+        # visibility into those, so logging the actual content (not just that one arrived) is what
+        # makes a real rejection diagnosable instead of silently invisible -- see
+        # resend_stale_subscriptions for the self-heal this is paired with. Truncated defensively
+        # in case Upstox ever sends something unexpectedly large as a text frame.
         if not isinstance(message, (bytes, bytearray)):
             logger.warning("Unexpected non-binary frame from market feed: %r", str(message)[:2000])
             return

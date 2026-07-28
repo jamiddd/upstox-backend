@@ -7,12 +7,13 @@ from app.services.upstox_market_feed_client import UpstoxMarketFeedClient
 
 logger = logging.getLogger(__name__)
 
-# Upstox's own full_d30 cap (see UpstoxMarketFeedClient._on_message's own doc comment) -- nothing
-# here enforces it, this is purely so a union approaching it shows up in logs *before* Upstox
-# starts rejecting subscriptions, rather than only being diagnosable after the fact from a
-# rejection frame.
-_FULL_MODE_CAP = 50
-_FULL_MODE_CAP_WARN_THRESHOLD = 40
+# Upstox's Normal-tier *combined* subscription limit (this connection subscribes both `full` and
+# `ltpc` concurrently, so the combined 1500 cap applies, not the 2000 individual-category limit --
+# see the Normal Connection and Subscription Limits table). Nothing here enforces it, this is
+# purely so a union approaching it shows up in logs *before* Upstox starts rejecting
+# subscriptions, rather than only being diagnosable after the fact from a rejection frame.
+_FULL_MODE_CAP = 1500
+_FULL_MODE_CAP_WARN_THRESHOLD = 1200
 
 
 class FeedSubscriptionManager:
