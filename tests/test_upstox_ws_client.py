@@ -156,5 +156,19 @@ async def test_send_json_is_a_noop_when_not_connected() -> None:
     await client.send_json({"method": "sub"})  # must not raise
 
 
+@pytest.mark.anyio
+async def test_force_reconnect_closes_current_socket_and_advances_generation() -> None:
+    connection = _FakeConnection()
+    client = UpstoxWebSocketClient(name="test", authorize=lambda: _ok(""), on_message=lambda _msg: None)
+    client._connection = connection
+    generation = client._generation
+
+    await client.force_reconnect("D30 stalled")
+
+    assert connection.closed is True
+    assert client._connection is None
+    assert client._generation == generation + 1
+
+
 async def _ok(url: str) -> str:
     return url

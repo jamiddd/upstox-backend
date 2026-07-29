@@ -22,6 +22,7 @@ MODE_FULL_D30 = "full_d30"
 # How many consecutive resend_stale_subscriptions passes the same key can need a plain re-`sub`
 # before escalating to an explicit unsub-then-sub -- see that function's own doc comment.
 _ESCALATE_AFTER_NUDGES = 2
+_D30_RECONNECT_COOLDOWN_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,12 @@ class UpstoxMarketFeedClient:
         # sometimes needed). Cleared the moment a key stops being stale, so an old streak never
         # carries into some later, unrelated incident.
         self._consecutive_nudge_count: dict[str, int] = {}
+        # D30 can stop as a whole while normal Full/LTPC frames keep this shared upstream socket
+        # healthy. A downstream Android reconnect cannot repair that; this state drives an
+        # explicit D30 reset followed by an upstream reconnect if the mode stays silent.
+        self._d30_recovery_stage = 0
+        self._d30_recovery_started_monotonic: Optional[float] = None
+        self._last_d30_upstream_reconnect_monotonic: Optional[float] = None
         self._client = UpstoxWebSocketClient(
             name="UpstoxMarketFeedClient",
             authorize=self._authorize,
@@ -227,6 +234,9 @@ class UpstoxMarketFeedClient:
             return
         for tick in decode_feed_response(bytes(message)):
             self._last_seen_monotonic[tick.instrument_key] = time.monotonic()
+            if tick.instrument_key in self._desired_full_d30:
+                self._d30_recovery_stage = 0
+                self._d30_recovery_started_monotonic = None
             self._on_tick(tick)
 
     def _desired_subscription_messages(self) -> list[dict[str, Any]]:
@@ -366,7 +376,64 @@ class UpstoxMarketFeedClient:
             self._consecutive_nudge_count.pop(key, None)
         await self._client.send_json(_control_message("unsub", MODE_LTPC, list(instrument_keys)))
 
-    async def resend_stale_subscriptions(self, stale_after_seconds: float) -> list[str]:
+    async def recover_stale_d30_cohort(
+        self,
+        *,
+        stale_after_seconds: float,
+        reconnect_after_seconds: float,
+    ) -> Optional[str]:
+        """Recovers a D30-wide stall without confusing it with an idle individual contract.
+
+        The incident signature is every desired D30 key having the same stale age while at least
+        one normal Full/LTPC key remains fresh. First perform an explicit D30 unsub+resub. If no
+        D30 tick follows within ``reconnect_after_seconds``, replace the actual upstream Upstox
+        socket. Returns the action name for logging, or ``None`` when no cohort stall exists.
+        """
+        if not self._client.connected or not self._desired_full_d30:
+            self._d30_recovery_stage = 0
+            self._d30_recovery_started_monotonic = None
+            return None
+
+        now = time.monotonic()
+        all_d30_stale = all(
+            now - self._last_seen_monotonic.get(key, now) >= stale_after_seconds
+            for key in self._desired_full_d30
+        )
+        other_desired = self._desired_full + self._desired_ltpc
+        other_mode_fresh = any(
+            now - self._last_seen_monotonic.get(key, 0.0) < stale_after_seconds
+            for key in other_desired
+        )
+        if not all_d30_stale or not other_mode_fresh:
+            return None
+
+        if self._d30_recovery_stage == 0:
+            keys = list(self._desired_full_d30)
+            await self._client.send_json(_control_message("unsub", MODE_LTPC, keys))
+            await self._client.send_json(_control_message("sub", MODE_FULL_D30, keys))
+            self._d30_recovery_stage = 1
+            self._d30_recovery_started_monotonic = now
+            return "d30_unsub_resub"
+
+        started = self._d30_recovery_started_monotonic or now
+        if self._d30_recovery_stage == 1 and now - started >= reconnect_after_seconds:
+            last_reconnect = self._last_d30_upstream_reconnect_monotonic
+            if (
+                last_reconnect is None
+                or now - last_reconnect >= _D30_RECONNECT_COOLDOWN_SECONDS
+            ):
+                self._d30_recovery_stage = 2
+                self._last_d30_upstream_reconnect_monotonic = now
+                await self._client.force_reconnect("all Full D30 instruments stale")
+                return "upstream_reconnect"
+        return "awaiting_upstream_reconnect"
+
+    async def resend_stale_subscriptions(
+        self,
+        stale_after_seconds: float,
+        *,
+        include_d30: bool = True,
+    ) -> list[str]:
         """Best-effort self-heal for a silently-dropped single-instrument subscription.
 
         Upstox's sub/unsub control messages are fire-and-forget (see `_on_message`'s own doc
@@ -401,7 +468,9 @@ class UpstoxMarketFeedClient:
             return now - self._last_seen_monotonic.get(key, now) >= stale_after_seconds
 
         stale_full = [key for key in self._desired_full if is_stale(key)]
-        stale_d30 = [key for key in self._desired_full_d30 if is_stale(key)]
+        stale_d30 = [
+            key for key in self._desired_full_d30 if include_d30 and is_stale(key)
+        ]
         stale_full_set = set(stale_full) | set(stale_d30)
         # Full wins per key if somehow stale in both -- same precedence
         # FeedSubscriptionManager._apply already uses when a key is desired in both modes.
@@ -472,6 +541,7 @@ class UpstoxMarketFeedClient:
             "desired_full": list(self._desired_full),
             "desired_full_count": len(self._desired_full),
             "desired_ltpc": list(self._desired_ltpc),
+            "d30_recovery_stage": self._d30_recovery_stage,
             "seconds_since_last_tick": dict(
                 sorted(seconds_since_last_tick.items(), key=lambda item: -item[1]),
             ),

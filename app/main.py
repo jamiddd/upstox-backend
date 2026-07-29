@@ -109,6 +109,10 @@ _MARKET_FEED_STALENESS_CHECK_INTERVAL_SECONDS = 20.0
 # this one detects "no frames for one specific subscribed instrument while everything else on the
 # connection is fine" -- do not conflate the two or import one into the other.
 _MARKET_FEED_INSTRUMENT_STALE_AFTER_SECONDS = 45.0
+# D30 normally emits depth changes continuously. If the entire D30 cohort is silent while normal
+# Full/LTPC modes remain fresh, reset that mode first and then the actual upstream socket.
+_D30_COHORT_STALE_AFTER_SECONDS = 30.0
+_D30_COHORT_RECONNECT_AFTER_SECONDS = 15.0
 
 # How many consecutive disconnected/auth-pending transitions one of the backend's own Upstox feed
 # connections can have before it's worth a notification -- avoids notifying on a single transient
@@ -541,8 +545,19 @@ async def _run_market_feed_staleness_check(
         try:
             if not is_market_open():
                 continue
+            d30_action = await market_feed_client.recover_stale_d30_cohort(
+                stale_after_seconds=_D30_COHORT_STALE_AFTER_SECONDS,
+                reconnect_after_seconds=_D30_COHORT_RECONNECT_AFTER_SECONDS,
+            )
+            if d30_action == "d30_unsub_resub":
+                logger.warning("Market feed self-heal: resetting the complete Full D30 cohort")
+            elif d30_action == "upstream_reconnect":
+                logger.warning(
+                    "Market feed self-heal: Full D30 stayed stale; replaced upstream Upstox socket",
+                )
             nudged = await market_feed_client.resend_stale_subscriptions(
                 _MARKET_FEED_INSTRUMENT_STALE_AFTER_SECONDS,
+                include_d30=d30_action is None,
             )
             if nudged:
                 logger.warning("Market feed self-heal: resubscribed stale instrument(s) %s", nudged)

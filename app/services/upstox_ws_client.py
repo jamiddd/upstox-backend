@@ -127,6 +127,22 @@ class UpstoxWebSocketClient:
         except ConnectionClosed:
             pass
 
+    async def force_reconnect(self, reason: str) -> None:
+        """Closes the current upstream socket so the normal reconnect loop authorizes a fresh
+        connection and replays the complete desired subscription state.
+
+        Used for partial-mode stalls where other frames keep the connection-wide watchdog alive:
+        changing the generation alone would not interrupt an in-flight ``recv()``, so the socket
+        is explicitly closed as well.
+        """
+        self._generation += 1
+        connection = self._connection
+        self._connection = None
+        logger.warning("%s: forcing upstream reconnect (%s)", self._name, reason)
+        if connection is not None:
+            with contextlib.suppress(Exception):
+                await connection.close()
+
     async def _run(self) -> None:
         while not self._stopped:
             try:
