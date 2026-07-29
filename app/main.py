@@ -100,9 +100,9 @@ _SUBSCRIPTION_REFRESH_INTERVAL_SECONDS = 60.0
 # _run_position_tracker_refresh's own doc comment for what this interval actually catches.
 _POSITION_TRACKER_REFRESH_INTERVAL_SECONDS = 15.0
 
-# How often _run_market_feed_staleness_check wakes up to look for a silently-dropped single
-# instrument subscription.
-_MARKET_FEED_STALENESS_CHECK_INTERVAL_SECONDS = 20.0
+# D30 cohort recovery needs a prompt second observation after its explicit mode reset. Individual
+# instrument nudges remain protected by their own 45-second age threshold and timestamp reset.
+_MARKET_FEED_STALENESS_CHECK_INTERVAL_SECONDS = 10.0
 # Per-instrument threshold for UpstoxMarketFeedClient.resend_stale_subscriptions -- deliberately a
 # DIFFERENT, independent concern from UpstoxWebSocketClient's own connection-wide
 # _STALE_AFTER_SECONDS=30 watchdog. That one detects "no frames at all from the whole connection";
@@ -111,8 +111,8 @@ _MARKET_FEED_STALENESS_CHECK_INTERVAL_SECONDS = 20.0
 _MARKET_FEED_INSTRUMENT_STALE_AFTER_SECONDS = 45.0
 # D30 normally emits depth changes continuously. If the entire D30 cohort is silent while normal
 # Full/LTPC modes remain fresh, reset that mode first and then the actual upstream socket.
-_D30_COHORT_STALE_AFTER_SECONDS = 30.0
-_D30_COHORT_RECONNECT_AFTER_SECONDS = 15.0
+_D30_COHORT_STALE_AFTER_SECONDS = 20.0
+_D30_COHORT_RECONNECT_AFTER_SECONDS = 10.0
 
 # How many consecutive disconnected/auth-pending transitions one of the backend's own Upstox feed
 # connections can have before it's worth a notification -- avoids notifying on a single transient
