@@ -172,6 +172,30 @@ async def test_replace_full_subscription_is_noop_when_unchanged() -> None:
 
 
 @pytest.mark.anyio
+async def test_replace_subscriptions_applies_d30_full_ltpc_precedence_and_mode_transitions() -> None:
+    client, fake = _client()
+
+    await client.replace_subscriptions(
+        full_d30=["D30", "SHARED"],
+        full=["FULL", "SHARED"],
+        ltpc=["LTPC", "FULL", "D30"],
+    )
+
+    methods = [(m["method"], m["data"]["mode"], m["data"]["instrumentKeys"]) for m in fake.sent]
+    assert ("sub", "full_d30", ["D30", "SHARED"]) in methods
+    assert ("sub", "full", ["FULL"]) in methods
+    assert ("sub", "ltpc", ["LTPC"]) in methods
+
+    fake.sent.clear()
+    await client.replace_subscriptions(full_d30=[], full=["D30", "FULL"], ltpc=["SHARED", "LTPC"])
+
+    methods = [(m["method"], m["data"]["mode"], m["data"]["instrumentKeys"]) for m in fake.sent]
+    assert ("unsub", "ltpc", ["D30", "SHARED"]) in methods
+    assert ("sub", "full", ["D30"]) in methods
+    assert ("sub", "ltpc", ["SHARED"]) in methods
+
+
+@pytest.mark.anyio
 async def test_unsubscribe_removes_from_both_desired_sets() -> None:
     client, fake = _client()
     await client.replace_full_subscription(["A", "B"])

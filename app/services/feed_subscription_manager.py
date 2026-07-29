@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
@@ -14,6 +15,14 @@ logger = logging.getLogger(__name__)
 # subscriptions, rather than only being diagnosable after the fact from a rejection frame.
 _FULL_MODE_CAP = 1500
 _FULL_MODE_CAP_WARN_THRESHOLD = 1200
+# Keep operational headroom below Upstox Plus's hard 50-key Full D30 limit for transitions and
+# reconciliation. D30 is reserved exclusively for live client viewports; tracked instruments and
+# open positions remain on normal full/LTPC modes.
+_FULL_D30_APPLICATION_CAP = 45
+
+
+class D30SubscriptionLimitError(ValueError):
+    pass
 
 
 class FeedSubscriptionManager:
@@ -47,51 +56,70 @@ class FeedSubscriptionManager:
     ) -> None:
         self._market_feed_client = market_feed_client
         self._tracked_store = tracked_store
+        self._client_d30: dict[str, set[str]] = {}
         self._client_full: dict[str, set[str]] = {}
         self._client_ltpc: dict[str, set[str]] = {}
         self._position_instruments: set[str] = set()
-        # UpstoxMarketFeedClient.subscribe_ltpc() -- like Android's own subscribeLtpc() -- always
-        # resends "sub" for its whole argument without unsubscribing anything dropped from it.
-        # Android's own callers (updatePositionSubscription/updateWatchlistSubscription) handle
-        # that by explicitly unsubscribing the previous full set before subscribing the new one
-        # whenever it changes; mirrored here rather than reinventing a finer-grained diff for a
-        # set this cheap to fully replace.
-        self._previous_ltpc_union: set[str] = set()
+        self._apply_lock = asyncio.Lock()
 
     async def refresh_tracked_instruments(self) -> None:
         """Re-applies the union after the tracked-instruments list itself changes (or on a
         periodic tick, same cadence as the background poller already re-checks it)."""
-        await self._apply()
+        async with self._apply_lock:
+            await self._apply()
 
     async def set_client_subscription(
         self,
         session_id: str,
         *,
+        d30: list[str] | None = None,
         full: list[str],
         ltpc: list[str],
     ) -> None:
         """Replaces one connected app session's own wanted instrument sets."""
-        self._client_full[session_id] = set(full)
-        self._client_ltpc[session_id] = set(ltpc)
-        await self._apply()
+        async with self._apply_lock:
+            proposed_d30 = set(d30 or [])
+            projected_d30_union = proposed_d30.copy()
+            for other_session_id, keys in self._client_d30.items():
+                if other_session_id != session_id:
+                    projected_d30_union |= keys
+            if len(projected_d30_union) > _FULL_D30_APPLICATION_CAP:
+                raise D30SubscriptionLimitError(
+                    f"Full D30 request would use {len(projected_d30_union)}/"
+                    f"{_FULL_D30_APPLICATION_CAP} application slots",
+                )
+
+            self._client_d30[session_id] = proposed_d30
+            # D30 wins over normal full within a session.
+            self._client_full[session_id] = set(full) - proposed_d30
+            self._client_ltpc[session_id] = set(ltpc)
+            await self._apply()
 
     async def remove_client(self, session_id: str) -> None:
         """Drops a disconnected session's contribution to the union entirely."""
-        self._client_full.pop(session_id, None)
-        self._client_ltpc.pop(session_id, None)
-        await self._apply()
+        async with self._apply_lock:
+            self._client_d30.pop(session_id, None)
+            self._client_full.pop(session_id, None)
+            self._client_ltpc.pop(session_id, None)
+            await self._apply()
 
     async def set_open_position_instruments(self, instrument_keys: set[str]) -> None:
         """Replaces the always-needed open-position set -- called by whatever refreshes
         `PositionPnlTracker` (see that class's own doc comment) each time it does, so a newly
         opened position starts getting live ticks immediately and a closed one stops."""
-        self._position_instruments = instrument_keys
-        await self._apply()
+        async with self._apply_lock:
+            self._position_instruments = instrument_keys
+            await self._apply()
 
     async def _apply(self) -> None:
+        d30_union: set[str] = set()
+        for keys in self._client_d30.values():
+            d30_union |= keys
+
         full_union: set[str] = set(self._tracked_store.load())
         for keys in self._client_full.values():
             full_union |= keys
+        full_union -= d30_union
 
         if len(full_union) >= _FULL_MODE_CAP:
             logger.warning(
@@ -110,15 +138,13 @@ class FeedSubscriptionManager:
         ltpc_union: set[str] = set(self._position_instruments)
         for keys in self._client_ltpc.values():
             ltpc_union |= keys
-        ltpc_union -= full_union
+        ltpc_union -= full_union | d30_union
 
-        await self._market_feed_client.replace_full_subscription(sorted(full_union))
-        if ltpc_union != self._previous_ltpc_union:
-            if self._previous_ltpc_union:
-                await self._market_feed_client.unsubscribe(sorted(self._previous_ltpc_union))
-            if ltpc_union:
-                await self._market_feed_client.subscribe_ltpc(sorted(ltpc_union))
-            self._previous_ltpc_union = ltpc_union
+        await self._market_feed_client.replace_subscriptions(
+            full_d30=sorted(d30_union),
+            full=sorted(full_union),
+            ltpc=sorted(ltpc_union),
+        )
 
     def debug_snapshot(self) -> dict[str, object]:
         """Read-only view of what's feeding the full/ltpc union -- see `api/routes.py`'s
@@ -127,6 +153,10 @@ class FeedSubscriptionManager:
         return {
             "tracked_instruments": sorted(self._tracked_store.load()),
             "position_instruments": sorted(self._position_instruments),
+            "d30_application_cap": _FULL_D30_APPLICATION_CAP,
+            "client_d30_by_session": {
+                session_id: sorted(keys) for session_id, keys in self._client_d30.items()
+            },
             "client_full_by_session": {
                 session_id: sorted(keys) for session_id, keys in self._client_full.items()
             },

@@ -10,7 +10,7 @@ from starlette.websockets import WebSocketState
 
 from app.core.config import Settings
 from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequiredError
-from app.services.feed_subscription_manager import FeedSubscriptionManager
+from app.services.feed_subscription_manager import D30SubscriptionLimitError, FeedSubscriptionManager
 from app.services.notification_service import NotificationService
 from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.signal_snapshot_store import SignalSnapshotStore
@@ -38,9 +38,20 @@ class ClientSession:
     WebSocket's own object id, which is unique for the life of one connection; this app has no
     concept of a persistent user identity beyond the single shared Upstox token."""
 
-    def __init__(self, session_id: str, websocket: WebSocket) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        websocket: WebSocket,
+        *,
+        client_instance_id: str,
+        generation: int,
+    ) -> None:
         self.session_id = session_id
         self.websocket = websocket
+        self.client_instance_id = client_instance_id
+        self.generation = generation
+        self.last_subscription_revision = -1
+        self.d30_keys: set[str] = set()
         self.full_keys: set[str] = set()
         self.ltpc_keys: set[str] = set()
         self.underlying_key: Optional[str] = None
@@ -84,21 +95,65 @@ class StreamConnectionManager:
         self._subscription_manager = subscription_manager
         self._notification_service = notification_service
         self._sessions: dict[str, ClientSession] = {}
+        self._session_by_client_instance: dict[str, ClientSession] = {}
 
-    async def connect(self, websocket: WebSocket) -> ClientSession:
+    async def connect(
+        self,
+        websocket: WebSocket,
+        *,
+        client_instance_id: str | None = None,
+        generation: int = 0,
+    ) -> ClientSession:
         """Registers a new session. The caller (`stream_routes.stream_endpoint`) is responsible
         for having already called `websocket.accept()` -- the handshake must be accepted before
         the API-key check so an auth rejection can deliver a real WebSocket close code instead of
         a bare HTTP 403 (see that route's own doc comment)."""
-        session = ClientSession(str(id(websocket)), websocket)
+        instance_id = client_instance_id or str(id(websocket))
+        existing = self._session_by_client_instance.get(instance_id)
+        if existing is not None:
+            if generation <= existing.generation:
+                await websocket.close(code=4409, reason="Superseded connection generation")
+                raise ValueError("Connection generation is not newer than the active session")
+            try:
+                await existing.websocket.close(code=4001, reason="Replaced by newer connection")
+            except Exception:
+                logger.info(
+                    "Old stream socket was already unreachable while replacing session %s",
+                    existing.session_id,
+                    exc_info=True,
+                )
+            finally:
+                await self.disconnect(existing)
+
+        session = ClientSession(
+            str(id(websocket)),
+            websocket,
+            client_instance_id=instance_id,
+            generation=generation,
+        )
         self._sessions[session.session_id] = session
+        self._session_by_client_instance[instance_id] = session
+        logger.info(
+            "Stream session connected: session=%s client=%s generation=%d active_sessions=%d",
+            session.session_id, instance_id, generation, len(self._sessions),
+        )
         return session
 
     async def disconnect(self, session: ClientSession) -> None:
-        self._sessions.pop(session.session_id, None)
+        if self._sessions.pop(session.session_id, None) is None:
+            return
+        if self._session_by_client_instance.get(session.client_instance_id) is session:
+            self._session_by_client_instance.pop(session.client_instance_id, None)
         if session.signals_task is not None:
             session.signals_task.cancel()
         await self._subscription_manager.remove_client(session.session_id)
+        logger.info(
+            "Stream session removed: session=%s client=%s generation=%d active_sessions=%d",
+            session.session_id,
+            session.client_instance_id,
+            session.generation,
+            len(self._sessions),
+        )
 
     async def handle_message(self, session: ClientSession, raw: str) -> None:
         try:
@@ -118,11 +173,29 @@ class StreamConnectionManager:
         # compatible with a future client sending a message type this backend doesn't know yet.
 
     async def _handle_subscribe(self, session: ClientSession, message: dict[str, Any]) -> None:
+        revision = message.get("revision", session.last_subscription_revision + 1)
+        if not isinstance(revision, int) or revision <= session.last_subscription_revision:
+            return
+        d30 = [key for key in message.get("d30", []) if isinstance(key, str)]
         full = [key for key in message.get("full", []) if isinstance(key, str)]
         ltpc = [key for key in message.get("ltpc", []) if isinstance(key, str)]
+        try:
+            await self._subscription_manager.set_client_subscription(
+                session.session_id,
+                d30=d30,
+                full=full,
+                ltpc=ltpc,
+            )
+        except D30SubscriptionLimitError as exc:
+            await session.send({
+                "type": "subscription_error",
+                "data": {"revision": revision, "reason": str(exc)},
+            })
+            return
+        session.last_subscription_revision = revision
+        session.d30_keys = set(d30)
         session.full_keys = set(full)
         session.ltpc_keys = set(ltpc)
-        await self._subscription_manager.set_client_subscription(session.session_id, full=full, ltpc=ltpc)
 
     def _handle_set_underlying(self, session: ClientSession, message: dict[str, Any]) -> None:
         underlying_key = message.get("underlying_key")
@@ -206,7 +279,11 @@ class StreamConnectionManager:
 
     async def dispatch_tick(self, tick: FeedTick) -> None:
         for session in list(self._sessions.values()):
-            if tick.instrument_key not in session.full_keys and tick.instrument_key not in session.ltpc_keys:
+            if (
+                tick.instrument_key not in session.d30_keys
+                and tick.instrument_key not in session.full_keys
+                and tick.instrument_key not in session.ltpc_keys
+            ):
                 continue
             candle = tick.one_minute_candle
             await session.send({
@@ -257,3 +334,20 @@ class StreamConnectionManager:
         # client-side over the full set, not by asking the backend to only push some of them.
         for session in list(self._sessions.values()):
             await session.send({"type": "notification", "data": notification})
+
+    def debug_snapshot(self) -> dict[str, object]:
+        return {
+            "active_session_count": len(self._sessions),
+            "sessions": [
+                {
+                    "session_id": session.session_id,
+                    "client_instance_id": session.client_instance_id,
+                    "generation": session.generation,
+                    "last_subscription_revision": session.last_subscription_revision,
+                    "d30_count": len(session.d30_keys),
+                    "full_count": len(session.full_keys),
+                    "ltpc_count": len(session.ltpc_keys),
+                }
+                for session in self._sessions.values()
+            ],
+        }

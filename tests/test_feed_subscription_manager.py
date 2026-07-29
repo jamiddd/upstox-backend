@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.feed_subscription_manager import FeedSubscriptionManager
+from app.services.feed_subscription_manager import D30SubscriptionLimitError, FeedSubscriptionManager
 
 
 class _FakeTrackedStore:
@@ -16,8 +16,28 @@ class _FakeTrackedStore:
 class _FakeMarketFeedClient:
     def __init__(self) -> None:
         self.full_calls: list[list[str]] = []
+        self.d30_calls: list[list[str]] = []
         self.ltpc_subscribe_calls: list[list[str]] = []
         self.unsubscribe_calls: list[list[str]] = []
+        self._full: list[str] = []
+        self._d30: list[str] = []
+        self._ltpc: list[str] = []
+
+    async def replace_subscriptions(
+        self, *, full_d30: list[str], full: list[str], ltpc: list[str],
+    ) -> None:
+        if full_d30 != self._d30:
+            self.d30_calls.append(full_d30)
+            self._d30 = full_d30
+        if full != self._full:
+            self.full_calls.append(full)
+            self._full = full
+        if ltpc != self._ltpc:
+            if self._ltpc:
+                self.unsubscribe_calls.append(self._ltpc)
+            if ltpc:
+                self.ltpc_subscribe_calls.append(ltpc)
+            self._ltpc = ltpc
 
     async def replace_full_subscription(self, instrument_keys: list[str]) -> None:
         self.full_calls.append(instrument_keys)
@@ -182,3 +202,35 @@ async def test_unchanged_ltpc_set_does_not_resend() -> None:
 
     assert client.unsubscribe_calls == []
     assert client.ltpc_subscribe_calls == []
+
+
+@pytest.mark.anyio
+async def test_d30_is_reserved_for_client_keys_and_wins_over_other_modes() -> None:
+    client = _FakeMarketFeedClient()
+    manager = FeedSubscriptionManager(
+        market_feed_client=client, tracked_store=_FakeTrackedStore(["TRACKED", "D30"]),
+    )
+
+    await manager.set_client_subscription(
+        "session-1", d30=["D30"], full=["D30", "FULL"], ltpc=["D30", "FULL", "LTPC"],
+    )
+
+    assert client.d30_calls[-1] == ["D30"]
+    assert client.full_calls[-1] == sorted(["FULL", "TRACKED"])
+    assert client.ltpc_subscribe_calls[-1] == ["LTPC"]
+
+
+@pytest.mark.anyio
+async def test_d30_limit_rejects_replacement_atomically() -> None:
+    client = _FakeMarketFeedClient()
+    manager = FeedSubscriptionManager(market_feed_client=client, tracked_store=_FakeTrackedStore([]))
+    await manager.set_client_subscription(
+        "session-1", d30=[f"K{i}" for i in range(45)], full=[], ltpc=[],
+    )
+
+    with pytest.raises(D30SubscriptionLimitError):
+        await manager.set_client_subscription("session-2", d30=["EXTRA"], full=[], ltpc=[])
+
+    assert manager.debug_snapshot()["client_d30_by_session"] == {
+        "session-1": [f"K{i}" for i in sorted(range(45), key=lambda value: f"K{value}")],
+    }

@@ -33,6 +33,7 @@ class _FakeWebSocket:
     def __init__(self) -> None:
         self.application_state = WebSocketState.CONNECTED
         self.sent: list[dict[str, Any]] = []
+        self.closed: list[tuple[int, str]] = []
 
     async def accept(self) -> None:
         pass
@@ -40,14 +41,19 @@ class _FakeWebSocket:
     async def send_text(self, text: str) -> None:
         self.sent.append(json.loads(text))
 
+    async def close(self, code: int, reason: str) -> None:
+        self.closed.append((code, reason))
+
 
 class _FakeSubscriptionManager:
     def __init__(self) -> None:
-        self.set_calls: list[tuple[str, list[str], list[str]]] = []
+        self.set_calls: list[tuple[str, list[str], list[str], list[str]]] = []
         self.removed: list[str] = []
 
-    async def set_client_subscription(self, session_id: str, *, full: list[str], ltpc: list[str]) -> None:
-        self.set_calls.append((session_id, full, ltpc))
+    async def set_client_subscription(
+        self, session_id: str, *, d30: list[str], full: list[str], ltpc: list[str],
+    ) -> None:
+        self.set_calls.append((session_id, d30, full, ltpc))
 
     async def remove_client(self, session_id: str) -> None:
         self.removed.append(session_id)
@@ -71,12 +77,57 @@ async def test_subscribe_message_forwards_to_subscription_manager() -> None:
     session = await manager.connect(websocket)  # type: ignore[arg-type]
 
     await manager.handle_message(
-        session, json.dumps({"type": "subscribe", "full": ["A", "B"], "ltpc": ["C"]}),
+        session,
+        json.dumps({
+            "type": "subscribe",
+            "revision": 1,
+            "d30": ["D"],
+            "full": ["A", "B"],
+            "ltpc": ["C"],
+        }),
     )
 
-    assert fake_sub.set_calls == [(session.session_id, ["A", "B"], ["C"])]
+    assert fake_sub.set_calls == [(session.session_id, ["D"], ["A", "B"], ["C"])]
+    assert session.d30_keys == {"D"}
     assert session.full_keys == {"A", "B"}
     assert session.ltpc_keys == {"C"}
+
+
+@pytest.mark.anyio
+async def test_newer_generation_retires_older_session_for_same_client() -> None:
+    manager, fake_sub = _manager()
+    old_socket = _FakeWebSocket()
+    new_socket = _FakeWebSocket()
+    old_session = await manager.connect(  # type: ignore[arg-type]
+        old_socket, client_instance_id="phone", generation=1,
+    )
+
+    new_session = await manager.connect(  # type: ignore[arg-type]
+        new_socket, client_instance_id="phone", generation=2,
+    )
+
+    assert old_session.session_id in fake_sub.removed
+    assert old_socket.closed == [(4001, "Replaced by newer connection")]
+    assert new_session.client_instance_id == "phone"
+    assert new_session.generation == 2
+@pytest.mark.anyio
+async def test_stale_subscription_revision_is_ignored() -> None:
+    manager, fake_sub = _manager()
+    session = await manager.connect(_FakeWebSocket())  # type: ignore[arg-type]
+
+    await manager.handle_message(
+        session, json.dumps({"type": "subscribe", "revision": 2, "d30": ["NEW"]}),
+    )
+    await manager.handle_message(
+        session, json.dumps({"type": "subscribe", "revision": 1, "d30": ["OLD"]}),
+    )
+
+    assert fake_sub.set_calls == [(session.session_id, ["NEW"], [], [])]
+
+    snapshot = manager.debug_snapshot()
+    assert snapshot["active_session_count"] == 1
+    assert snapshot["sessions"][0]["client_instance_id"] == session.client_instance_id
+    assert snapshot["sessions"][0]["d30_count"] == 1
 
 
 @pytest.mark.anyio

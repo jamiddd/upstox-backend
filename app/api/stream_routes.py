@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 
@@ -13,6 +14,7 @@ router = APIRouter()
 
 # WebSocket close codes in the 4000-4999 range are reserved for application use (RFC 6455).
 _UNAUTHORIZED_CLOSE_CODE = 4401
+_CLIENT_IDLE_TIMEOUT_SECONDS = 45.0
 
 
 @router.websocket("/stream")
@@ -45,12 +47,27 @@ async def stream_endpoint(
         return
 
     manager = websocket.app.state.stream_manager
-    session = await manager.connect(websocket)
+    client_instance_id = websocket.headers.get("x-client-instance-id")
+    try:
+        generation = int(websocket.headers.get("x-connection-generation", "0"))
+    except ValueError:
+        generation = 0
+    try:
+        session = await manager.connect(
+            websocket,
+            client_instance_id=client_instance_id,
+            generation=generation,
+        )
+    except ValueError:
+        return
     try:
         while True:
-            raw = await websocket.receive_text()
+            raw = await asyncio.wait_for(
+                websocket.receive_text(),
+                timeout=_CLIENT_IDLE_TIMEOUT_SECONDS,
+            )
             await manager.handle_message(session, raw)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, asyncio.TimeoutError):
         pass
     finally:
         await manager.disconnect(session)
