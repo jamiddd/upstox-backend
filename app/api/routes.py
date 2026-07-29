@@ -179,7 +179,8 @@ def get_feed_status(request: Request) -> dict[str, Any]:
     full-mode union is to Upstox's 50-key cap) without needing server/log file access."""
     market_feed_client = getattr(request.app.state, "market_feed_client", None)
     subscription_manager = getattr(request.app.state, "feed_subscription_manager", None)
-    if market_feed_client is None or subscription_manager is None:
+    stream_manager = getattr(request.app.state, "stream_manager", None)
+    if market_feed_client is None or subscription_manager is None or stream_manager is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"status": "error", "message": "Market feed not initialized yet"},
@@ -187,6 +188,7 @@ def get_feed_status(request: Request) -> dict[str, Any]:
     return {
         "market_feed": market_feed_client.debug_snapshot(),
         "subscription_manager": subscription_manager.debug_snapshot(),
+        "stream_manager": stream_manager.debug_snapshot(),
     }
 
 

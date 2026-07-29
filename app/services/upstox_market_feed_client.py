@@ -15,16 +15,14 @@ from app.services.upstox_ws_client import UpstoxAuthPendingError, UpstoxWebSocke
 
 logger = logging.getLogger(__name__)
 
-# The backend requests Upstox's normal (non-Plus) full-depth mode: LTPC/OHLC/Greeks payload plus
-# the top 5 market levels. Upstox Plus's `full_d30` tier (up to 30 levels, 50-instrument-key cap)
-# was tried and reverted -- see git history -- may revisit later once its subscription-leak
-# hardening is done.
 MODE_LTPC = "ltpc"
 MODE_FULL = "full"
+MODE_FULL_D30 = "full_d30"
 
 # How many consecutive resend_stale_subscriptions passes the same key can need a plain re-`sub`
 # before escalating to an explicit unsub-then-sub -- see that function's own doc comment.
 _ESCALATE_AFTER_NUDGES = 2
+_D30_RECONNECT_COOLDOWN_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -172,6 +170,7 @@ class UpstoxMarketFeedClient:
         self._upstox = upstox
         self._token_store = token_store
         self._on_tick = on_tick
+        self._desired_full_d30: list[str] = []
         self._desired_full: list[str] = []
         self._desired_ltpc: list[str] = []
         # Per-instrument last-tick-seen time (monotonic -- immune to wall-clock/NTP jumps, same
@@ -187,6 +186,12 @@ class UpstoxMarketFeedClient:
         # sometimes needed). Cleared the moment a key stops being stale, so an old streak never
         # carries into some later, unrelated incident.
         self._consecutive_nudge_count: dict[str, int] = {}
+        # D30 can stop as a whole while normal Full/LTPC frames keep this shared upstream socket
+        # healthy. A downstream Android reconnect cannot repair that; this state drives an
+        # explicit D30 reset followed by an upstream reconnect if the mode stays silent.
+        self._d30_recovery_stage = 0
+        self._d30_recovery_started_monotonic: Optional[float] = None
+        self._last_d30_upstream_reconnect_monotonic: Optional[float] = None
         self._client = UpstoxWebSocketClient(
             name="UpstoxMarketFeedClient",
             authorize=self._authorize,
@@ -229,15 +234,80 @@ class UpstoxMarketFeedClient:
             return
         for tick in decode_feed_response(bytes(message)):
             self._last_seen_monotonic[tick.instrument_key] = time.monotonic()
+            if tick.instrument_key in self._desired_full_d30:
+                self._d30_recovery_stage = 0
+                self._d30_recovery_started_monotonic = None
             self._on_tick(tick)
 
     def _desired_subscription_messages(self) -> list[dict[str, Any]]:
         messages = []
+        if self._desired_full_d30:
+            messages.append(_control_message("sub", MODE_FULL_D30, self._desired_full_d30))
         if self._desired_full:
             messages.append(_control_message("sub", MODE_FULL, self._desired_full))
         if self._desired_ltpc:
             messages.append(_control_message("sub", MODE_LTPC, self._desired_ltpc))
         return messages
+
+    async def replace_subscriptions(
+        self,
+        *,
+        full_d30: list[str],
+        full: list[str],
+        ltpc: list[str],
+    ) -> None:
+        """Atomically replaces all three effective mode sets.
+
+        Full D30 wins over normal full, which wins over LTPC. Any key changing mode is explicitly
+        unsubscribed before it is subscribed in the new mode; this avoids relying on Upstox to
+        resolve overlapping mode requests consistently.
+        """
+        new_d30 = list(dict.fromkeys(full_d30))
+        d30_set = set(new_d30)
+        new_full = [key for key in dict.fromkeys(full) if key not in d30_set]
+        full_set = set(new_full)
+        new_ltpc = [
+            key for key in dict.fromkeys(ltpc)
+            if key not in d30_set and key not in full_set
+        ]
+        old_modes = {
+            **{key: MODE_LTPC for key in self._desired_ltpc},
+            **{key: MODE_FULL for key in self._desired_full},
+            **{key: MODE_FULL_D30 for key in self._desired_full_d30},
+        }
+        new_modes = {
+            **{key: MODE_LTPC for key in new_ltpc},
+            **{key: MODE_FULL for key in new_full},
+            **{key: MODE_FULL_D30 for key in new_d30},
+        }
+        if old_modes == new_modes:
+            return
+
+        changed_or_removed = sorted(
+            key for key, old_mode in old_modes.items() if new_modes.get(key) != old_mode
+        )
+        self._desired_full_d30 = new_d30
+        self._desired_full = new_full
+        self._desired_ltpc = new_ltpc
+
+        if changed_or_removed:
+            await self._client.send_json(_control_message("unsub", MODE_LTPC, changed_or_removed))
+        for mode, keys in (
+            (MODE_FULL_D30, [key for key in new_d30 if old_modes.get(key) != MODE_FULL_D30]),
+            (MODE_FULL, [key for key in new_full if old_modes.get(key) != MODE_FULL]),
+            (MODE_LTPC, [key for key in new_ltpc if old_modes.get(key) != MODE_LTPC]),
+        ):
+            if keys:
+                await self._client.send_json(_control_message("sub", mode, keys))
+
+        desired_keys = set(new_modes)
+        for key in list(self._last_seen_monotonic):
+            if key not in desired_keys:
+                self._last_seen_monotonic.pop(key, None)
+                self._consecutive_nudge_count.pop(key, None)
+        now = time.monotonic()
+        for key in desired_keys:
+            self._last_seen_monotonic.setdefault(key, now)
 
     async def replace_full_subscription(self, instrument_keys: list[str]) -> None:
         """Replaces the full-mode watch set without interrupting instruments common to the old
@@ -277,6 +347,13 @@ class UpstoxMarketFeedClient:
             for key in added:
                 self._last_seen_monotonic.setdefault(key, now)
 
+    async def replace_full_d30_subscription(self, instrument_keys: list[str]) -> None:
+        await self.replace_subscriptions(
+            full_d30=instrument_keys,
+            full=self._desired_full,
+            ltpc=self._desired_ltpc,
+        )
+
     async def subscribe_ltpc(self, instrument_keys: list[str]) -> None:
         if not instrument_keys:
             return
@@ -289,6 +366,7 @@ class UpstoxMarketFeedClient:
 
     async def unsubscribe(self, instrument_keys: list[str]) -> None:
         to_remove = set(instrument_keys)
+        self._desired_full_d30 = [key for key in self._desired_full_d30 if key not in to_remove]
         self._desired_full = [key for key in self._desired_full if key not in to_remove]
         self._desired_ltpc = [key for key in self._desired_ltpc if key not in to_remove]
         # Stop tracking staleness for anything no longer desired at all -- keeps these dicts from
@@ -298,7 +376,64 @@ class UpstoxMarketFeedClient:
             self._consecutive_nudge_count.pop(key, None)
         await self._client.send_json(_control_message("unsub", MODE_LTPC, list(instrument_keys)))
 
-    async def resend_stale_subscriptions(self, stale_after_seconds: float) -> list[str]:
+    async def recover_stale_d30_cohort(
+        self,
+        *,
+        stale_after_seconds: float,
+        reconnect_after_seconds: float,
+    ) -> Optional[str]:
+        """Recovers a D30-wide stall without confusing it with an idle individual contract.
+
+        The incident signature is every desired D30 key having the same stale age while at least
+        one normal Full/LTPC key remains fresh. First perform an explicit D30 unsub+resub. If no
+        D30 tick follows within ``reconnect_after_seconds``, replace the actual upstream Upstox
+        socket. Returns the action name for logging, or ``None`` when no cohort stall exists.
+        """
+        if not self._client.connected or not self._desired_full_d30:
+            self._d30_recovery_stage = 0
+            self._d30_recovery_started_monotonic = None
+            return None
+
+        now = time.monotonic()
+        all_d30_stale = all(
+            now - self._last_seen_monotonic.get(key, now) >= stale_after_seconds
+            for key in self._desired_full_d30
+        )
+        other_desired = self._desired_full + self._desired_ltpc
+        other_mode_fresh = any(
+            now - self._last_seen_monotonic.get(key, 0.0) < stale_after_seconds
+            for key in other_desired
+        )
+        if not all_d30_stale or not other_mode_fresh:
+            return None
+
+        if self._d30_recovery_stage == 0:
+            keys = list(self._desired_full_d30)
+            await self._client.send_json(_control_message("unsub", MODE_LTPC, keys))
+            await self._client.send_json(_control_message("sub", MODE_FULL_D30, keys))
+            self._d30_recovery_stage = 1
+            self._d30_recovery_started_monotonic = now
+            return "d30_unsub_resub"
+
+        started = self._d30_recovery_started_monotonic or now
+        if self._d30_recovery_stage == 1 and now - started >= reconnect_after_seconds:
+            last_reconnect = self._last_d30_upstream_reconnect_monotonic
+            if (
+                last_reconnect is None
+                or now - last_reconnect >= _D30_RECONNECT_COOLDOWN_SECONDS
+            ):
+                self._d30_recovery_stage = 2
+                self._last_d30_upstream_reconnect_monotonic = now
+                await self._client.force_reconnect("all Full D30 instruments stale")
+                return "upstream_reconnect"
+        return "awaiting_upstream_reconnect"
+
+    async def resend_stale_subscriptions(
+        self,
+        stale_after_seconds: float,
+        *,
+        include_d30: bool = True,
+    ) -> list[str]:
         """Best-effort self-heal for a silently-dropped single-instrument subscription.
 
         Upstox's sub/unsub control messages are fire-and-forget (see `_on_message`'s own doc
@@ -333,13 +468,16 @@ class UpstoxMarketFeedClient:
             return now - self._last_seen_monotonic.get(key, now) >= stale_after_seconds
 
         stale_full = [key for key in self._desired_full if is_stale(key)]
-        stale_full_set = set(stale_full)
+        stale_d30 = [
+            key for key in self._desired_full_d30 if include_d30 and is_stale(key)
+        ]
+        stale_full_set = set(stale_full) | set(stale_d30)
         # Full wins per key if somehow stale in both -- same precedence
         # FeedSubscriptionManager._apply already uses when a key is desired in both modes.
         stale_ltpc = [
             key for key in self._desired_ltpc if key not in stale_full_set and is_stale(key)
         ]
-        nudged = stale_full + stale_ltpc
+        nudged = stale_d30 + stale_full + stale_ltpc
         nudged_set = set(nudged)
 
         # A key that's recovered (no longer stale) shouldn't carry its escalation streak into
@@ -353,25 +491,31 @@ class UpstoxMarketFeedClient:
             if self._consecutive_nudge_count.get(key, 0) >= _ESCALATE_AFTER_NUDGES
         }
         escalate_full = [key for key in stale_full if key in escalate_set]
+        escalate_d30 = [key for key in stale_d30 if key in escalate_set]
         escalate_ltpc = [key for key in stale_ltpc if key in escalate_set]
         plain_full = [key for key in stale_full if key not in escalate_set]
+        plain_d30 = [key for key in stale_d30 if key not in escalate_set]
         plain_ltpc = [key for key in stale_ltpc if key not in escalate_set]
 
-        if escalate_full or escalate_ltpc:
+        if escalate_d30 or escalate_full or escalate_ltpc:
             logger.warning(
                 "Market feed self-heal: escalating to unsub+resub for %s (still stale after a "
                 "plain resend)",
-                escalate_full + escalate_ltpc,
+                escalate_d30 + escalate_full + escalate_ltpc,
             )
             await self._client.send_json(
-                _control_message("unsub", MODE_LTPC, escalate_full + escalate_ltpc),
+                _control_message("unsub", MODE_LTPC, escalate_d30 + escalate_full + escalate_ltpc),
             )
+            if escalate_d30:
+                await self._client.send_json(_control_message("sub", MODE_FULL_D30, escalate_d30))
             if escalate_full:
                 await self._client.send_json(_control_message("sub", MODE_FULL, escalate_full))
             if escalate_ltpc:
                 await self._client.send_json(_control_message("sub", MODE_LTPC, escalate_ltpc))
         if plain_full:
             await self._client.send_json(_control_message("sub", MODE_FULL, plain_full))
+        if plain_d30:
+            await self._client.send_json(_control_message("sub", MODE_FULL_D30, plain_d30))
         if plain_ltpc:
             await self._client.send_json(_control_message("sub", MODE_LTPC, plain_ltpc))
 
@@ -392,9 +536,12 @@ class UpstoxMarketFeedClient:
         }
         return {
             "connected": self.connected,
+            "desired_full_d30": list(self._desired_full_d30),
+            "desired_full_d30_count": len(self._desired_full_d30),
             "desired_full": list(self._desired_full),
             "desired_full_count": len(self._desired_full),
             "desired_ltpc": list(self._desired_ltpc),
+            "d30_recovery_stage": self._d30_recovery_stage,
             "seconds_since_last_tick": dict(
                 sorted(seconds_since_last_tick.items(), key=lambda item: -item[1]),
             ),

@@ -25,7 +25,7 @@ def _settings() -> Settings:
 
 
 class _FakeSubscriptionManager:
-    async def set_client_subscription(self, session_id, *, full, ltpc) -> None:
+    async def set_client_subscription(self, session_id, *, d30, full, ltpc) -> None:
         pass
 
     async def remove_client(self, session_id) -> None:
@@ -42,7 +42,7 @@ class _FakeStreamManager:
         self.received: list[str] = []
         self.disconnected = False
 
-    async def connect(self, websocket):
+    async def connect(self, websocket, **kwargs):
         # The route already calls websocket.accept() before reaching here (see stream_routes.py).
         return websocket
 

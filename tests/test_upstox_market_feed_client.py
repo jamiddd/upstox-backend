@@ -35,9 +35,13 @@ class _FakeUnderlyingClient:
     def __init__(self) -> None:
         self.sent: list[dict[str, object]] = []
         self.connected = True
+        self.reconnect_reasons: list[str] = []
 
     async def send_json(self, payload: dict[str, object]) -> None:
         self.sent.append(payload)
+
+    async def force_reconnect(self, reason: str) -> None:
+        self.reconnect_reasons.append(reason)
 
 
 def _client() -> tuple[UpstoxMarketFeedClient, _FakeUnderlyingClient]:
@@ -172,6 +176,30 @@ async def test_replace_full_subscription_is_noop_when_unchanged() -> None:
 
 
 @pytest.mark.anyio
+async def test_replace_subscriptions_applies_d30_full_ltpc_precedence_and_mode_transitions() -> None:
+    client, fake = _client()
+
+    await client.replace_subscriptions(
+        full_d30=["D30", "SHARED"],
+        full=["FULL", "SHARED"],
+        ltpc=["LTPC", "FULL", "D30"],
+    )
+
+    methods = [(m["method"], m["data"]["mode"], m["data"]["instrumentKeys"]) for m in fake.sent]
+    assert ("sub", "full_d30", ["D30", "SHARED"]) in methods
+    assert ("sub", "full", ["FULL"]) in methods
+    assert ("sub", "ltpc", ["LTPC"]) in methods
+
+    fake.sent.clear()
+    await client.replace_subscriptions(full_d30=[], full=["D30", "FULL"], ltpc=["SHARED", "LTPC"])
+
+    methods = [(m["method"], m["data"]["mode"], m["data"]["instrumentKeys"]) for m in fake.sent]
+    assert ("unsub", "ltpc", ["D30", "SHARED"]) in methods
+    assert ("sub", "full", ["D30"]) in methods
+    assert ("sub", "ltpc", ["SHARED"]) in methods
+
+
+@pytest.mark.anyio
 async def test_unsubscribe_removes_from_both_desired_sets() -> None:
     client, fake = _client()
     await client.replace_full_subscription(["A", "B"])
@@ -205,6 +233,57 @@ async def test_resend_stale_subscriptions_does_not_nudge_freshly_subscribed_inst
 
     assert nudged == []
     assert fake.sent == []
+
+
+@pytest.mark.anyio
+async def test_d30_cohort_stall_resubscribes_then_reconnects_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.replace_subscriptions(full_d30=["D1", "D2"], full=["FULL"], ltpc=[])
+    fake.sent.clear()
+
+    clock.advance(31.0)
+    client._last_seen_monotonic["FULL"] = clock()
+    action = await client.recover_stale_d30_cohort(
+        stale_after_seconds=30.0, reconnect_after_seconds=15.0,
+    )
+
+    assert action == "d30_unsub_resub"
+    methods = [(m["method"], m["data"]["mode"], m["data"]["instrumentKeys"]) for m in fake.sent]
+    assert ("unsub", "ltpc", ["D1", "D2"]) in methods
+    assert ("sub", "full_d30", ["D1", "D2"]) in methods
+
+    clock.advance(16.0)
+    client._last_seen_monotonic["FULL"] = clock()
+    action = await client.recover_stale_d30_cohort(
+        stale_after_seconds=30.0, reconnect_after_seconds=15.0,
+    )
+
+    assert action == "upstream_reconnect"
+    assert fake.reconnect_reasons == ["all Full D30 instruments stale"]
+
+
+@pytest.mark.anyio
+async def test_d30_cohort_recovery_does_not_trigger_when_all_modes_are_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(market_feed_client_module.time, "monotonic", clock)
+    client, fake = _client()
+    await client.replace_subscriptions(full_d30=["D1"], full=["FULL"], ltpc=[])
+    fake.sent.clear()
+    clock.advance(31.0)
+
+    action = await client.recover_stale_d30_cohort(
+        stale_after_seconds=30.0, reconnect_after_seconds=15.0,
+    )
+
+    assert action is None
+    assert fake.sent == []
+    assert fake.reconnect_reasons == []
 
 
 @pytest.mark.anyio
