@@ -138,6 +138,20 @@ class MaxLossSettingsRequest(BaseModel):
     amount: float = Field(ge=0)
 
 
+class MarginRequest(BaseModel):
+    """Body for `POST /charges/margin` -- unlike /charges/brokerage (plain query params, since
+    it's a GET), the upstream Margin Calculator API takes a JSON body natively (a batch of up to
+    20 instruments), so this mirrors that shape for the single instrument this app ever prices
+    at once instead of forcing it through query params.
+    """
+
+    instrument_key: str = Field(min_length=1)
+    quantity: int = Field(gt=0)
+    product: Literal["I", "D", "MTF"] = "I"
+    transaction_type: Literal["BUY", "SELL"]
+    price: float = Field(default=0, ge=0)
+
+
 class ModifyOrderRequest(BaseModel):
     """Fields accepted by the Upstox V3 modify-order endpoint."""
 
@@ -394,6 +408,29 @@ async def get_brokerage(
             product=product,
             transaction_type=transaction_type,
             price=price,
+        )
+    except UpstoxApiError as exc:
+        raise _upstox_http_error(exc) from exc
+
+
+@protected_router.post("/charges/margin")
+async def get_margin(
+    request: MarginRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> dict[str, Any]:
+    """Return Upstox's actual required margin for one proposed order -- the real fund block for
+    a SELL (short options), unlike /charges/brokerage's statutory-charges-only figure.
+    """
+    access_token = _load_access_token(token_store)
+    try:
+        return await service.get_margin(
+            access_token,
+            instrument_key=request.instrument_key,
+            quantity=request.quantity,
+            product=request.product,
+            transaction_type=request.transaction_type,
+            price=request.price,
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc

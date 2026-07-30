@@ -100,6 +100,48 @@ class UpstoxService:
             },
         )
 
+    async def get_margin(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        quantity: int,
+        product: str,
+        transaction_type: str,
+        price: float = 0,
+    ) -> dict[str, Any]:
+        """Calculate Upstox's actual required margin for one proposed order via the v2 Margin
+        Calculator API -- unlike get_brokerage (statutory charges only), this is the real fund
+        block Upstox would place, which is what a SELL (short options) order needs shown up
+        front since it isn't the simple "premium * quantity" arithmetic a BUY is. Only ever
+        sent a single instrument (the Margin Calculator API accepts up to 20 in one request,
+        batched under "instruments", but this app only ever prices one order at a time).
+        """
+        response = await self._request(
+            "POST",
+            f"{self.settings.upstox_api_base_url}/charges/margin",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+            json={
+                "instruments": [
+                    {
+                        "instrument_key": instrument_key,
+                        "quantity": quantity,
+                        "transaction_type": transaction_type,
+                        "product": product,
+                        "price": price,
+                    },
+                ],
+            },
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise UpstoxApiError("Unexpected Upstox margin response")
+        return payload
+
     async def get_profile(self, access_token: str) -> dict[str, Any]:
         """Fetch the logged-in Upstox user's profile -- the lightest authenticated call Upstox
         offers, used purely to confirm a stored token is still actually valid (Upstox access
