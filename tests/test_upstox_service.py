@@ -108,6 +108,45 @@ def test_get_brokerage_sends_order_parameters() -> None:
     assert payload == {"status": "success", "data": {"charges": {}}}
 
 
+def test_get_margin_posts_single_instrument_batch() -> None:
+    """Calculate actual required margin using Upstox's Margin Calculator endpoint."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v2/charges/margin"
+        body = json.loads((await request.aread()).decode("utf-8"))
+        assert body == {
+            "instruments": [
+                {
+                    "instrument_key": "NSE_FO|35271",
+                    "quantity": 75,
+                    "transaction_type": "SELL",
+                    "product": "I",
+                    "price": 125.5,
+                },
+            ],
+        }
+        assert request.headers["Authorization"] == "Bearer upstox-token"
+        return httpx.Response(
+            200,
+            json={"status": "success", "data": {"margins": [], "required_margin": 42.0, "final_margin": 42.0}},
+        )
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_margin(
+                "upstox-token",
+                instrument_key="NSE_FO|35271",
+                quantity=75,
+                product="I",
+                transaction_type="SELL",
+                price=125.5,
+            )
+
+    payload = anyio.run(run)
+    assert payload == {"status": "success", "data": {"margins": [], "required_margin": 42.0, "final_margin": 42.0}}
+
+
 def test_get_order_book_uses_current_day_order_endpoint() -> None:
     """Fetch today's order book."""
     async def handler(request: httpx.Request) -> httpx.Response:

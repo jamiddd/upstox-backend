@@ -189,6 +189,43 @@ class FakeUpstoxService:
             },
         }
 
+    async def get_margin(
+        self,
+        access_token: str,
+        *,
+        instrument_key: str,
+        quantity: int,
+        product: str,
+        transaction_type: str,
+        price: float = 0,
+    ) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": {
+                "margins": [
+                    {
+                        "span_margin": 3200.0,
+                        "exposure_margin": 1018.75,
+                        "equity_margin": 0.0,
+                        "net_buy_premium": 0.0,
+                        "additional_margin": 0.0,
+                        "total_margin": 4218.75,
+                        "tender_margin": 0.0,
+                    },
+                ],
+                "required_margin": 4218.75,
+                "final_margin": 4218.75,
+                "request": {
+                    "access_token": access_token,
+                    "instrument_key": instrument_key,
+                    "quantity": quantity,
+                    "product": product,
+                    "transaction_type": transaction_type,
+                    "price": price,
+                },
+            },
+        }
+
     async def get_holdings(self, access_token: str) -> dict[str, Any]:
         return {"status": "success", "data": [{"token": access_token}]}
 
@@ -2056,6 +2093,57 @@ def test_get_brokerage_rejects_invalid_order_parameters() -> None:
         response = client.get(
             "/api/charges/brokerage?instrument_key=NSE_FO%7C111&quantity=0"
             "&product=I&transaction_type=BUY&price=0",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422
+
+
+def test_get_margin_returns_upstox_required_margin() -> None:
+    """Forward a valid margin request to Upstox's margin calculator."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/charges/margin",
+            json={
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "transaction_type": "SELL",
+                "price": 125.5,
+            },
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["data"]["final_margin"] == 4218.75
+    assert response.json()["data"]["request"] == {
+        "access_token": "stored-token",
+        "instrument_key": "NSE_FO|111",
+        "quantity": 75,
+        "product": "I",
+        "transaction_type": "SELL",
+        "price": 125.5,
+    }
+
+
+def test_get_margin_rejects_invalid_order_parameters() -> None:
+    """Reject invalid margin requests before a call reaches Upstox."""
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/charges/margin",
+            json={
+                "instrument_key": "NSE_FO|111",
+                "quantity": 0,
+                "product": "I",
+                "transaction_type": "SELL",
+                "price": 0,
+            },
             headers={"X-API-Key": "mobile-secret"},
         )
     finally:
