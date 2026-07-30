@@ -831,6 +831,14 @@ class FakeUpstoxService:
                     "lot_size": 75,
                     "freeze_quantity": 1800.0,
                     "tick_size": 5.0,
+                    # Deliberately far in the future (not a fixed past-dated string like "2026-07-
+                    # 31" above, which would eventually make this fixture describe an already-
+                    # expired contract) -- search_underlyings' expiry filter drops anything already
+                    # expired, so a fixed near-term date would eventually make this item vanish
+                    # from results and silently break every test relying on it.
+                    "expiry": (datetime.now(ZoneInfo("Asia/Kolkata")) + timedelta(days=400))
+                    .date()
+                    .isoformat(),
                 },
             ],
             "meta_data": {
@@ -2138,7 +2146,8 @@ def test_search_underlyings_include_futures_merges_futures_contract() -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert {
+    future_result = next(item for item in body["results"] if item["instrument_key"] == "NSE_FO|53216")
+    assert future_result == {
         "instrument_key": "NSE_FO|53216",
         "symbol": "NIFTY FUT 31 JUL 26",
         "name": "Nifty Future",
@@ -2147,8 +2156,101 @@ def test_search_underlyings_include_futures_merges_futures_contract() -> None:
         "lot_size": 75.0,
         "freeze_quantity": 1800.0,
         "tick_size": 0.05,
+        "expiry": future_result["expiry"],  # far-future dynamic date, see FakeUpstoxService's fixture
         "is_optionable": False,
-    } in body["results"]
+    }
+
+
+def test_search_underlyings_futures_skip_expired_current_month_and_pick_next_month() -> None:
+    """When the current month's future has already expired, search_underlyings falls back to the
+    next month's contract instead of returning the stale one (or nothing) -- see
+    search_underlyings' own doc comment on why a single "current_month" Upstox request isn't
+    enough. Also confirms multiple valid candidates come back sorted by nearest expiry first.
+    """
+
+    class _FuturesExpiryFakeUpstoxService(FakeUpstoxService):
+        async def search_instruments(
+            self,
+            access_token: str,
+            *,
+            query: str,
+            expiry: str = "current_month",
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            if kwargs.get("instrument_types") != "FUT":
+                return await super().search_instruments(access_token, query=query, expiry=expiry, **kwargs)
+
+            expired = {
+                "name": "Nifty Future (expired)",
+                "exchange": "NSE",
+                "instrument_type": "FUT",
+                "instrument_key": "NSE_FO|EXPIRED",
+                "trading_symbol": "NIFTY FUT EXPIRED",
+                "underlying_type": "INDEX",
+                "underlying_symbol": "NIFTY",
+                "lot_size": 75,
+                "freeze_quantity": 1800.0,
+                "tick_size": 5.0,
+                "expiry": "2020-01-30",
+            }
+            near = {
+                "name": "Nifty Future (near)",
+                "exchange": "NSE",
+                "instrument_type": "FUT",
+                "instrument_key": "NSE_FO|NEAR",
+                "trading_symbol": "NIFTY FUT NEAR",
+                "underlying_type": "INDEX",
+                "underlying_symbol": "NIFTY",
+                "lot_size": 75,
+                "freeze_quantity": 1800.0,
+                "tick_size": 5.0,
+                "expiry": (datetime.now(ZoneInfo("Asia/Kolkata")) + timedelta(days=10)).date().isoformat(),
+            }
+            far = {
+                "name": "Nifty Future (far)",
+                "exchange": "NSE",
+                "instrument_type": "FUT",
+                "instrument_key": "NSE_FO|FAR",
+                "trading_symbol": "NIFTY FUT FAR",
+                "underlying_type": "INDEX",
+                "underlying_symbol": "NIFTY",
+                "lot_size": 75,
+                "freeze_quantity": 1800.0,
+                "tick_size": 5.0,
+                "expiry": (datetime.now(ZoneInfo("Asia/Kolkata")) + timedelta(days=40)).date().isoformat(),
+            }
+            # current_month only ever "sees" the expired contract (simulating Upstox's own
+            # current_month bucket still describing a contract that's since lapsed); next_month
+            # is where the two genuinely-tradable candidates live.
+            data = [expired] if expiry == "current_month" else [near, far]
+            return {
+                "status": "success",
+                "data": data,
+                "meta_data": {
+                    "page": {"page_number": 1, "records": kwargs.get("records", 30), "total_records": len(data), "total_pages": 1}
+                },
+            }
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = _FuturesExpiryFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
+    _SEARCH_CACHE.clear()
+    client = TestClient(app)
+    try:
+        response = client.get(
+            "/api/search/underlyings?query=nifty&limit=10&include_futures=true",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    future_keys = [item["instrument_key"] for item in body["results"] if item["underlying_type"] == "FUTURES"]
+    # The expired current-month contract never appears, and the two valid next-month candidates
+    # come back nearest-expiry-first.
+    assert future_keys == ["NSE_FO|NEAR", "NSE_FO|FAR"]
 
 
 def test_search_underlyings_empty_query_returns_default_option_indices() -> None:

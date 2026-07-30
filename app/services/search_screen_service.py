@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import monotonic
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from app.core.exceptions import UpstoxApiError
 from app.services.upstox_service import UpstoxService
@@ -16,6 +17,8 @@ class _SearchCacheEntry:
 
 
 _SEARCH_CACHE: dict[tuple[str, int], _SearchCacheEntry] = {}
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 DEFAULT_OPTION_INDICES = [
     {
@@ -183,11 +186,17 @@ class SearchScreenService:
     ) -> dict[str, Any]:
         """Return deduped index/equity underlyings that have option contracts.
 
-        [include_futures] additionally merges in matching current-month futures contracts
-        (instrument_type FUT) -- see _shape_futures' doc comment for why these need their own
-        opt-in flag rather than always being included. Only the Watchlist "Add" flow (not the
-        Search screen's underlying picker, which needs a real option-capable underlying to hand
-        off to the Main screen's bootstrap call) should ever pass this true.
+        [include_futures] additionally merges in matching futures contracts (instrument_type FUT)
+        -- see _shape_futures' doc comment for why these need their own opt-in flag rather than
+        always being included. Only the Watchlist "Add" flow (not the Search screen's underlying
+        picker, which needs a real option-capable underlying to hand off to the Main screen's
+        bootstrap call) should ever pass this true.
+
+        Futures results span both the current and next calendar month, with anything already
+        expired dropped and the rest sorted by nearest expiry first -- so this always resolves to
+        the nearest genuinely-tradable contract, not just "whatever's in the current calendar
+        month" (which can be an already-expired contract for however many days remain in that
+        month after expiry).
         """
         normalized_query = query.strip()
         safe_limit = min(max(limit, 1), 30)
@@ -222,14 +231,41 @@ class SearchScreenService:
                 results.append(item)
                 seen_keys.add(item["instrument_key"])
             if include_futures and len(results) < safe_limit:
-                futures_payload = await self.upstox.search_instruments(
-                    access_token,
-                    query=normalized_query,
-                    instrument_types="FUT",
-                    page_number=1,
-                    records=safe_limit - len(results),
+                remaining = safe_limit - len(results)
+                # FIX: a single "current_month" request (search_instruments' own default) meant
+                # this silently kept asking Upstox for that specific calendar month's contract
+                # even once it had already expired -- there was no "give me whatever's next
+                # available" fallback at all, so a stale/expired-adjacent query could return
+                # nothing useful for the intended underlying (observed: resolving NIFTY's future
+                # landed on an unrelated contract). Requesting both current_month and next_month,
+                # merging, dropping anything already expired, and sorting by nearest expiry first
+                # guarantees the nearest genuinely-tradable contract wins regardless of where in
+                # the expiry cycle "today" falls.
+                futures_candidates: list[dict[str, Any]] = []
+                futures_seen: set[str] = set()
+                for expiry_window in ("current_month", "next_month"):
+                    futures_payload = await self.upstox.search_instruments(
+                        access_token,
+                        query=normalized_query,
+                        instrument_types="FUT",
+                        expiry=expiry_window,
+                        page_number=1,
+                        records=remaining,
+                    )
+                    for item in _shape_futures(futures_payload, limit=remaining):
+                        if item["instrument_key"] in futures_seen:
+                            continue
+                        futures_seen.add(item["instrument_key"])
+                        futures_candidates.append(item)
+
+                today_ist = datetime.now(_IST).date().isoformat()
+                futures_candidates = sorted(
+                    (item for item in futures_candidates if item["expiry"] >= today_ist),
+                    key=lambda item: item["expiry"],
                 )
-                for item in _shape_futures(futures_payload, limit=safe_limit - len(results)):
+                for item in futures_candidates:
+                    if len(results) >= safe_limit:
+                        break
                     if item["instrument_key"] in seen_keys:
                         continue
                     results.append(item)
@@ -383,6 +419,12 @@ def _shape_futures(payload: dict[str, Any], *, limit: int) -> list[dict[str, Any
                 "lot_size": _number_value(item, "lot_size"),
                 "freeze_quantity": _number_value(item, "freeze_quantity"),
                 "tick_size": _tick_size(item),
+                # Lets callers (search_underlyings' current+next-month merge, and the Android
+                # client defensively) pick the nearest non-expired contract instead of trusting
+                # whatever order Upstox's own search happens to return -- see search_underlyings'
+                # own doc comment on why a single "current_month" request isn't enough once that
+                # month's contract has already expired.
+                "expiry": _expiry_value(item),
                 # A futures contract IS the instrument, not an underlying with its own separate
                 # option chain -- same "meaningless to hand to the Main screen's bootstrap call"
                 # reasoning as NON_OPTIONABLE_INDICES above.

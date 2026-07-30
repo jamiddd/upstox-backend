@@ -22,6 +22,7 @@ Query params:
 query optional, 0-50 characters
 limit optional, 1-30, default 20
 page_number optional, starts at 1, default 1
+include_futures optional, default false -- see "FUTURES entries" below
 ```
 
 When `query` is empty, the backend returns a default paginated list of index underlyings that provide options.
@@ -79,7 +80,11 @@ India VIX (NSE_INDEX|India VIX) -- a real, quotable NSE index with no listed opt
   surface through the normal CE/PE-backed search below. Always excluded when query is empty
   unless it matches the typed query by name/symbol.
 FUTURES entries (only returned when include_futures=true) -- the contract itself IS the
-  instrument, not an underlying with its own option chain.
+  instrument, not an underlying with its own option chain. These carry an extra `expiry` field
+  (ISO date, e.g. "2026-08-27") not present on INDEX/EQUITY results. Search spans both the
+  current and next calendar month, drops anything already expired, and returns whatever's left
+  sorted by nearest expiry first -- so the first FUTURES result is always the nearest
+  genuinely-tradable contract, never a stale current-month one that's already lapsed.
 ```
 
 The client should show these but disable selecting them -- handing a non-optionable
