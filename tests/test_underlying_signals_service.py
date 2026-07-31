@@ -203,8 +203,8 @@ def test_record_and_diff_ignores_a_snapshot_outside_the_five_minute_band() -> No
     key = ("NSE_INDEX|Nifty 50", None)
     _record(key, now=1000.0, atr=20.0)
 
-    # Only 3 minutes old -- outside the 4-6 minute tolerance band.
-    deltas = _record(key, now=1000.0 + 180.0, atr=25.0)
+    # Only 100 seconds old -- outside the 2.5-10 minute tolerance band.
+    deltas = _record(key, now=1000.0 + 100.0, atr=25.0)
 
     assert deltas.atr is None
 

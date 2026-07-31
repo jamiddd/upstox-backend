@@ -64,8 +64,8 @@ _NO_TRADE_ZONE_FALLBACK_POINTS = 15.0
 # still count as "5 minutes ago" (a tolerance band, not an exact match, since polling is not
 # perfectly metronomic). The 10-minute window applies only to the legacy in-memory fallback used
 # by isolated unit callers; production snapshots remain in SQLite through expiry.
-_FIVE_MIN_MIN_SECONDS = 240.0
-_FIVE_MIN_MAX_SECONDS = 360.0
+_FIVE_MIN_MIN_SECONDS = 150.0
+_FIVE_MIN_MAX_SECONDS = 600.0
 _HISTORY_WINDOW_SECONDS = 600.0
 
 # SENSEX has no actively-traded futures contract on Upstox (unlike NIFTY/BANKNIFTY on NSE) -- per
