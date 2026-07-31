@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes import router as api_router
@@ -34,6 +35,7 @@ from app.services.notification_retention import run_notification_retention
 from app.services.account_snapshot_scheduler import run_account_snapshot_scheduler
 from app.services.oi_snapshot_collector import run_oi_snapshot_collector
 from app.services.order_fill_detector import OrderFillDetector
+from app.services.order_flow_analyzer import OrderFlowService
 from app.services.position_pnl_tracker import PositionPnlTracker
 from app.services.smart_order_service import SmartOrderService
 from app.services.stream_connection_manager import StreamConnectionManager
@@ -323,6 +325,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
     )
     order_fill_detector = OrderFillDetector()
+    order_flow_service = OrderFlowService()
     journal_store = JournalStore(settings)
     trade_context_token_store = EncryptedTokenStore(settings)
     trade_context_upstox = UpstoxService(settings)
@@ -354,7 +357,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         upstox=market_feed_upstox,
         token_store=market_feed_token_store,
         on_tick=lambda tick: _on_market_tick(
-            candle_builder, stream_manager, position_tracker, max_loss_watcher_deps, tick,
+            candle_builder, stream_manager, position_tracker, max_loss_watcher_deps,
+            order_flow_service, tick,
         ),
         on_state_change=market_feed_notifier.handle,
     )
@@ -604,10 +608,17 @@ def _on_market_tick(
     stream_manager: StreamConnectionManager,
     position_tracker: PositionPnlTracker,
     max_loss_watcher_deps: _MaxLossWatcherDeps,
+    order_flow_service: OrderFlowService,
     tick: FeedTick,
 ) -> None:
     candle_builder.handle_tick(tick)
     asyncio.create_task(stream_manager.dispatch_tick(tick))
+
+    order_flow_snapshot = order_flow_service.handle_tick(tick)
+    if order_flow_snapshot is not None:
+        asyncio.create_task(
+            stream_manager.dispatch_order_flow(tick.instrument_key, order_flow_snapshot.to_dict()),
+        )
 
     position_tracker.apply_tick(tick.instrument_key, tick.ltp)
     if tick.instrument_key in position_tracker.instrument_keys():
@@ -706,6 +717,20 @@ def _payload_price(payload: dict[str, Any]) -> Optional[float]:
 
 
 app = FastAPI(title="Upstox Scalper Backend", version="0.1.0", lifespan=_lifespan)
+
+# Android's OkHttp calls are never subject to same-origin/CORS at all, so this is purely additive
+# for the web client -- an empty web_client_origin (the default) means CORSMiddleware is simply
+# never added, leaving today's behavior completely unchanged.
+_cors_origin = get_settings().web_client_origin
+if _cors_origin:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[_cors_origin],
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-API-Key"],
+    )
+
 app.include_router(api_router, prefix="/api")
 app.include_router(stream_router, prefix="/api")
 

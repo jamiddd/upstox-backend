@@ -21,6 +21,7 @@ from app.api.dependencies import (
     get_usd_inr_service,
 )
 from app.core.config import Settings, get_settings
+from app.core.web_session import WEB_SESSION_COOKIE_NAME, create_session_token
 from app.main import app
 from app.services import instrument_rules_service
 from app.services.instrument_rules_service import _MasterCache
@@ -1198,6 +1199,37 @@ def test_main_bootstrap_returns_screen_ready_payload() -> None:
     ]
 
 
+def test_main_bootstrap_accepts_web_session_cookie_with_no_api_key() -> None:
+    """The web client's Main dashboard (M1) calls this route with only its session cookie, never
+    the raw MOBILE_API_KEY -- confirms dual_router's require_mobile_or_web actually accepts that
+    path, not just the X-API-Key path every other bootstrap test here exercises."""
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    app.dependency_overrides[get_settings] = lambda: settings
+    client = _client(FakeTokenStore(token="stored-token"))
+    # _client() re-applies its own dependency_overrides[get_settings] = _settings after the
+    # module-level cache resets above -- re-override afterward so this test's settings win.
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        token = create_session_token(settings)
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, token)
+        response = client.get("/api/main/bootstrap")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["expiries"] == ["2026-07-16", "2026-07-23"]
+
+
+def test_main_bootstrap_rejects_neither_api_key_nor_cookie() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get("/api/main/bootstrap")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
 def test_main_bootstrap_degrades_gracefully_when_funds_service_unavailable() -> None:
     """A funds/margin failure (e.g. Upstox's nightly maintenance window) must not take down the
     whole bootstrap call -- spot price, expiries, and positions are all independently available.
@@ -2217,6 +2249,34 @@ def test_search_underlyings_returns_only_option_capable_indices_and_stocks() -> 
             "total_pages": 1,
         },
     }
+
+
+def test_search_underlyings_accepts_web_session_cookie_with_no_api_key() -> None:
+    """The web client's Search screen (M1) calls this route with only its session cookie -- see
+    the equivalent /main/bootstrap test for why this matters (dual_router's require_mobile_or_web
+    must accept this path, not just X-API-Key)."""
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        token = create_session_token(settings)
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, token)
+        response = client.get("/api/search/underlyings?query=nifty&limit=10")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["query"] == "nifty"
+
+
+def test_search_underlyings_rejects_neither_api_key_nor_cookie() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get("/api/search/underlyings")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
 
 
 def test_search_underlyings_include_futures_merges_futures_contract() -> None:
@@ -3336,6 +3396,568 @@ def test_tracked_instruments_endpoints_require_the_mobile_api_key(tmp_path: Path
     client = TestClient(app)
     try:
         response = client.get("/api/user/tracked-instruments")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
+# --- M1c: dual_router (require_mobile_or_web) coverage for the newly-moved read-only routes ---
+# One "accepts the session cookie" test per route below (proves dual_router's wiring actually
+# works for that specific route, not just a bare 200), plus one consolidated "rejects neither auth"
+# test at the end covering every dual_router path added across M1a/b/c -- the 401-with-no-auth
+# invariant is identical for all of them, so it doesn't need one near-duplicate test per route.
+
+
+def test_main_option_chain_accepts_web_session_cookie() -> None:
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get(
+            "/api/main/option-chain?expiry_date=2026-07-16&underlying_key=NSE_INDEX|Nifty 50",
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["expiry_date"] == "2026-07-16"
+
+
+def test_main_summary_accepts_web_session_cookie() -> None:
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get("/api/main/summary")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert "opening_balance" in response.json()
+
+
+def test_portfolio_holdings_accepts_web_session_cookie() -> None:
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get("/api/portfolio/holdings")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+
+
+def test_portfolio_positions_accepts_web_session_cookie() -> None:
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get("/api/portfolio/positions")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+
+
+def test_orders_history_accepts_web_session_cookie() -> None:
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get("/api/orders/history")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["scope"] == "today"
+
+
+def test_journal_trades_list_accepts_web_session_cookie(tmp_path: Path) -> None:
+    settings = replace(
+        _settings(), web_session_secret="test-web-secret",
+        journal_database_path=tmp_path / "journal.sqlite3",
+    )
+    journal_store = JournalStore(settings)
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get("/api/journal/trades")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "trades": [],
+        "page": {"page_number": 1, "page_size": 20, "total_records": 0, "total_pages": 0},
+    }
+
+
+def test_journal_trade_detail_accepts_web_session_cookie_but_404s_when_missing(
+    tmp_path: Path,
+) -> None:
+    """Reaching a 404 here (rather than 401) already proves the cookie cleared auth -- the route
+    only 401s before the handler runs at all, per require_mobile_or_web."""
+    settings = replace(
+        _settings(), web_session_secret="test-web-secret",
+        journal_database_path=tmp_path / "journal.sqlite3",
+    )
+    journal_store = JournalStore(settings)
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get("/api/journal/trades/does-not-exist")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+
+
+def test_analytics_summary_accepts_web_session_cookie(tmp_path: Path) -> None:
+    settings = replace(
+        _settings(), web_session_secret="test-web-secret",
+        journal_database_path=tmp_path / "journal.sqlite3",
+    )
+    journal_store = JournalStore(settings)
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get("/api/analytics/summary")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["trade_count"] == 0
+    assert response.json()["low_sample"] is True
+
+
+def test_all_dual_router_routes_reject_neither_api_key_nor_cookie(tmp_path: Path) -> None:
+    """Every route moved onto dual_router across M1a/b/c must still 401 with no auth at all --
+    one shared test for the invariant instead of one near-duplicate per route."""
+    settings = replace(
+        _settings(), web_session_secret="test-web-secret",
+        journal_database_path=tmp_path / "journal.sqlite3",
+    )
+    journal_store = JournalStore(settings)
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        paths = [
+            "/api/auth/web-session-status",
+            "/api/main/bootstrap",
+            "/api/search/underlyings",
+            "/api/main/option-chain?expiry_date=2026-07-16",
+            "/api/main/summary",
+            "/api/portfolio/holdings",
+            "/api/portfolio/positions",
+            "/api/orders/history",
+            "/api/journal/trades",
+            "/api/journal/trades/some-id",
+            "/api/analytics/summary",
+        ]
+        for path in paths:
+            response = client.get(path)
+            assert response.status_code == 401, f"{path} did not reject missing auth"
+    finally:
+        app.dependency_overrides.clear()
+
+
+# --- M3a: dual_router coverage for the first write endpoint (smart-bracket) + the new
+# read-only suggested-quantity endpoint ---
+
+
+def test_place_smart_bracket_order_accepts_web_session_cookie() -> None:
+    """The web client's Buy/Sell confirmation flow (M3) calls this with only its session cookie --
+    confirms dual_router's require_mobile_or_web accepts that path for a WRITE endpoint too, not
+    just the read-only routes moved in M1/M2."""
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.post(
+            "/api/orders/smart-bracket",
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 118.0,
+                "market_protection": -1,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "success"
+
+
+def test_place_smart_bracket_order_rejects_neither_api_key_nor_cookie() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/smart-bracket",
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 75,
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 118.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
+def test_suggested_quantity_accepts_web_session_cookie() -> None:
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client()
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.post(
+            "/api/orders/suggested-quantity",
+            json={"mode": "FIXED", "lot_size": 75, "default_lot_count": 2},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"quantity": 150}
+
+
+def test_suggested_quantity_rejects_neither_api_key_nor_cookie() -> None:
+    client = _client()
+    try:
+        response = client.post(
+            "/api/orders/suggested-quantity",
+            json={"mode": "FIXED", "lot_size": 75},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
+def test_suggested_quantity_held_quantity_short_circuits() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.post(
+            "/api/orders/suggested-quantity",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"held_quantity": 150, "mode": "RISK_BASED", "lot_size": 75},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"quantity": 150}
+
+
+# --- M3c: dual_router coverage for the second write endpoint (exit-positions) ---
+
+
+def test_exit_positions_accepts_web_session_cookie() -> None:
+    """The web client's Portfolio close actions (M3) call this with only its session cookie."""
+    _set_exit_positions_instrument_rules_cache()
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
+    client = TestClient(app)
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.post("/api/orders/exit-positions", json={})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["positions_found"] == 2
+
+
+def test_exit_positions_rejects_neither_api_key_nor_cookie() -> None:
+    _set_exit_positions_instrument_rules_cache()
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = _ExitAllFakeUpstoxService
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
+    client = TestClient(app)
+    try:
+        response = client.post("/api/orders/exit-positions", json={})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
+# --- M3d: dual_router coverage for the GTT list (read-only) + fourth/fifth write endpoints
+# (modify, cancel) ---
+
+
+def test_get_gtt_orders_accepts_web_session_cookie() -> None:
+    """The web client's GTT screen (M3d) lists active brackets with only its session cookie."""
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get("/api/orders/gtt")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert {order["gtt_order_id"] for order in payload} == {"GTT-111", "GTT-other"}
+
+
+def test_get_gtt_orders_rejects_neither_api_key_nor_cookie() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get("/api/orders/gtt")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
+def test_modify_gtt_order_accepts_web_session_cookie() -> None:
+    """The web client's GTT edit dialog (M3d) modifies a bracket with only its session cookie."""
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.put(
+            "/api/orders/gtt/modify",
+            json={
+                "gtt_order_id": "GTT-111",
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 145.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {"gtt_order_id": "GTT-111"}
+
+
+def test_modify_gtt_order_rejects_neither_api_key_nor_cookie() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.put(
+            "/api/orders/gtt/modify",
+            json={
+                "gtt_order_id": "GTT-111",
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 145.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
+def test_cancel_gtt_order_accepts_web_session_cookie() -> None:
+    """The web client's GTT cancel confirmation (M3d) calls this with only its session cookie."""
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.request(
+            "DELETE",
+            "/api/orders/gtt/cancel",
+            json={"gtt_order_id": "GTT-111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["data"]["gtt_order_ids"] == ["GTT-111"]
+
+
+def test_cancel_gtt_order_rejects_neither_api_key_nor_cookie() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.request(
+            "DELETE",
+            "/api/orders/gtt/cancel",
+            json={"gtt_order_id": "GTT-111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
+# --- M3e: dual_router coverage for /settings/max-loss -- previously untested (Android-only,
+# zero prior test references to either route) ---
+
+
+def test_get_max_loss_settings_defaults_to_zero(tmp_path: Path) -> None:
+    """No prior PUT -- the store's own on-disk-missing default."""
+    settings = replace(_settings(), max_loss_settings_path=tmp_path / "max_loss.json")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        response = client.get("/api/settings/max-loss", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"amount": 0.0}
+
+
+def test_set_max_loss_settings_persists_and_is_reflected_by_get(tmp_path: Path) -> None:
+    settings = replace(_settings(), max_loss_settings_path=tmp_path / "max_loss.json")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        put_response = client.put(
+            "/api/settings/max-loss",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"amount": 5000.0},
+        )
+        get_response = client.get("/api/settings/max-loss", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert put_response.status_code == 200
+    assert put_response.json() == {"amount": 5000.0}
+    assert get_response.status_code == 200
+    assert get_response.json() == {"amount": 5000.0}
+
+
+def test_get_max_loss_settings_accepts_web_session_cookie(tmp_path: Path) -> None:
+    """The web client's Settings screen (M3e) reconciles its local value with only its session
+    cookie."""
+    settings = replace(
+        _settings(), web_session_secret="test-web-secret", max_loss_settings_path=tmp_path / "max_loss.json"
+    )
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get("/api/settings/max-loss")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"amount": 0.0}
+
+
+def test_get_max_loss_settings_rejects_neither_api_key_nor_cookie(tmp_path: Path) -> None:
+    settings = replace(_settings(), max_loss_settings_path=tmp_path / "max_loss.json")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        response = client.get("/api/settings/max-loss")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
+def test_set_max_loss_settings_accepts_web_session_cookie(tmp_path: Path) -> None:
+    """The web client's Main dashboard (M3e) syncs the resolved threshold with only its session
+    cookie -- both a direct Settings-screen edit and the auto square-off's own zero-out call."""
+    settings = replace(
+        _settings(), web_session_secret="test-web-secret", max_loss_settings_path=tmp_path / "max_loss.json"
+    )
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.put("/api/settings/max-loss", json={"amount": 2500.0})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"amount": 2500.0}
+
+
+def test_set_max_loss_settings_rejects_neither_api_key_nor_cookie(tmp_path: Path) -> None:
+    settings = replace(_settings(), max_loss_settings_path=tmp_path / "max_loss.json")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        response = client.put("/api/settings/max-loss", json={"amount": 2500.0})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+
+
+# --- M4a: dual_router coverage for /market/candles -- the web client's Chart screen needs this ---
+
+
+def test_market_candles_accepts_web_session_cookie() -> None:
+    settings = replace(_settings(), web_session_secret="test-web-secret")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.get(
+            "/api/market/candles",
+            params={
+                "instrument_key": "NSE_INDEX|Nifty 50",
+                "unit": "minutes",
+                "interval": 5,
+                "from_date": "2026-07-16",
+                "to_date": "2026-07-17",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["instrument_key"] == "NSE_INDEX|Nifty 50"
+
+
+def test_market_candles_rejects_neither_api_key_nor_cookie() -> None:
+    client = _client(FakeTokenStore(token="stored-token"))
+    try:
+        response = client.get(
+            "/api/market/candles",
+            params={
+                "instrument_key": "NSE_INDEX|Nifty 50",
+                "from_date": "2026-07-16",
+                "to_date": "2026-07-17",
+            },
+        )
     finally:
         app.dependency_overrides.clear()
 

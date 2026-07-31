@@ -41,9 +41,11 @@ class _FakeStreamManager:
     def __init__(self) -> None:
         self.received: list[str] = []
         self.disconnected = False
+        self.connect_kwargs: dict[str, object] = {}
 
     async def connect(self, websocket, **kwargs):
         # The route already calls websocket.accept() before reaching here (see stream_routes.py).
+        self.connect_kwargs = kwargs
         return websocket
 
     async def handle_message(self, session, raw: str) -> None:
@@ -93,6 +95,42 @@ def test_valid_api_key_connects_and_relays_messages() -> None:
 
     assert json.loads(reply)["type"] == "ack"
     assert stream_manager.received == [json.dumps({"type": "subscribe", "full": ["A"], "ltpc": []})]
+
+
+def test_client_instance_id_and_generation_accepted_via_query_params() -> None:
+    """Browsers can't set custom headers on a WS handshake -- the web client sends these as query
+    params instead of Android's headers; confirms the route reads that fallback."""
+    stream_manager = _FakeStreamManager()
+    app = _app(stream_manager)
+    client = TestClient(app)
+
+    with client.websocket_connect(
+        "/api/stream?client_instance_id=tab-abc&generation=3",
+        headers={"X-API-Key": "mobile-secret"},
+    ):
+        pass
+
+    assert stream_manager.connect_kwargs["client_instance_id"] == "tab-abc"
+    assert stream_manager.connect_kwargs["generation"] == 3
+
+
+def test_header_wins_over_query_param_when_both_present() -> None:
+    stream_manager = _FakeStreamManager()
+    app = _app(stream_manager)
+    client = TestClient(app)
+
+    with client.websocket_connect(
+        "/api/stream?client_instance_id=from-query&generation=1",
+        headers={
+            "X-API-Key": "mobile-secret",
+            "x-client-instance-id": "from-header",
+            "x-connection-generation": "9",
+        },
+    ):
+        pass
+
+    assert stream_manager.connect_kwargs["client_instance_id"] == "from-header"
+    assert stream_manager.connect_kwargs["generation"] == 9
 
 
 def test_disconnect_calls_manager_disconnect() -> None:

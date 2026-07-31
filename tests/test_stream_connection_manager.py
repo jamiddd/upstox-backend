@@ -226,6 +226,26 @@ async def test_dispatch_tick_only_reaches_sessions_watching_that_instrument() ->
 
 
 @pytest.mark.anyio
+async def test_dispatch_order_flow_only_reaches_d30_subscribed_sessions() -> None:
+    """Unlike dispatch_tick (any tier), order_flow is d30-only -- the analysis needs full depth
+    and is meaningless for full/ltpc-tier subscribers."""
+    manager, _ = _manager()
+    d30_session_socket = _FakeWebSocket()
+    full_session_socket = _FakeWebSocket()
+    d30_session = await manager.connect(d30_session_socket)  # type: ignore[arg-type]
+    full_session = await manager.connect(full_session_socket)  # type: ignore[arg-type]
+    d30_session.d30_keys = {"NSE_FO|111"}
+    full_session.full_keys = {"NSE_FO|111"}
+
+    await manager.dispatch_order_flow("NSE_FO|111", {"ofi_rolling": 42.0})
+
+    assert d30_session_socket.sent == [
+        {"type": "order_flow", "data": {"instrument_key": "NSE_FO|111", "ofi_rolling": 42.0}},
+    ]
+    assert full_session_socket.sent == []
+
+
+@pytest.mark.anyio
 async def test_dispatch_order_update_reaches_every_connected_session() -> None:
     manager, _ = _manager()
     a = _FakeWebSocket()

@@ -7,6 +7,7 @@ import secrets
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
 from app.core.config import Settings, get_settings
+from app.core.web_session import WEB_SESSION_COOKIE_NAME, verify_session_token
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +27,17 @@ async def stream_endpoint(
     Upstox WebSocket and its 60s signals / 5s order-status REST polls (see
     `StreamConnectionManager`'s own doc comment for the full protocol).
 
-    Authenticated with the same static `X-API-Key` header every other route already requires,
-    checked explicitly in the body rather than via a `Header`-based dependency (as
-    `require_mobile_api_key` does for REST routes) -- a WebSocket handshake needs an explicit
-    `close()` on auth failure, not an `HTTPException`, for a clean rejection.
+    Authenticated with either the same static `X-API-Key` header every other route already
+    requires (Android), or the web client's signed `psw_session` cookie -- checked explicitly in
+    the body rather than via a `Header`/`Depends`-based dependency (as `require_mobile_api_key`
+    does for REST routes) -- a WebSocket handshake needs an explicit `close()` on auth failure, not
+    an `HTTPException`, for a clean rejection. Browsers cannot set a custom header on a WS upgrade
+    request, but they do send cookies automatically, which is exactly why the web client needs this
+    second path instead of reusing the header check unmodified. Same reasoning applies to
+    `client_instance_id`/`generation` below -- Android sends them as headers, the web client sends
+    them as query params instead.
 
-    The handshake is accepted *before* checking the key, even on the rejection path: closing a
+    The handshake is accepted *before* checking auth, even on the rejection path: closing a
     WebSocket that was never accepted makes uvicorn's real ASGI server reject the connection at
     the HTTP level with a bare 403 and no code the client can read, rather than delivering the
     close code below as an actual WebSocket close frame. `TestClient`'s in-process WS transport
@@ -40,16 +46,32 @@ async def stream_endpoint(
     """
     await websocket.accept()
     api_key = websocket.headers.get("x-api-key")
-    if not settings.mobile_api_key or not api_key or not secrets.compare_digest(
-        api_key, settings.mobile_api_key,
-    ):
+    has_valid_api_key = bool(
+        settings.mobile_api_key and api_key and secrets.compare_digest(api_key, settings.mobile_api_key),
+    )
+    session_cookie = websocket.cookies.get(WEB_SESSION_COOKIE_NAME)
+    has_valid_session = bool(
+        settings.web_session_secret
+        and session_cookie
+        and verify_session_token(session_cookie, settings),
+    )
+    if not has_valid_api_key and not has_valid_session:
         await websocket.close(code=_UNAUTHORIZED_CLOSE_CODE)
         return
 
     manager = websocket.app.state.stream_manager
-    client_instance_id = websocket.headers.get("x-client-instance-id")
+    # Browsers cannot set custom headers on a WS upgrade request (the same limitation the auth
+    # cookie above exists to work around) -- the web client sends these as query params instead.
+    # Query params are checked second (header wins if somehow both are present) purely because
+    # the header path is Android's existing, already-proven behavior.
+    client_instance_id = websocket.headers.get("x-client-instance-id") or websocket.query_params.get(
+        "client_instance_id",
+    )
+    generation_raw = websocket.headers.get("x-connection-generation") or websocket.query_params.get(
+        "generation", "0",
+    )
     try:
-        generation = int(websocket.headers.get("x-connection-generation", "0"))
+        generation = int(generation_raw)
     except ValueError:
         generation = 0
     try:

@@ -320,6 +320,19 @@ class StreamConnectionManager:
                 },
             })
 
+    async def dispatch_order_flow(self, instrument_key: str, snapshot: dict[str, Any]) -> None:
+        """Pushes the OrderFlowAnalyzer-derived signal for one instrument, d30-only -- unlike
+        dispatch_tick (which sends to any session subscribed at any tier), this only reaches
+        sessions with `instrument_key` in their `d30_keys`, since the analysis needs full depth
+        and is meaningless for full/ltpc-tier subscribers."""
+        for session in list(self._sessions.values()):
+            if instrument_key not in session.d30_keys:
+                continue
+            await session.send({
+                "type": "order_flow",
+                "data": {"instrument_key": instrument_key, **snapshot},
+            })
+
     async def dispatch_order_update(self, payload: dict[str, Any]) -> None:
         # Order updates aren't scoped to a chart/instrument subscription the way ticks are --
         # every connected session needs to know about a fill regardless of what it's currently

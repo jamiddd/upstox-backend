@@ -60,6 +60,18 @@ class Settings:
     # URL -- Android resolves it straight to the app via Chrome Custom Tabs' normal redirect
     # handling, no App Links/asset-links.json verification needed.
     mobile_app_redirect_url: str = "personalscalper://auth/callback"
+    # CORS origin for the SvelteKit web client (e.g. "https://app.scalp8.xyz"). Empty disables
+    # CORS entirely -- the Android app never needs it (no browser same-origin policy applies to
+    # its OkHttp calls), so an unset value here does not block Android in any way.
+    web_client_origin: str = ""
+    # HMAC signing key for the web client's session cookie (see app/core/web_session.py) --
+    # entirely separate from mobile_api_key: this secret only ever signs/verifies a cookie minted
+    # by this backend, it is never sent by or exposed to the browser itself.
+    web_session_secret: str = ""
+    # Where /auth/callback sends the browser after a successful Upstox login when the login was
+    # initiated by the web client (state=web) -- the browser equivalent of mobile_app_redirect_url,
+    # e.g. "https://app.scalp8.xyz/auth/callback".
+    web_client_auth_redirect_url: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -131,6 +143,9 @@ class Settings:
                 "MOBILE_APP_REDIRECT_URL",
                 "personalscalper://auth/callback",
             ),
+            web_client_origin=os.getenv("WEB_CLIENT_ORIGIN", ""),
+            web_session_secret=os.getenv("WEB_SESSION_SECRET", ""),
+            web_client_auth_redirect_url=os.getenv("WEB_CLIENT_AUTH_REDIRECT_URL", ""),
         )
 
     def require_mobile_api_key(self) -> None:
@@ -154,6 +169,11 @@ class Settings:
         parsed = urlparse(self.upstox_redirect_url)
         if not parsed.scheme or not parsed.netloc:
             raise AppConfigError("UPSTOX_REDIRECT_URL must be an absolute URL")
+
+    def require_web_session_secret(self) -> None:
+        """Ensure the web client's session-signing secret has been configured."""
+        if not self.web_session_secret:
+            raise AppConfigError("WEB_SESSION_SECRET is not configured")
 
     def require_upstox_totp_login(self) -> None:
         """Ensure the automated TOTP login's own credentials are configured, on top of the

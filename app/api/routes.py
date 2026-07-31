@@ -7,7 +7,7 @@ import logging
 from typing import Any, Literal, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -38,9 +38,14 @@ from app.core.exceptions import (
 from app.services.token_store import EncryptedTokenStore
 from app.services.candle_service import CandleService
 from app.services.candle_cache_store import CandleCacheStore
+from app.core.web_session import (
+    WEB_SESSION_COOKIE_NAME,
+    DEFAULT_SESSION_TTL_SECONDS,
+    create_session_token,
+)
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_service import UpstoxService
-from app.core.security import require_mobile_api_key
+from app.core.security import require_mobile_api_key, require_mobile_or_web, require_web_session
 from app.services.instrument_rules_service import (
     InstrumentRulesService,
     slice_quantity_for_freeze,
@@ -62,6 +67,7 @@ from app.services.oi_snapshot_store import OISnapshotStore, SnapshotNotFoundErro
 from app.services.search_screen_service import SearchScreenService
 from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.smart_order_service import SmartOrderService
+from app.services import quantity_sizing
 from app.services.underlying_signals_service import UnderlyingSignalsService
 from app.services.trade_context_service import TradeContextService, extract_order_ids
 from app.services.usd_inr_service import UsdInrService
@@ -69,6 +75,16 @@ from app.services.upstox_totp_login import UpstoxTotpLoginService
 
 public_router = APIRouter()
 protected_router = APIRouter(dependencies=[Depends(require_mobile_api_key)])
+# Routes only the web client calls with its session cookie -- kept on a separate router (rather
+# than adding require_web_session route-by-route to protected_router) since protected_router's
+# router-level dependency is require_mobile_api_key for every route included in it; Android never
+# touches this router at all.
+web_router = APIRouter(dependencies=[Depends(require_web_session)])
+# Routes both Android (X-API-Key) and the web client (session cookie) call -- a route needing
+# either auth can't stay on protected_router (its router-level dependency is require_mobile_api_key
+# only), so it moves here instead. Only routes that actually need to be reachable from the browser
+# move onto this router; everything else stays on protected_router until it does.
+dual_router = APIRouter(dependencies=[Depends(require_mobile_or_web)])
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +105,35 @@ class SmartBracketOrderRequest(BaseModel):
     trailing_gap: Optional[float] = Field(default=None, gt=0)
     market_protection: Optional[int] = Field(default=None, ge=-1, le=25)
     slice_quantity: Optional[int] = Field(default=None, gt=0)
+
+
+class SuggestedQuantityRequest(BaseModel):
+    """Request body for QuantitySizing.kt's server-side port -- see
+    app/services/quantity_sizing.py. Mirrors default_quantity's parameters; all optional except
+    mode/lot_size, matching the Kotlin function's own nullable-inputs-mean-fallback behavior."""
+
+    held_quantity: int = 0
+    mode: Literal["FIXED", "CAPITAL_BASED", "RISK_BASED", "ATR_BASED", "IV_BASED", "KELLY"] = "FIXED"
+    available_capital: Optional[float] = None
+    capital_allocation_percent: float = 0
+    buffer_amount: float = 0
+    estimated_charges: Optional[float] = None
+    entry_price: Optional[float] = Field(default=None, gt=0)
+    lot_size: int = Field(gt=0)
+    default_lot_count: int = 1
+    risk_per_trade_amount: float = 0
+    risk_management_is_percent: bool = True
+    stop_loss_value: float = 0
+    atr_14_5m: Optional[float] = None
+    contract_delta: Optional[float] = None
+    contract_iv: Optional[float] = None
+    atr_stop_multiplier: float = 1.5
+    iv_stop_multiplier: float = 1.0
+    kelly_trade_count: int = 0
+    kelly_win_rate: Optional[float] = None
+    kelly_average_win: Optional[float] = None
+    kelly_average_loss: Optional[float] = None
+    kelly_capital: Optional[float] = None
 
 
 class ModifyGttOrderRequest(BaseModel):
@@ -218,10 +263,67 @@ def get_login_url(
         raise _http_error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
 
 
+@protected_router.post("/auth/web-login")
+def web_login(
+    response: Response,
+    settings: Settings = Depends(get_settings),
+) -> dict[str, str]:
+    """Issue the web client's signed session cookie.
+
+    Protected by the same MOBILE_API_KEY every other protected_router route already requires --
+    the browser must have that key entered once (mirroring Android's own "Connect" pairing) before
+    it can mint a session. The cookie itself is what subsequent requests/`/stream` use afterward,
+    so the browser never needs to hold the raw API key beyond this one call.
+    """
+    try:
+        settings.require_web_session_secret()
+    except AppConfigError as exc:
+        raise _http_error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
+
+    token = create_session_token(settings)
+    response.set_cookie(
+        key=WEB_SESSION_COOKIE_NAME,
+        value=token,
+        max_age=DEFAULT_SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+    )
+    return {"status": "ok"}
+
+
+@web_router.post("/auth/web-logout")
+def web_logout(response: Response) -> dict[str, str]:
+    """Clear the web client's session cookie.
+
+    On web_router (require_web_session), not protected_router (require_mobile_api_key) -- by the
+    time a browser wants to log out, it only ever holds the session cookie from web-login, never
+    the raw MOBILE_API_KEY (see web_login's own doc comment for why). Gating logout behind the API
+    key would make it permanently unreachable from the web client.
+    """
+    response.delete_cookie(key=WEB_SESSION_COOKIE_NAME)
+    return {"status": "logged_out"}
+
+
+@web_router.get("/auth/web-session-status")
+def web_session_status() -> dict[str, bool]:
+    """Report whether the calling browser's session cookie is currently valid.
+
+    Reaching this handler at all already proves the cookie is valid -- web_router's
+    require_web_session dependency 401s before this body ever runs otherwise -- so the response is
+    always `{"authenticated": true}`. Distinct from `/auth/status` (which reports whether the
+    *Upstox* OAuth token is still valid) -- this is purely "is this browser's own session with our
+    backend still good," the thing the protected shell needs to decide whether to redirect to
+    `/login`.
+    """
+    return {"authenticated": True}
+
+
 @public_router.get("/auth/callback")
 async def auth_callback(
     request: Request,
     code: str,
+    state: Optional[str] = None,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
@@ -237,7 +339,15 @@ async def auth_callback(
     same mechanism every other app's in-browser OAuth flow relies on) -- see
     `ConnectViewModel`/`MainActivity`'s matching intent-filter in the Android app repo, which
     reacts to this by re-checking connection status automatically.
+
+    `state == "web"` (threaded through from `GET /auth/login-url`'s own optional `state` param)
+    redirects to `settings.web_client_auth_redirect_url` instead -- lets the web client reuse this
+    same Upstox-registered redirect URL rather than needing a second one registered with Upstox.
+    Any other/missing state value keeps today's Android behavior as the default.
     """
+    redirect_base = (
+        settings.web_client_auth_redirect_url if state == "web" else settings.mobile_app_redirect_url
+    )
     try:
         token_payload = await service.exchange_code_for_token(code)
         token_store.save(token_payload)
@@ -245,10 +355,10 @@ async def auth_callback(
         if reconciler is not None:
             asyncio.create_task(reconciler.reconcile())
     except (AppConfigError, TokenStoreError) as exc:
-        return RedirectResponse(f"{settings.mobile_app_redirect_url}?status=error&message={quote(str(exc))}")
+        return RedirectResponse(f"{redirect_base}?status=error&message={quote(str(exc))}")
     except UpstoxApiError as exc:
-        return RedirectResponse(f"{settings.mobile_app_redirect_url}?status=error&message={quote(exc.message)}")
-    return RedirectResponse(f"{settings.mobile_app_redirect_url}?status=success")
+        return RedirectResponse(f"{redirect_base}?status=error&message={quote(exc.message)}")
+    return RedirectResponse(f"{redirect_base}?status=success")
 
 
 @protected_router.get("/auth/status")
@@ -436,12 +546,15 @@ async def get_margin(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/portfolio/holdings")
+@dual_router.get("/portfolio/holdings")
 async def get_holdings(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Return long-term holdings from Upstox."""
+    """Return long-term holdings from Upstox.
+
+    On dual_router (require_mobile_or_web) -- the web client's Portfolio screen (M1) needs this.
+    """
     access_token = _load_access_token(token_store)
     try:
         return await service.get_holdings(access_token)
@@ -449,12 +562,15 @@ async def get_holdings(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/portfolio/positions")
+@dual_router.get("/portfolio/positions")
 async def get_positions(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Return current positions from Upstox."""
+    """Return current positions from Upstox.
+
+    On dual_router (require_mobile_or_web) -- the web client's Portfolio screen (M1) needs this.
+    """
     access_token = _load_access_token(token_store)
     try:
         return await service.get_positions(access_token)
@@ -475,7 +591,7 @@ async def get_funds_and_margin(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/main/bootstrap")
+@dual_router.get("/main/bootstrap")
 async def main_bootstrap(
     underlying_key: str = DEFAULT_UNDERLYING_KEY,
     expiry_date: Optional[str] = None,
@@ -484,7 +600,12 @@ async def main_bootstrap(
     settings: Settings = Depends(get_settings),
     journal_store: JournalStore = Depends(get_journal_store),
 ) -> dict[str, Any]:
-    """Return screen-ready initial data for the option trading main screen."""
+    """Return screen-ready initial data for the option trading main screen.
+
+    On dual_router (require_mobile_or_web), not protected_router -- this is the web client's Main
+    dashboard screen (M1), so it must accept the browser's session cookie as well as Android's
+    X-API-Key header.
+    """
     access_token = _load_access_token(token_store)
     try:
         return await MainScreenService(service, AccountSnapshotStore(settings), journal_store).bootstrap(
@@ -519,7 +640,7 @@ async def main_selected_quote(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/main/option-chain")
+@dual_router.get("/main/option-chain")
 async def main_option_chain(
     expiry_date: str = Query(min_length=1),
     underlying_key: str = DEFAULT_UNDERLYING_KEY,
@@ -527,7 +648,12 @@ async def main_option_chain(
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
     """Return every strike's live CE/PE market data + option greeks (+ lot_size) for the
-    underlying + expiry."""
+    underlying + expiry.
+
+    On dual_router (require_mobile_or_web) -- backs the web client's Option Chain, GEX, and OI
+    screens (M1), all three of which poll this same endpoint and compute their own thing
+    client-side, mirroring Android's OptionChainViewModel/GexViewModel/OiViewModel.
+    """
     access_token = _load_access_token(token_store)
     try:
         return await MainScreenService(service).option_chain(
@@ -557,14 +683,18 @@ async def main_position_quotes(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/main/summary")
+@dual_router.get("/main/summary")
 async def main_summary(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
     journal_store: JournalStore = Depends(get_journal_store),
 ) -> dict[str, Any]:
-    """Return opening balance, current P&L, and closing balance."""
+    """Return opening balance, current P&L, and closing balance.
+
+    On dual_router (require_mobile_or_web) -- the web client's Analytics screen (M1) needs this
+    for its capital_base denominator.
+    """
     access_token = _load_access_token(token_store)
     try:
         return await MainScreenService(service, AccountSnapshotStore(settings), journal_store).summary(access_token)
@@ -755,7 +885,7 @@ async def authorize_market_feed(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/market/candles")
+@dual_router.get("/market/candles")
 async def market_candles(
     instrument_key: str = Query(min_length=1),
     unit: Literal["minutes", "hours", "days"] = "minutes",
@@ -766,7 +896,10 @@ async def market_candles(
     token_store: EncryptedTokenStore = Depends(get_token_store),
     candle_cache_store: Optional[CandleCacheStore] = Depends(get_candle_cache_store),
 ) -> dict[str, Any]:
-    """Return a normalized historical-plus-intraday candle series for the mobile chart."""
+    """Return a normalized historical-plus-intraday candle series for the mobile chart.
+
+    On dual_router (require_mobile_or_web) -- the web client's Chart screen (M4a) needs this.
+    """
     if from_date > to_date:
         raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "from_date must not be after to_date")
     if unit == "hours" and interval > 5:
@@ -794,7 +927,7 @@ async def market_candles(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/search/underlyings")
+@dual_router.get("/search/underlyings")
 async def search_underlyings(
     query: str = Query(default="", max_length=50),
     limit: int = Query(default=20, ge=1, le=30),
@@ -805,6 +938,10 @@ async def search_underlyings(
 ) -> dict[str, Any]:
     """Search option-capable index/equity underlyings, optionally also matching futures contracts
     (see SearchScreenService.search_underlyings' doc comment for why include_futures is opt-in).
+
+    On dual_router (require_mobile_or_web), not protected_router -- this is the web client's
+    Search screen (M1), so it must accept the browser's session cookie as well as Android's
+    X-API-Key header.
     """
     access_token = _load_access_token(token_store)
     try:
@@ -840,7 +977,7 @@ async def search_contracts(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/orders/history")
+@dual_router.get("/orders/history")
 async def order_history(
     scope: str = Query(default="today", pattern="^(today|all)$"),
     page_number: int = Query(default=1, ge=1),
@@ -851,7 +988,11 @@ async def order_history(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Return paginated order-history screen data."""
+    """Return paginated order-history screen data.
+
+    On dual_router (require_mobile_or_web) -- the web client's read-only Order History screen (M1)
+    needs this. Write actions (cancel/modify) stay on protected_router, Android-only.
+    """
     access_token = _load_access_token(token_store)
     order_service = OrderHistoryService(service)
     try:
@@ -944,7 +1085,7 @@ async def mark_notification_read(
     return {"updated": updated, "unread_count": store.unread_count()}
 
 
-@protected_router.get("/journal/trades")
+@dual_router.get("/journal/trades")
 def list_journal_trades(
     page_number: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
@@ -952,6 +1093,8 @@ def list_journal_trades(
     end_date: Optional[str] = None,
     store: JournalStore = Depends(get_journal_store),
 ) -> dict[str, Any]:
+    """On dual_router (require_mobile_or_web) -- the web client's read-only Journal screen (M1)
+    needs this. The PATCH/POST journal write routes stay on protected_router, Android-only."""
     trades, page = store.list_trades(
         page_number=page_number, page_size=page_size,
         start_date=start_date, end_date=end_date,
@@ -966,11 +1109,13 @@ def journal_filter_options(
     return store.filter_options()
 
 
-@protected_router.get("/journal/trades/{trade_id}")
+@dual_router.get("/journal/trades/{trade_id}")
 def get_journal_trade(
     trade_id: str,
     store: JournalStore = Depends(get_journal_store),
 ) -> dict[str, Any]:
+    """On dual_router (require_mobile_or_web) -- the web client's Journal detail view (M1) needs
+    this."""
     trade = store.get_trade(trade_id)
     if trade is None:
         raise _http_error(status.HTTP_404_NOT_FOUND, "Journal trade not found")
@@ -1006,13 +1151,15 @@ def create_manual_journal_trade(
         ) from exc
 
 
-@protected_router.get("/analytics/summary")
+@dual_router.get("/analytics/summary")
 def journal_analytics_summary(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     capital_base: Optional[float] = Query(default=None, gt=0),
     store: JournalStore = Depends(get_journal_store),
 ) -> dict[str, Any]:
+    """On dual_router (require_mobile_or_web) -- the web client's Analytics screen (M1) needs
+    this."""
     result = store.analytics_summary(start_date=start_date, end_date=end_date)
     result["net_pnl_percent"] = (
         result["net_pnl"] / capital_base * 100 if capital_base else None
@@ -1041,7 +1188,7 @@ async def register_device(
     return {"status": "success"}
 
 
-@protected_router.post("/orders/smart-bracket")
+@dual_router.post("/orders/smart-bracket")
 async def place_smart_bracket_order(
     order: SmartBracketOrderRequest,
     service: UpstoxService = Depends(get_upstox_service),
@@ -1050,7 +1197,13 @@ async def place_smart_bracket_order(
     snapshot_store: SignalSnapshotStore = Depends(get_signal_snapshot_store),
     oi_snapshot_store: OISnapshotStore = Depends(get_oi_snapshot_store),
 ) -> dict[str, Any]:
-    """Place a bracket-like order using Upstox multi-leg GTT."""
+    """Place a bracket-like order using Upstox multi-leg GTT.
+
+    On dual_router (require_mobile_or_web) -- M3's first write endpoint exposed to the web client.
+    Unlike every prior dual_router move (all read-only), this one places a real order; the web
+    client's own confirmation dialog (always shown, no Android-style skip-confirmation mode) is
+    the client-side safety gate, same posture Android's OrderConfirmationDialog already provides.
+    """
     access_token = _load_access_token(token_store)
     try:
         rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
@@ -1102,7 +1255,39 @@ async def place_smart_bracket_order(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/orders/gtt")
+@dual_router.post("/orders/suggested-quantity")
+def suggested_quantity(request: SuggestedQuantityRequest) -> dict[str, object]:
+    """Server-side port of QuantitySizing.kt's defaultQuantity -- read-only computation, no side
+    effects, safe on dual_router from the start (unlike smart-bracket, this never touches Upstox
+    or persists anything)."""
+    quantity = quantity_sizing.default_quantity(
+        held_quantity=request.held_quantity,
+        mode=request.mode,
+        available_capital=request.available_capital,
+        capital_allocation_percent=request.capital_allocation_percent,
+        buffer_amount=request.buffer_amount,
+        estimated_charges=request.estimated_charges,
+        entry_price=request.entry_price,
+        lot_size=request.lot_size,
+        default_lot_count=request.default_lot_count,
+        risk_per_trade_amount=request.risk_per_trade_amount,
+        risk_management_is_percent=request.risk_management_is_percent,
+        stop_loss_value=request.stop_loss_value,
+        atr_14_5m=request.atr_14_5m,
+        contract_delta=request.contract_delta,
+        contract_iv=request.contract_iv,
+        atr_stop_multiplier=request.atr_stop_multiplier,
+        iv_stop_multiplier=request.iv_stop_multiplier,
+        kelly_trade_count=request.kelly_trade_count,
+        kelly_win_rate=request.kelly_win_rate,
+        kelly_average_win=request.kelly_average_win,
+        kelly_average_loss=request.kelly_average_loss,
+        kelly_capital=request.kelly_capital,
+    )
+    return {"quantity": quantity}
+
+
+@dual_router.get("/orders/gtt")
 async def get_gtt_orders(
     instrument_key: Optional[str] = Query(None, min_length=1),
     include_history: bool = Query(False),
@@ -1113,6 +1298,8 @@ async def get_gtt_orders(
     Main screen's GTT Open Orders section; the filtered form lets the app find the bracket behind
     a position, or (with include_history=true) its historical bracket.
     See SmartOrderService.get_gtt_orders_for_instrument.
+
+    On dual_router (require_mobile_or_web) -- the web client's GTT screen (M3d) needs this.
     """
     access_token = _load_access_token(token_store)
     try:
@@ -1123,14 +1310,17 @@ async def get_gtt_orders(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.put("/orders/gtt/modify")
+@dual_router.put("/orders/gtt/modify")
 async def modify_gtt_order(
     order: ModifyGttOrderRequest,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    """Re-points an existing GTT bracket's target/stoploss. See SmartOrderService.modify_gtt_bracket."""
+    """Re-points an existing GTT bracket's target/stoploss. See SmartOrderService.modify_gtt_bracket.
+
+    On dual_router (require_mobile_or_web) -- M3's fourth write endpoint exposed to the web client.
+    """
     access_token = _load_access_token(token_store)
     try:
         rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
@@ -1155,13 +1345,16 @@ async def modify_gtt_order(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.delete("/orders/gtt/cancel")
+@dual_router.delete("/orders/gtt/cancel")
 async def cancel_gtt_order(
     order: CancelGttOrderRequest,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Cancels an untriggered GTT order and all associated rules."""
+    """Cancels an untriggered GTT order and all associated rules.
+
+    On dual_router (require_mobile_or_web) -- M3's fifth write endpoint exposed to the web client.
+    """
     access_token = _load_access_token(token_store)
     try:
         return await service.cancel_gtt_order(access_token, order.gtt_order_id)
@@ -1169,24 +1362,30 @@ async def cancel_gtt_order(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/settings/max-loss")
+@dual_router.get("/settings/max-loss")
 def get_max_loss_settings(
     store: MaxLossSettingsStore = Depends(get_max_loss_settings_store),
 ) -> dict[str, float]:
     """Current max-loss threshold the backend's own max_loss_watcher enforces -- lets the app
     reconcile its local Order Settings value against the server on load (e.g. the watcher may
-    have already fired and disarmed it while the app was closed)."""
+    have already fired and disarmed it while the app was closed).
+
+    On dual_router (require_mobile_or_web) -- the web client's Settings screen (M3e) reads this.
+    """
     return {"amount": store.load()}
 
 
-@protected_router.put("/settings/max-loss")
+@dual_router.put("/settings/max-loss")
 def set_max_loss_settings(
     request: MaxLossSettingsRequest,
     store: MaxLossSettingsStore = Depends(get_max_loss_settings_store),
 ) -> dict[str, float]:
     """Sets the max-loss threshold the backend's own max_loss_watcher enforces -- called whenever
     the user edits the amount in Order Settings, so the watcher stays in sync with whatever the
-    app itself is configured to protect against. `amount <= 0` disables it."""
+    app itself is configured to protect against. `amount <= 0` disables it.
+
+    On dual_router (require_mobile_or_web) -- M3's sixth write endpoint exposed to the web client.
+    """
     store.save(request.amount)
     return {"amount": request.amount}
 
@@ -1223,7 +1422,7 @@ async def exit_all_positions(
     return result
 
 
-@protected_router.post("/orders/exit-positions")
+@dual_router.post("/orders/exit-positions")
 async def exit_positions(
     request: ExitPositionsRequest,
     service: UpstoxService = Depends(get_upstox_service),
@@ -1236,6 +1435,11 @@ async def exit_positions(
     [ExitPositionsRequest.instrument_keys] (e.g. "close only profitable positions", computed
     client-side). See SmartOrderService.exit_positions and [exit_all_positions]'s own doc
     comment for why this shares the same lock.
+
+    On dual_router (require_mobile_or_web) -- M3's second write endpoint exposed to the web
+    client, after /orders/smart-bracket (M3a). /orders/exit-all stays on protected_router,
+    untouched -- the web client always calls this route with no instrument_keys for "close
+    everything," identical behavior, so there's no need to expose that one too.
     """
     access_token = _load_access_token(token_store)
     async with exit_all_lock:
@@ -1343,3 +1547,5 @@ def _upstox_http_error(exc: UpstoxApiError) -> HTTPException:
 router = APIRouter()
 router.include_router(public_router)
 router.include_router(protected_router)
+router.include_router(web_router)
+router.include_router(dual_router)
