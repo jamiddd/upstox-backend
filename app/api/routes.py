@@ -1122,12 +1122,14 @@ def get_journal_trade(
     return trade
 
 
-@protected_router.patch("/journal/trades/{trade_id}/notes")
+@dual_router.patch("/journal/trades/{trade_id}/notes")
 def update_journal_notes(
     trade_id: str,
     body: JournalNotesRequest,
     store: JournalStore = Depends(get_journal_store),
 ) -> dict[str, Any]:
+    """On dual_router (require_mobile_or_web) -- M5's seventh write endpoint exposed to the web
+    client (Journal screen trade-notes editing, M5a)."""
     trade = store.save_notes(trade_id, body.model_dump())
     if trade is None:
         raise _http_error(status.HTTP_404_NOT_FOUND, "Journal trade not found")

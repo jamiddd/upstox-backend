@@ -3962,3 +3962,110 @@ def test_market_candles_rejects_neither_api_key_nor_cookie() -> None:
         app.dependency_overrides.clear()
 
     assert response.status_code == 401
+
+
+# --- M5a: dual_router coverage for PATCH /journal/trades/{trade_id}/notes -- previously
+# untested (Android-only, zero prior test references to this route) ---
+
+
+def _seed_manual_trade(journal_store: JournalStore) -> str:
+    trade = journal_store.create_manual_trade({
+        "instrument_key": "NSE_FO|111", "trading_symbol": "NIFTY26JUL25000CE",
+        "trade_date": "2026-07-17", "direction": "long", "quantity": 75,
+        "entry_price": 120.0, "exit_price": 130.0,
+        "opened_at": "2026-07-17T04:00:00+00:00", "closed_at": "2026-07-17T05:00:00+00:00",
+        "gross_pnl": 750.0,
+    })
+    return trade["id"]
+
+
+def test_update_journal_notes_sets_fields_on_an_existing_trade(tmp_path: Path) -> None:
+    settings = replace(_settings(), journal_database_path=tmp_path / "journal.sqlite3")
+    journal_store = JournalStore(settings)
+    trade_id = _seed_manual_trade(journal_store)
+
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        response = client.patch(
+            f"/api/journal/trades/{trade_id}/notes",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "setup": "Breakout", "entry_reason": "Momentum", "exit_reason": "Target hit",
+                "plan": "Scale out at target", "mistakes": "Entered late",
+                "lessons": "Wait for confirmation", "notes": "Good trade overall",
+                "tags": ["breakout", "momentum"], "reviewed": True,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["setup"] == "Breakout"
+    assert body["tags"] == ["breakout", "momentum"]
+    assert body["reviewed"] is True
+    assert body["notes"] == "Good trade overall"
+
+
+def test_update_journal_notes_404s_on_a_nonexistent_trade(tmp_path: Path) -> None:
+    settings = replace(_settings(), journal_database_path=tmp_path / "journal.sqlite3")
+    journal_store = JournalStore(settings)
+
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        response = client.patch(
+            "/api/journal/trades/does-not-exist/notes",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"tags": [], "reviewed": False},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+
+
+def test_update_journal_notes_accepts_web_session_cookie(tmp_path: Path) -> None:
+    settings = replace(
+        _settings(), web_session_secret="test-web-secret",
+        journal_database_path=tmp_path / "journal.sqlite3",
+    )
+    journal_store = JournalStore(settings)
+    trade_id = _seed_manual_trade(journal_store)
+
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        client.cookies.set(WEB_SESSION_COOKIE_NAME, create_session_token(settings))
+        response = client.patch(
+            f"/api/journal/trades/{trade_id}/notes",
+            json={"tags": ["cookie-auth"], "reviewed": True},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["tags"] == ["cookie-auth"]
+
+
+def test_update_journal_notes_rejects_neither_api_key_nor_cookie(tmp_path: Path) -> None:
+    settings = replace(_settings(), journal_database_path=tmp_path / "journal.sqlite3")
+    journal_store = JournalStore(settings)
+    trade_id = _seed_manual_trade(journal_store)
+
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        response = client.patch(
+            f"/api/journal/trades/{trade_id}/notes",
+            json={"tags": [], "reviewed": False},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
