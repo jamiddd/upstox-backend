@@ -681,12 +681,15 @@ Untracked underlyings are entirely unaffected -- polling them from the app still
 before (no delta on the first poll, needs 5 live minutes), this feature only removes that
 cold-start wait for whichever instruments are explicitly opted in.
 
-`GET /api/main/underlying-signals/history` returns the stored rows newest-first and needs only the
-mobile API key, not a currently valid Upstox token. `underlying_key` is required; `expiry_date` is
-optional, and `limit` defaults to 200 (maximum 1000). Each row contains its trading date, UTC slot
-and observation timestamps, ATR, VWAP distance, crucial-level distance, PCR, support/resistance
-strikes and both-side OI values, and ATM straddle. Dated rows are deleted overnight after their
-expiry day, matching the raw OI retention policy.
+`GET /api/main/underlying-signals/history` returns the stored rows newest-first and needs no
+currently valid Upstox token -- on dual_router (`require_mobile_or_web`), so either the mobile API
+key or the web client's session cookie works, same as `/main/bootstrap`/`/main/option-chain`. It's
+the web client's Straddle screen's only data source (the ATM-straddle history line chart).
+`underlying_key` is required; `expiry_date` is optional, and `limit` defaults to 200 (maximum
+1000). Each row contains its trading date, UTC slot and observation timestamps, ATR, VWAP
+distance, crucial-level distance, PCR, support/resistance strikes and both-side OI values, and ATM
+straddle. Dated rows are deleted overnight after their expiry day, matching the raw OI retention
+policy.
 
 ## USD/INR (non-Upstox)
 

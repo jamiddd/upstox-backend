@@ -741,14 +741,20 @@ async def main_underlying_signals(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/main/underlying-signals/history")
+@dual_router.get("/main/underlying-signals/history")
 async def main_underlying_signals_history(
     underlying_key: str = Query(min_length=1),
     expiry_date: Optional[str] = None,
     limit: int = Query(default=200, ge=1, le=1000),
     snapshot_store: SignalSnapshotStore = Depends(get_signal_snapshot_store),
 ) -> dict[str, Any]:
-    """Return durable five-minute signal metrics without requiring a live Upstox token."""
+    """Return durable five-minute signal metrics without requiring a live Upstox token.
+
+    On dual_router (require_mobile_or_web), not protected_router -- the web client's Straddle
+    screen needs this (it's the only data source for the ATM-straddle history line chart; unlike
+    most other web-client routes this needs no live Upstox token at all, just the stored
+    snapshots, so there's no server-side reason to keep it mobile-only).
+    """
     return {
         "underlying_key": underlying_key,
         "expiry_date": expiry_date,
