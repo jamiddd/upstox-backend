@@ -62,6 +62,7 @@ class FeedTick:
     total_bid_quantity: Optional[int] = None
     total_ask_quantity: Optional[int] = None
     one_minute_candle: Optional[FeedCandle] = None
+    close_price: Optional[float] = None
 
 
 def decode_feed_response(data: bytes) -> list[FeedTick]:
@@ -85,6 +86,7 @@ def decode_feed_response(data: bytes) -> list[FeedTick]:
                     instrument_key=instrument_key,
                     ltp=feed.ltpc.ltp,
                     last_trade_time_millis=feed.ltpc.ltt,
+                    close_price=feed.ltpc.cp,
                 ),
             )
         elif union == "fullFeed":
@@ -121,6 +123,7 @@ def _decode_full_feed(instrument_key: str, full_feed: Any) -> Optional[FeedTick]
             total_bid_quantity=int(market_full_feed.tbq),
             total_ask_quantity=int(market_full_feed.tsq),
             one_minute_candle=_one_minute_candle(market_full_feed.marketOHLC.ohlc),
+            close_price=market_full_feed.ltpc.cp,
         )
     if union == "indexFF":
         # Indices (e.g. NIFTY 50) have no bid/ask -- they aren't directly tradeable.
@@ -130,6 +133,7 @@ def _decode_full_feed(instrument_key: str, full_feed: Any) -> Optional[FeedTick]
             ltp=index_full_feed.ltpc.ltp,
             last_trade_time_millis=index_full_feed.ltpc.ltt,
             one_minute_candle=_one_minute_candle(index_full_feed.marketOHLC.ohlc),
+            close_price=index_full_feed.ltpc.cp,
         )
     return None
 

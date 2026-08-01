@@ -291,6 +291,7 @@ class StreamConnectionManager:
                 "data": {
                     "instrument_key": tick.instrument_key,
                     "ltp": tick.ltp,
+                    "close_price": tick.close_price,
                     "last_trade_time_millis": tick.last_trade_time_millis,
                     "bid_price": tick.bid_price,
                     "ask_price": tick.ask_price,

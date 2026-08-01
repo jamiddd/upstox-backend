@@ -57,18 +57,20 @@ def _client() -> tuple[UpstoxMarketFeedClient, _FakeUnderlyingClient]:
 
 
 def test_decodes_ltpc_only_tick() -> None:
-    ltpc = pb.LTPC(ltp=125.5)
+    ltpc = pb.LTPC(ltp=125.5, cp=120.0)
     feed = pb.Feed(ltpc=ltpc)
     response = pb.FeedResponse()
     response.feeds["NSE_FO|111"].CopyFrom(feed)
 
     ticks = decode_feed_response(response.SerializeToString())
 
-    assert ticks == [FeedTick(instrument_key="NSE_FO|111", ltp=125.5, last_trade_time_millis=0)]
+    assert ticks == [
+        FeedTick(instrument_key="NSE_FO|111", ltp=125.5, last_trade_time_millis=0, close_price=120.0),
+    ]
 
 
 def test_decodes_full_mode_market_contract_with_bid_ask_and_candle() -> None:
-    ltpc = pb.LTPC(ltp=125.0)
+    ltpc = pb.LTPC(ltp=125.0, cp=122.0)
     ohlc = pb.OHLC(interval="I1", ts=1_721_873_700_000, open=124.0, high=126.0, low=123.5, close=125.0, vol=900)
     market_ohlc = pb.MarketOHLC(ohlc=[ohlc])
     quotes = [
@@ -94,6 +96,7 @@ def test_decodes_full_mode_market_contract_with_bid_ask_and_candle() -> None:
     tick = ticks[0]
     assert tick.instrument_key == "NSE_FO|222"
     assert tick.ltp == 125.0
+    assert tick.close_price == 122.0
     assert tick.bid_price == 124.5
     assert tick.ask_price == 125.5
     assert tick.market_depth == (
@@ -108,7 +111,7 @@ def test_decodes_full_mode_market_contract_with_bid_ask_and_candle() -> None:
 
 
 def test_decodes_index_full_feed_with_no_bid_ask() -> None:
-    ltpc = pb.LTPC(ltp=25_050.0)
+    ltpc = pb.LTPC(ltp=25_050.0, cp=24_900.0)
     index_full_feed = pb.IndexFullFeed(ltpc=ltpc)
     full_feed = pb.FullFeed(indexFF=index_full_feed)
     feed = pb.Feed(fullFeed=full_feed)
@@ -119,6 +122,7 @@ def test_decodes_index_full_feed_with_no_bid_ask() -> None:
 
     assert len(ticks) == 1
     assert ticks[0].ltp == 25_050.0
+    assert ticks[0].close_price == 24_900.0
     assert ticks[0].bid_price is None
     assert ticks[0].ask_price is None
 
