@@ -686,13 +686,16 @@ async def main_option_chain(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.get("/main/position-quotes")
+@dual_router.get("/main/position-quotes")
 async def main_position_quotes(
     instrument_keys: str = Query(default=""),
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Return LTP snapshots for open positions tracked by the app."""
+    """Return LTP snapshots for open positions tracked by the app. On dual_router
+    (require_mobile_or_web) -- the web client's TickerBar (M5c-equivalent) needs this to hydrate
+    an instant snapshot on mount instead of waiting for each instrument's next live WS tick,
+    same reasoning Android's own toolbar ticker poll already relies on this endpoint for."""
     access_token = _load_access_token(token_store)
     keys = [key.strip() for key in instrument_keys.split(",") if key.strip()]
     try:
