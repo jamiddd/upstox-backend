@@ -15,6 +15,10 @@ class TrackedInstrumentsStoreError(RuntimeError):
     """Raised when the tracked-instruments store cannot be used."""
 
 
+class WatchlistStoreError(RuntimeError):
+    """Raised when the watchlist store cannot be used."""
+
+
 class UpstoxAuthRequiredError(RuntimeError):
     """Raised when an Upstox-backed route is called before login."""
 

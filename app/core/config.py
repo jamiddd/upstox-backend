@@ -33,6 +33,7 @@ class Settings:
     upstox_totp_secret: str = ""
     upstox_totp_pin: str = ""
     tracked_instruments_path: Path = Path("/data/tracked_instruments.json")
+    watchlist_path: Path = Path("/data/watchlist.json")
     account_snapshot_path: Path = Path("/data/account_snapshot.json")
     auto_login_state_path: Path = Path("/data/auto_login_state.json")
     oi_database_path: Path = Path("/data/oi_snapshots.sqlite3")
@@ -89,6 +90,9 @@ class Settings:
             token_store_path=Path(os.getenv("TOKEN_STORE_PATH", "/data/upstox_token.enc")),
             tracked_instruments_path=Path(
                 os.getenv("TRACKED_INSTRUMENTS_PATH", "/data/tracked_instruments.json"),
+            ),
+            watchlist_path=Path(
+                os.getenv("WATCHLIST_PATH", "/data/watchlist.json"),
             ),
             account_snapshot_path=Path(
                 os.getenv("ACCOUNT_SNAPSHOT_PATH", "/data/account_snapshot.json"),

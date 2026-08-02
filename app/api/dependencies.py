@@ -18,6 +18,7 @@ from app.services.token_store import EncryptedTokenStore
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_service import UpstoxService
 from app.services.usd_inr_service import UsdInrService
+from app.services.watchlist_store import WatchlistStore
 
 
 def get_token_store(settings: Settings = Depends(get_settings)) -> EncryptedTokenStore:
@@ -34,6 +35,11 @@ def get_token_store(settings: Settings = Depends(get_settings)) -> EncryptedToke
 def get_tracked_instruments_store(settings: Settings = Depends(get_settings)) -> TrackedInstrumentsStore:
     """Create the tracked-instruments store for the current request."""
     return TrackedInstrumentsStore(settings)
+
+
+def get_watchlist_store(settings: Settings = Depends(get_settings)) -> WatchlistStore:
+    """Create the watchlist store for the current request."""
+    return WatchlistStore(settings)
 
 
 def get_signal_snapshot_store(settings: Settings = Depends(get_settings)) -> SignalSnapshotStore:

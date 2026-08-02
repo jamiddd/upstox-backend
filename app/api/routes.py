@@ -25,6 +25,7 @@ from app.api.dependencies import (
     get_tracked_instruments_store,
     get_upstox_service,
     get_usd_inr_service,
+    get_watchlist_store,
 )
 from app.core.config import Settings, get_settings
 from app.core.exceptions import (
@@ -34,6 +35,7 @@ from app.core.exceptions import (
     UpstoxApiError,
     UpstoxAuthRequiredError,
     UpstoxAutoLoginError,
+    WatchlistStoreError,
 )
 from app.services.token_store import EncryptedTokenStore
 from app.services.candle_service import CandleService
@@ -45,6 +47,7 @@ from app.core.web_session import (
 )
 from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_service import UpstoxService
+from app.services.watchlist_store import WatchlistStore
 from app.core.security import require_mobile_api_key, require_mobile_or_web, require_web_session
 from app.services.instrument_rules_service import (
     InstrumentRulesService,
@@ -166,6 +169,24 @@ class TrackedInstrumentsRequest(BaseModel):
     """
 
     underlying_keys: list[str] = Field(default_factory=list)
+
+
+class WatchlistInstrumentModel(BaseModel):
+    """One entry in a watchlist -- see WatchlistRequest/WatchlistStore."""
+
+    instrument_key: str
+    symbol: str
+    lot_size: Optional[float] = None
+    is_underlying: bool = False
+
+
+class WatchlistRequest(BaseModel):
+    """Replaces the whole persisted watchlist for one list_id ("india" or "global") -- see
+    WatchlistStore. Always the client's full current list, not an incremental add/remove, same
+    contract as TrackedInstrumentsRequest.
+    """
+
+    items: list[WatchlistInstrumentModel] = Field(default_factory=list)
 
 
 class ExitPositionsRequest(BaseModel):
@@ -876,6 +897,36 @@ async def set_tracked_instruments(
             detail={"status": "error", "message": str(exc)},
         ) from exc
     return {"underlying_keys": store.load()}
+
+
+@dual_router.get("/user/watchlist/{list_id}")
+async def get_watchlist(
+    list_id: Literal["india", "global"],
+    store: WatchlistStore = Depends(get_watchlist_store),
+) -> dict[str, Any]:
+    """Return the persisted watchlist ("india" or "global") -- shared by both Android's Main
+    screen ticker and the web client's TickerBar/WatchlistScreen. On dual_router
+    (require_mobile_or_web) since both clients need this."""
+    return {"items": store.load(list_id)}
+
+
+@dual_router.put("/user/watchlist/{list_id}")
+async def set_watchlist(
+    list_id: Literal["india", "global"],
+    body: WatchlistRequest,
+    store: WatchlistStore = Depends(get_watchlist_store),
+) -> dict[str, Any]:
+    """Replace the whole persisted watchlist for list_id -- see WatchlistRequest. Both Android
+    and the web client push their full current list here right after every local add/remove/
+    reorder; last write wins, same posture as /user/tracked-instruments."""
+    try:
+        store.save(list_id, [item.model_dump() for item in body.items])
+    except WatchlistStoreError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"status": "error", "message": str(exc)},
+        ) from exc
+    return {"items": store.load(list_id)}
 
 
 @protected_router.get("/market/feed/authorize")
