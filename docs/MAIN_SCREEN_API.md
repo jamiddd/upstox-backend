@@ -144,6 +144,7 @@ this chart's contract multiplier always matches what the app actually trades aga
       "ce": {
         "instrument_key": "NSE_FO|111",
         "ltp": 125.0,
+        "close_price": 118.0,
         "bid_price": 124.5,
         "ask_price": 125.5,
         "bid_qty": 300.0,
@@ -160,6 +161,7 @@ this chart's contract multiplier always matches what the app actually trades aga
       "pe": {
         "instrument_key": "NSE_FO|222",
         "ltp": 90.0,
+        "close_price": 95.0,
         "bid_price": 89.5,
         "ask_price": 90.5,
         "bid_qty": 200.0,
@@ -180,6 +182,12 @@ this chart's contract multiplier always matches what the app actually trades aga
 
 A strike missing a listed CE or PE contract simply omits that key (e.g. deep ITM/OTM strikes
 sometimes only have one side listed).
+
+`close_price` is that contract's previous session's close (Upstox's own `market_data.close_price`)
+-- the baseline the app's option chain screen diffs `ltp` against to show a %-change per leg, the
+same way `prev_oi` is the baseline for %-change-in-OI. Both default to `0.0` (never omitted) when
+Upstox doesn't have a prior value for a contract (e.g. freshly listed), which the client treats as
+"no baseline available" rather than a real zero.
 
 ## OI Analysis
 

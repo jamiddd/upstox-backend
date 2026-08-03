@@ -1482,6 +1482,7 @@ def test_main_option_chain_returns_live_market_data_and_greeks_per_strike() -> N
                 "ce": {
                     "instrument_key": "NSE_FO|111",
                     "ltp": 125.0,
+                    "close_price": 118.0,
                     "bid_price": 124.5,
                     "ask_price": 125.5,
                     "bid_qty": 300.0,
@@ -1498,6 +1499,7 @@ def test_main_option_chain_returns_live_market_data_and_greeks_per_strike() -> N
                 "pe": {
                     "instrument_key": "NSE_FO|222",
                     "ltp": 90.0,
+                    "close_price": 95.0,
                     "bid_price": 89.5,
                     "ask_price": 90.5,
                     "bid_qty": 200.0,
@@ -1517,6 +1519,7 @@ def test_main_option_chain_returns_live_market_data_and_greeks_per_strike() -> N
                 "ce": {
                     "instrument_key": "NSE_FO|333",
                     "ltp": 80.0,
+                    "close_price": 76.0,
                     "bid_price": 79.0,
                     "ask_price": 81.5,
                     "bid_qty": 150.0,

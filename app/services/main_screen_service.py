@@ -737,6 +737,7 @@ def _option_side(side: Any) -> Optional[dict[str, Any]]:
     return {
         "instrument_key": _string_value(side, "instrument_key"),
         "ltp": _number_value(market_data, "ltp"),
+        "close_price": _number_value(market_data, "close_price"),
         "bid_price": _number_value(market_data, "bid_price"),
         "ask_price": _number_value(market_data, "ask_price"),
         "bid_qty": _number_value(market_data, "bid_qty"),
