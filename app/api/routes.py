@@ -494,7 +494,7 @@ async def market_usd_inr(service: UsdInrService = Depends(get_usd_inr_service)) 
     }
 
 
-@protected_router.get("/market/oi-analysis")
+@dual_router.get("/market/oi-analysis")
 async def get_oi_analysis(
     expiry: str = Query(min_length=1),
     analysis_date: date = Query(alias="date"),
@@ -504,7 +504,12 @@ async def get_oi_analysis(
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
 ) -> dict[str, Any]:
-    """Return OI, change in OI, max pain, and PCR analysis in one response."""
+    """Return OI, change in OI, max pain, and PCR analysis in one response.
+
+    On dual_router (require_mobile_or_web) -- backs the web client's Option Chain screen summary
+    row (total Call/Put OI, PCR); was Android-only (protected_router) which left that row on the
+    web client permanently unpopulated since the browser can't set the X-API-Key header.
+    """
     access_token = _load_access_token(token_store)
     try:
         return await OIAnalysisService(service).get_analysis(
