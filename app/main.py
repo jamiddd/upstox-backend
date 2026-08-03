@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any, Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -250,6 +251,16 @@ class _MarketFeedStalenessNotifier:
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+
+    # Shared, connection-pooled client for every outbound Upstox REST call -- UpstoxService falls
+    # back to a fresh `httpx.AsyncClient` per request when none is given (see its own `_request`),
+    # which means a brand new TLS handshake for every single call. That's the dominant cost behind
+    # slow/hanging chart loads under the 3-pane layout: each pane's candles+futures-search chain is
+    # several sequential Upstox calls, times 3 panes loading together, times a fresh handshake each
+    # -- this one pooled client removes that multiplier for every route built on
+    # `get_upstox_service` (see dependencies.py).
+    upstox_http_client = httpx.AsyncClient(timeout=15.0)
+    app.state.upstox_http_client = upstox_http_client
     # Constructed without a stream_manager up front -- one doesn't exist yet (it needs the feed
     # subscription manager, which needs the market feed client, which itself wants this same
     # notification_service for its own state-change notifications). Patched onto this instance
@@ -285,7 +296,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # market ticks rather than a REST-polling timer. Dedicated token store/UpstoxService instances,
     # same posture as market_feed_token_store/portfolio_feed_token_store below.
     max_loss_token_store = EncryptedTokenStore(settings)
-    max_loss_upstox = UpstoxService(settings)
+    max_loss_upstox = UpstoxService(settings, client=upstox_http_client)
     position_tracker = PositionPnlTracker(max_loss_upstox, max_loss_token_store)
     max_loss_settings_store = MaxLossSettingsStore(settings)
     max_loss_smart_order_service = SmartOrderService(max_loss_upstox)
@@ -328,7 +339,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     order_flow_service = OrderFlowService()
     journal_store = JournalStore(settings)
     trade_context_token_store = EncryptedTokenStore(settings)
-    trade_context_upstox = UpstoxService(settings)
+    trade_context_upstox = UpstoxService(settings, client=upstox_http_client)
     trade_context_service = TradeContextService(
         store=journal_store,
         upstox=trade_context_upstox,
@@ -352,7 +363,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     market_feed_token_store = EncryptedTokenStore(settings)
-    market_feed_upstox = UpstoxService(settings)
+    market_feed_upstox = UpstoxService(settings, client=upstox_http_client)
     market_feed_client = UpstoxMarketFeedClient(
         upstox=market_feed_upstox,
         token_store=market_feed_token_store,
@@ -363,7 +374,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         on_state_change=market_feed_notifier.handle,
     )
     portfolio_feed_token_store = EncryptedTokenStore(settings)
-    portfolio_feed_upstox = UpstoxService(settings)
+    portfolio_feed_upstox = UpstoxService(settings, client=upstox_http_client)
     portfolio_feed_client = UpstoxPortfolioFeedClient(
         upstox=portfolio_feed_upstox,
         token_store=portfolio_feed_token_store,
@@ -498,6 +509,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await journal_reconciler_task
         await market_feed_client.stop()
         await portfolio_feed_client.stop()
+        await upstox_http_client.aclose()
 
 
 async def _run_subscription_refresh(subscription_manager: FeedSubscriptionManager) -> None:

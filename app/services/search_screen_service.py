@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import monotonic
@@ -243,15 +244,24 @@ class SearchScreenService:
                 # the expiry cycle "today" falls.
                 futures_candidates: list[dict[str, Any]] = []
                 futures_seen: set[str] = set()
-                for expiry_window in ("current_month", "next_month"):
-                    futures_payload = await self.upstox.search_instruments(
-                        access_token,
-                        query=normalized_query,
-                        instrument_types="FUT",
-                        expiry=expiry_window,
-                        page_number=1,
-                        records=remaining,
-                    )
+                # current_month and next_month are independent Upstox requests -- fired
+                # concurrently rather than one after another, then merged in the same
+                # current-month-first order the sequential loop used to (so the sort/dedup below
+                # sees an identical result regardless of how the two payloads arrived).
+                futures_payloads = await asyncio.gather(
+                    *(
+                        self.upstox.search_instruments(
+                            access_token,
+                            query=normalized_query,
+                            instrument_types="FUT",
+                            expiry=expiry_window,
+                            page_number=1,
+                            records=remaining,
+                        )
+                        for expiry_window in ("current_month", "next_month")
+                    ),
+                )
+                for futures_payload in futures_payloads:
                     for item in _shape_futures(futures_payload, limit=remaining):
                         if item["instrument_key"] in futures_seen:
                             continue

@@ -57,9 +57,13 @@ def get_candle_cache_store(settings: Settings = Depends(get_settings)) -> Candle
     return CandleCacheStore(settings)
 
 
-def get_upstox_service(settings: Settings = Depends(get_settings)) -> UpstoxService:
-    """Create the Upstox REST service for the current request."""
-    return UpstoxService(settings)
+def get_upstox_service(request: Request, settings: Settings = Depends(get_settings)) -> UpstoxService:
+    """Create the Upstox REST service for the current request, backed by the app-wide
+    connection-pooled client (see `_lifespan`'s `upstox_http_client`) rather than a fresh
+    `httpx.AsyncClient` per call -- without it, every outbound Upstox request pays a fresh TLS
+    handshake, which compounds badly under concurrent load (e.g. 3 chart panes each firing several
+    sequential Upstox calls at once)."""
+    return UpstoxService(settings, client=request.app.state.upstox_http_client)
 
 
 def get_usd_inr_service() -> UsdInrService:

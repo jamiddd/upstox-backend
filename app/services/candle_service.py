@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -8,6 +9,13 @@ from app.services.upstox_service import UpstoxService
 from app.services.candle_cache_store import CandleCacheStore
 
 _IST = ZoneInfo("Asia/Kolkata")
+
+
+async def _no_candles() -> dict[str, Any]:
+    """Placeholder awaitable for `asyncio.gather` when a caller doesn't need one of the two
+    branches (e.g. `to_date` is entirely in the past, so there's no intraday leg) -- its result is
+    never read (see the `needs_historical`/`needs_intraday` guards around each branch below)."""
+    return {}
 
 
 class CandleService:
@@ -54,8 +62,15 @@ class CandleService:
             rows_by_timestamp.update({row["timestamp"]: row for row in cached})
 
         historical_to = min(to_date, yesterday)
-        if from_date <= historical_to:
-            historical = await self.upstox.get_historical_candle(
+        needs_historical = from_date <= historical_to
+        needs_intraday = from_date <= today <= to_date
+
+        # Independent Upstox endpoints (completed sessions vs. the still-forming one) -- fired
+        # concurrently instead of sequentially, since a chart's full load previously paid two
+        # chained round-trips back to back for no reason (and this compounds badly when several
+        # charts load at once, e.g. the 3-pane layout).
+        historical, intraday = await asyncio.gather(
+            self.upstox.get_historical_candle(
                 access_token,
                 instrument_key,
                 unit=unit,
@@ -63,6 +78,19 @@ class CandleService:
                 to_date=historical_to.isoformat(),
                 from_date=from_date.isoformat(),
             )
+            if needs_historical
+            else _no_candles(),
+            self.upstox.get_intraday_candle(
+                access_token,
+                instrument_key,
+                unit=unit,
+                interval=str(interval),
+            )
+            if needs_intraday
+            else _no_candles(),
+        )
+
+        if needs_historical:
             normalized_historical = _normalize_candles(historical)
             rows_by_timestamp.update(normalized_historical)
             if self.cache_store is not None:
@@ -70,13 +98,7 @@ class CandleService:
                     instrument_key, unit, interval, list(normalized_historical.values()),
                 )
 
-        if from_date <= today <= to_date:
-            intraday = await self.upstox.get_intraday_candle(
-                access_token,
-                instrument_key,
-                unit=unit,
-                interval=str(interval),
-            )
+        if needs_intraday:
             normalized_intraday = _normalize_candles(intraday)
             rows_by_timestamp.update(normalized_intraday)
             if self.cache_store is not None:
