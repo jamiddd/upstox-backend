@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any, Optional
@@ -611,7 +611,9 @@ def _on_market_tick(
     order_flow_service: OrderFlowService,
     tick: FeedTick,
 ) -> None:
-    candle_builder.handle_tick(tick)
+    live_candle = candle_builder.handle_tick(tick)
+    if live_candle is not None:
+        tick = replace(tick, one_minute_candle=live_candle)
     asyncio.create_task(stream_manager.dispatch_tick(tick))
 
     order_flow_snapshot = order_flow_service.handle_tick(tick)
