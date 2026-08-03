@@ -183,6 +183,14 @@ class SmartOrderService:
         `_split_quantity`/`slice_quantity_for_freeze` machinery place_bracket_order uses) -- this
         backs the max-loss safety trigger, so a position sized over freeze quantity must not
         silently fail to flatten just because it was submitted as one oversized order.
+
+        A position opened via place_bracket_order carries its target/stoploss as a separate GTT
+        order that Upstox tracks independently of the position itself -- this flattening market
+        order doesn't touch it. Left alone, that GTT stays armed against an instrument this account
+        no longer holds a position in, and could still fire later (a stray, unintended order, not
+        just a client display artifact -- the web client was found showing a closed position's
+        stale TARGET/STOP lines because of exactly this). So once a position's flatten succeeds,
+        its still-active bracket GTT(s) are cancelled too, best-effort (see _cancel_stray_gtts).
         """
         positions_payload = await self.upstox.get_positions(access_token)
         data = positions_payload.get("data")
@@ -287,6 +295,12 @@ class SmartOrderService:
             if not positions_to_attempt:
                 break
 
+        flattened_keys = [
+            key for key, result in result_by_key.items() if result.get("status") == "success"
+        ]
+        if flattened_keys:
+            await self._cancel_stray_gtts(access_token, flattened_keys)
+
         return {
             "status": "success",
             "positions_found": len(open_positions),
@@ -295,6 +309,31 @@ class SmartOrderService:
                 for position in open_positions
             ],
         }
+
+    async def _cancel_stray_gtts(self, access_token: str, instrument_keys: list[str]) -> None:
+        """Cancels every still-active bracket GTT for each just-flattened instrument.
+
+        Best-effort and non-fatal by design -- exit_positions' own job (getting the position to
+        flat) already succeeded by the time this runs; a stray GTT that fails to cancel here is a
+        follow-up cleanup concern, not a reason to report the exit itself as failed. Runs one
+        instrument at a time (not concurrently) since it's already piggybacking on a manual
+        close/max-loss-trigger, not a latency-sensitive path.
+        """
+        for instrument_key in instrument_keys:
+            try:
+                orders = await self.get_gtt_orders_for_instrument(
+                    access_token, instrument_key=instrument_key
+                )
+            except UpstoxApiError:
+                continue
+            for order in orders:
+                gtt_order_id = order.get("gtt_order_id")
+                if not isinstance(gtt_order_id, str) or not gtt_order_id:
+                    continue
+                try:
+                    await self.upstox.cancel_gtt_order(access_token, gtt_order_id)
+                except UpstoxApiError:
+                    continue
 
 
 # Terminal GTT statuses -- anything else (e.g. a still-pending/triggered rule) is treated as

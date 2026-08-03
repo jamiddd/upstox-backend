@@ -2998,6 +2998,43 @@ def test_exit_all_positions_flattens_every_open_position() -> None:
     assert results_by_key["NSE_FO|222"]["status"] == "error"
 
 
+class _ExitAllTrackingCancelUpstoxService(_ExitAllFakeUpstoxService):
+    """Same fixture as _ExitAllFakeUpstoxService (inherits FakeUpstoxService.get_gtt_orders'
+    GTT-111 active-for-NSE_FO|111/GTT-other active-for-NSE_FO|222 fixture unchanged), just
+    recording every cancel_gtt_order call so a test can assert exactly which GTTs got cancelled."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled_gtt_order_ids: list[str] = []
+
+    async def cancel_gtt_order(self, access_token: str, gtt_order_id: str) -> dict[str, Any]:
+        self.cancelled_gtt_order_ids.append(gtt_order_id)
+        return await super().cancel_gtt_order(access_token, gtt_order_id)
+
+
+def test_exit_all_positions_cancels_the_flattened_positions_own_bracket_gtt() -> None:
+    """A position's target/stoploss lives in a separate GTT order Upstox tracks independently of
+    the position -- left alone after a manual flatten, it stays armed against an instrument this
+    account no longer holds, and can still fire later. NSE_FO|111's exit succeeds (GTT-111, its
+    only active bracket per FakeUpstoxService.get_gtt_orders, must be cancelled); NSE_FO|222's
+    exit fails (GTT-other must be left alone, since the position it belongs to was never
+    actually flattened)."""
+    _set_exit_positions_instrument_rules_cache()
+    tracker = _ExitAllTrackingCancelUpstoxService()
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_upstox_service] = lambda: tracker
+    app.dependency_overrides[get_token_store] = lambda: FakeTokenStore(token="stored-token")
+    app.dependency_overrides[get_notification_service] = FakeNotificationService
+    client = TestClient(app)
+    try:
+        response = client.post("/api/orders/exit-all", headers={"X-API-Key": "mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert tracker.cancelled_gtt_order_ids == ["GTT-111"]
+
+
 def test_exit_positions_closes_every_open_position_when_unfiltered() -> None:
     """Omitting instrument_keys behaves identically to /orders/exit-all."""
     _set_exit_positions_instrument_rules_cache()
