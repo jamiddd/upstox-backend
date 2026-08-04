@@ -84,10 +84,34 @@ class SmartOrderService:
             "slices": placed_slices,
         }
 
-    async def get_gtt_orders_for_instrument(
-        self, access_token: str, *, instrument_key: str | None = None, include_history: bool = False
+    async def get_all_gtt_orders(self, access_token: str) -> list[dict[str, Any]]:
+        """Every GTT order Upstox currently reports, status-normalized, with no instrument or
+        status filtering applied.
+
+        This is the unfiltered feed a durable local archive (see GttHistoryStore) needs to stay
+        accurate -- get_gtt_orders_for_instrument's default view deliberately drops terminal
+        statuses (cancelled/rejected/completed), so an archive built only from its output would
+        never observe an order's transition into one of those and would keep serving its last
+        pre-transition status forever.
+        """
+        payload = await self.upstox.get_gtt_orders(access_token)
+        data = payload.get("data")
+        orders = data if isinstance(data, list) else []
+        return [
+            {**order, "status": _gtt_order_status(order)}
+            for order in orders
+            if isinstance(order, dict)
+        ]
+
+    @staticmethod
+    def filter_gtt_orders(
+        normalized_orders: list[dict[str, Any]],
+        *,
+        instrument_key: str | None = None,
+        include_history: bool = False,
     ) -> list[dict[str, Any]]:
-        """GTT orders, optionally filtered to one instrument.
+        """Narrow an already-normalized order list (see get_all_gtt_orders) to one instrument
+        and/or a status view.
 
         By default, "active" only -- excludes terminal statuses (cancelled/rejected/completed);
         anything else is treated as still-live so an unfamiliar status fails open rather than
@@ -99,21 +123,24 @@ class SmartOrderService:
         was active for a now-closed position, by matching a specific order's fill time against
         each returned GTT's own `created_at`.
         """
-        payload = await self.upstox.get_gtt_orders(access_token)
-        data = payload.get("data")
-        orders = data if isinstance(data, list) else []
         excluded_statuses = _TERMINAL_GTT_STATUSES if not include_history else _NEVER_FIRED_GTT_STATUSES
-        normalized_orders = [
-            {**order, "status": _gtt_order_status(order)}
-            for order in orders
-            if isinstance(order, dict)
-        ]
         return [
             order
             for order in normalized_orders
             if (instrument_key is None or order.get("instrument_token") == instrument_key)
             and str(order.get("status", "")).upper() not in excluded_statuses
         ]
+
+    async def get_gtt_orders_for_instrument(
+        self, access_token: str, *, instrument_key: str | None = None, include_history: bool = False
+    ) -> list[dict[str, Any]]:
+        """GTT orders, optionally filtered to one instrument -- one Upstox fetch (see
+        get_all_gtt_orders) narrowed by filter_gtt_orders; see that method for the status rules.
+        """
+        normalized_orders = await self.get_all_gtt_orders(access_token)
+        return self.filter_gtt_orders(
+            normalized_orders, instrument_key=instrument_key, include_history=include_history
+        )
 
     async def modify_gtt_bracket(
         self,

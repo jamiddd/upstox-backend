@@ -39,6 +39,7 @@ class Settings:
     oi_database_path: Path = Path("/data/oi_snapshots.sqlite3")
     notification_database_path: Path = Path("/data/notifications.sqlite3")
     journal_database_path: Path = Path("/data/journal.sqlite3")
+    gtt_database_path: Path = Path("/data/gtt_history.sqlite3")
     device_token_path: Path = Path("/data/device_token.json")
     max_loss_settings_path: Path = Path("/data/max_loss_settings.json")
     log_file_path: Path = Path("/data/logs/app.log")
@@ -108,6 +109,9 @@ class Settings:
             ),
             journal_database_path=Path(
                 os.getenv("JOURNAL_DATABASE_PATH", "/data/journal.sqlite3"),
+            ),
+            gtt_database_path=Path(
+                os.getenv("GTT_DATABASE_PATH", "/data/gtt_history.sqlite3"),
             ),
             device_token_path=Path(
                 os.getenv("DEVICE_TOKEN_PATH", "/data/device_token.json"),

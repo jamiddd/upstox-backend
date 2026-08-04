@@ -2754,6 +2754,81 @@ def test_get_gtt_orders_with_history_includes_completed_but_not_cancelled() -> N
     assert {order["gtt_order_id"] for order in payload} == {"GTT-111", "GTT-done"}
 
 
+class _StatusFlippingFakeUpstoxService(FakeUpstoxService):
+    """GTT-flip starts ACTIVE and switches to CANCELLED on the second get_gtt_orders call --
+    simulates a bracket cancelled out from under a just-flattened position between two polls (see
+    SmartOrderService._cancel_stray_gtts) so a test can assert the archive picks up the
+    transition instead of keeping the stale ACTIVE status."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    async def get_gtt_orders(self, access_token: str) -> dict[str, Any]:
+        self.call_count += 1
+        status = "ACTIVE" if self.call_count == 1 else "CANCELLED"
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "gtt_order_id": "GTT-flip",
+                    "instrument_token": "NSE_FO|111",
+                    "quantity": 75,
+                    "product": "I",
+                    "status": status,
+                    "rules": [],
+                },
+            ],
+        }
+
+
+def test_get_gtt_orders_history_reflects_a_status_transition_not_a_stale_first_snapshot(
+    tmp_path: Path,
+) -> None:
+    """The archive backing include_history=true must be fed the unfiltered order set on every
+    call (see get_all_gtt_orders), not just whatever a given response happened to return --
+    otherwise a transition into an excluded status (e.g. ACTIVE -> CANCELLED once
+    _cancel_stray_gtts fires) would never be observed and the archive would serve the first,
+    now-stale snapshot forever."""
+    settings = replace(_settings(), gtt_database_path=tmp_path / "gtt.sqlite3")
+    client = _client(FakeTokenStore(token="stored-token"))
+    fake_service = _StatusFlippingFakeUpstoxService()
+    app.dependency_overrides[get_settings] = lambda: settings
+    # A shared instance, not the class itself -- get_upstox_service is a per-request dependency
+    # factory, so overriding with the bare class would construct a fresh call_count=0 instance on
+    # every request and the status would never actually flip across the three calls below.
+    app.dependency_overrides[get_upstox_service] = lambda: fake_service
+    try:
+        first = client.get(
+            "/api/orders/gtt",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|111"},
+        )
+        second = client.get(
+            "/api/orders/gtt",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|111"},
+        )
+        history = client.get(
+            "/api/orders/gtt",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|111", "include_history": "true"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert [order["status"] for order in first.json()] == ["ACTIVE"]
+    # CANCELLED is excluded from the live "active" view -- GTT-flip drops out entirely.
+    assert second.json() == []
+    # But the archive that include_history reads from must show its true final status, not the
+    # first ACTIVE snapshot it was never given a chance to overwrite.
+    history_payload = history.json()
+    assert [order["gtt_order_id"] for order in history_payload] == []
+    from app.services.gtt_history_store import GttHistoryStore
+
+    archived = GttHistoryStore(settings).list("NSE_FO|111")
+    assert [order["status"] for order in archived] == ["CANCELLED"]
+
+
 def test_modify_gtt_order_resends_full_rule_set() -> None:
     """Modifying a GTT bracket rebuilds ENTRY/TARGET/STOPLOSS together, not a partial patch."""
     client = _client(FakeTokenStore(token="stored-token"))

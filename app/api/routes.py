@@ -61,6 +61,7 @@ from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenS
 from app.services.notification_service import NotificationService
 from app.services.notification_store import NotificationStore
 from app.services.journal_store import DuplicateJournalTradeError, JournalStore
+from app.services.gtt_history_store import GttHistoryStore
 from app.services.order_history_service import OrderHistoryService
 from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
@@ -1360,18 +1361,38 @@ async def get_gtt_orders(
     include_history: bool = Query(False),
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
 ) -> list[dict[str, Any]]:
     """Active GTT orders, optionally filtered to one instrument. The unfiltered form powers the
     Main screen's GTT Open Orders section; the filtered form lets the app find the bracket behind
     a position, or (with include_history=true) its historical bracket.
     See SmartOrderService.get_gtt_orders_for_instrument.
 
+    Every order Upstox currently reports -- any status, any instrument -- is archived to
+    GttHistoryStore on each call, not just the ones this response ends up returning. That's
+    deliberate: the live response deliberately excludes terminal statuses (cancelled/rejected/
+    completed) by default, and completed-request cleanup (see SmartOrderService's
+    _cancel_stray_gtts) cancels brackets out from under a position the moment it's flattened -- an
+    archive fed only from a filtered view would never observe either transition and would keep
+    serving a stale pre-transition status forever.
+
     On dual_router (require_mobile_or_web) -- the web client's GTT screen (M3d) needs this.
     """
     access_token = _load_access_token(token_store)
     try:
-        return await SmartOrderService(service).get_gtt_orders_for_instrument(
-            access_token, instrument_key=instrument_key, include_history=include_history
+        smart_order_service = SmartOrderService(service)
+        all_orders = await smart_order_service.get_all_gtt_orders(access_token)
+        history = GttHistoryStore(settings)
+        history.archive(all_orders)
+        if include_history:
+            # Read back from the archive rather than all_orders -- durability is the point:
+            # an order Upstox has since stopped listing entirely (aged out of its own API) still
+            # needs to show up here if it was ever observed, which all_orders alone can't provide.
+            return smart_order_service.filter_gtt_orders(
+                history.list(instrument_key), include_history=True
+            )
+        return smart_order_service.filter_gtt_orders(
+            all_orders, instrument_key=instrument_key, include_history=False
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
