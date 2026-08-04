@@ -43,6 +43,14 @@ class JournalReconciler:
                 trades = raw_trades if isinstance(raw_trades, list) else []
                 inserted = 0
                 trading_date = datetime.now(IST).date().isoformat()
+                # Charges already on file, keyed by fill_id -- used so a failed
+                # `/charges/brokerage` call (rate limit, timeout, ...) falls back to the last
+                # known-good value instead of clobbering it with 0.0. Without this, a burst of
+                # fills landing in the same second (e.g. a stop-loss cascade) tends to hit
+                # Upstox's rate limit together and each reconcile pass re-zeroes them forever,
+                # since upsert_fill unconditionally overwrites computed_charges every pass.
+                fill_ids = [_text(raw, "trade_id", "fill_id") for raw in trades if isinstance(raw, dict)]
+                known_charges = self.store.charges_for_fill_ids([f for f in fill_ids if f])
                 for raw in trades:
                     if not isinstance(raw, dict):
                         continue
@@ -50,9 +58,15 @@ class JournalReconciler:
                     if fill is None:
                         logger.warning("Skipping malformed broker trade: %r", raw)
                         continue
-                    fill["computed_charges"] = await self._charges(access_token, fill)
+                    charges = await self._charges(access_token, fill)
+                    fill["computed_charges"] = (
+                        charges if charges is not None else known_charges.get(fill["fill_id"], 0.0)
+                    )
                     inserted += int(self.store.upsert_fill(fill))
                     trading_date = fill["trade_date"]
+                    # Stagger sequential brokerage-charge calls so a batch of same-second fills
+                    # (stop-loss cascades) doesn't hammer Upstox's rate limit as one burst.
+                    await asyncio.sleep(0.2)
                 self.store.record_session_sync(trading_date, complete=complete)
                 conflicts = self.store.rebuild_session(trading_date)
                 if conflicts and self.notifications:
@@ -73,7 +87,9 @@ class JournalReconciler:
                 logger.warning("Journal reconciliation failed", exc_info=True)
                 return {"status": "error", "fills": 0}
 
-    async def _charges(self, access_token: str, fill: dict[str, Any]) -> float:
+    async def _charges(self, access_token: str, fill: dict[str, Any]) -> Optional[float]:
+        """Returns None (rather than 0.0) on any failure, so the caller can fall back to the
+        last known-good charge instead of overwriting it with a spurious zero."""
         try:
             payload = await self.upstox.get_brokerage(
                 access_token,
@@ -86,10 +102,10 @@ class JournalReconciler:
             data = payload.get("data")
             charges = data.get("charges") if isinstance(data, dict) else None
             total = charges.get("total") if isinstance(charges, dict) else None
-            return float(total) if isinstance(total, (int, float)) else 0.0
+            return float(total) if isinstance(total, (int, float)) else None
         except Exception:
             logger.warning("Charge computation failed for fill %s", fill["fill_id"], exc_info=True)
-            return 0.0
+            return None
 
 
 async def run_journal_reconciler(reconciler: JournalReconciler) -> None:
