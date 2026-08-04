@@ -10,6 +10,11 @@ from typing import Any, Optional
 
 from app.core.config import Settings
 
+# Canonical Monday-first order for `analytics_summary`'s weekday_breakdown -- markets are closed
+# Sat/Sun so those two will always come back zero, but they're kept in the list (rather than
+# filtered out) so the chart always renders a full, consistently-ordered 7-bar week.
+_WEEKDAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
 
 class DuplicateJournalTradeError(ValueError):
     def __init__(self, trade_id: str) -> None:
@@ -289,6 +294,20 @@ class JournalStore:
                 """,
                 (trading_date, now, now, now if complete else None, "complete" if complete else "partial"),
             )
+
+    def charges_for_fill_ids(self, fill_ids: list[str]) -> dict[str, float]:
+        """Last known-good `computed_charges` for the given fill_ids, keyed by fill_id --
+        used by the reconciler to fall back to a prior value when a fresh brokerage-charge
+        call fails, instead of clobbering it with a spurious 0.0."""
+        if not fill_ids:
+            return {}
+        placeholders = ",".join("?" for _ in fill_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT fill_id, computed_charges FROM trade_fills WHERE fill_id IN ({placeholders})",
+                fill_ids,
+            ).fetchall()
+        return {row["fill_id"]: row["computed_charges"] for row in rows}
 
     def fills_for_session(self, trading_date: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -643,7 +662,7 @@ class JournalStore:
         for value in nets:
             running += value
             equity.append(running)
-        weekday: dict[str, list[float]] = {}
+        weekday: dict[str, list[float]] = {day: [] for day in _WEEKDAY_LABELS}
         with self._connect() as connection:
             dated_rows = connection.execute(
                 f"""
@@ -674,10 +693,16 @@ class JournalStore:
                     "net_pnl": sum(day_values),
                     "win_rate": (
                         sum(1 for value in day_values if value > 0) / len(day_values) * 100
+                        if day_values else 0.0
                     ),
                     "low_sample": len(day_values) < 30,
                 }
-                for label, day_values in weekday.items()
+                # Always all 7 weekdays, Monday first, even ones with zero trades in range --
+                # otherwise the chart silently drops any weekday that happens to have no data
+                # yet (e.g. Wednesday/Friday early on, or every day but today right after a
+                # week rolls over), which reads as missing data rather than "no trades that day".
+                for label in _WEEKDAY_LABELS
+                for day_values in [weekday[label]]
             ],
         }
 

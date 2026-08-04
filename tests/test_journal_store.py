@@ -137,3 +137,37 @@ def test_total_charges_for_date_sums_only_that_dates_fills(tmp_path) -> None:
     assert store.total_charges_for_date("2026-07-25") == 999.0
     assert store.total_charges_for_date("2026-07-27") == 0.0
 
+
+def _closed_round_trip(store: JournalStore, trade_date: str, buy_id: str, sell_id: str) -> None:
+    buy = _fill(buy_id, trade_date, 5.0)
+    buy["transaction_type"] = "BUY"
+    sell = dict(buy)
+    sell.update(fill_id=sell_id, order_id=f"order-{sell_id}", transaction_type="SELL",
+                price=110.0, executed_at=f"{trade_date}T04:05:00+00:00", computed_charges=5.0)
+    store.upsert_fill(buy)
+    store.upsert_fill(sell)
+    store.rebuild_session(trade_date)
+
+
+def test_weekday_breakdown_always_returns_seven_days_monday_first(tmp_path) -> None:
+    store = JournalStore(_settings(tmp_path))
+    # 2026-07-27 is a Monday, 2026-07-28 a Tuesday -- no trades on any other day of that week.
+    _closed_round_trip(store, "2026-07-27", "mon-buy", "mon-sell")
+    _closed_round_trip(store, "2026-07-28", "tue-buy", "tue-sell")
+
+    breakdown = store.analytics_summary()["weekday_breakdown"]
+
+    assert [day["label"] for day in breakdown] == [
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    ]
+    by_label = {day["label"]: day for day in breakdown}
+    assert by_label["Monday"]["trade_count"] == 1
+    assert by_label["Monday"]["net_pnl"] == 740.0  # (110-100)*75 - (5+5) charges
+    assert by_label["Tuesday"]["trade_count"] == 1
+    # Days with no trades in range still show up, zeroed out rather than being omitted.
+    for empty_label in ("Wednesday", "Thursday", "Friday", "Saturday", "Sunday"):
+        assert by_label[empty_label] == {
+            "label": empty_label, "trade_count": 0, "net_pnl": 0.0,
+            "win_rate": 0.0, "low_sample": True,
+        }
+
