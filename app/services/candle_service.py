@@ -106,7 +106,16 @@ class CandleService:
                     instrument_key, unit, interval, list(normalized_intraday.values()),
                 )
 
-        candles = [rows_by_timestamp[key] for key in sorted(rows_by_timestamp)]
+        # ISO strings with different offsets do not sort chronologically as plain strings (for
+        # example, 09:30+05:30 sorts after 04:15Z even though they represent the same instant).
+        # Lightweight Charts requires strictly oldest-first input, so order by the parsed instant.
+        candles = [
+            rows_by_timestamp[key]
+            for key in sorted(
+                rows_by_timestamp,
+                key=lambda value: datetime.fromisoformat(value).timestamp(),
+            )
+        ]
         expected_latest_date = _expected_latest_trading_date(
             min(to_date, today),
             local_now=(now or datetime.now(_IST)).astimezone(_IST),

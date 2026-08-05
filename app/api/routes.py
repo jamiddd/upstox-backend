@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
+from time import monotonic
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 import logging
@@ -91,6 +93,13 @@ web_router = APIRouter(dependencies=[Depends(require_web_session)])
 dual_router = APIRouter(dependencies=[Depends(require_mobile_or_web)])
 
 logger = logging.getLogger(__name__)
+
+# The web dashboard can mount several consumers of the same portfolio data at once.  Keep this
+# cache at the API boundary so overlapping browser polls do not each become an Upstox request.
+# The token digest avoids retaining the bearer token in a cache key or loggable object.
+_POSITIONS_CACHE_TTL_SECONDS = 1.0
+_positions_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_positions_cache_lock = asyncio.Lock()
 
 
 class SmartBracketOrderRequest(BaseModel):
@@ -599,10 +608,24 @@ async def get_positions(
     On dual_router (require_mobile_or_web) -- the web client's Portfolio screen (M1) needs this.
     """
     access_token = _load_access_token(token_store)
-    try:
-        return await service.get_positions(access_token)
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
+    cache_key = sha256(access_token.encode("utf-8")).hexdigest()
+    now = monotonic()
+    async with _positions_cache_lock:
+        cached = _positions_cache.get(cache_key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        # Keep the lock through the upstream call: this is intentional single-flight behavior for
+        # concurrent dashboard mounts, not just a cache write lock.
+        try:
+            payload = await service.get_positions(access_token)
+        except UpstoxApiError as exc:
+            raise _upstox_http_error(exc) from exc
+        _positions_cache[cache_key] = (monotonic() + _POSITIONS_CACHE_TTL_SECONDS, payload)
+        # Bound memory if tokens rotate over the lifetime of a worker.
+        expired = [key for key, (expires_at, _) in _positions_cache.items() if expires_at <= monotonic()]
+        for key in expired:
+            _positions_cache.pop(key, None)
+    return payload
 
 
 @protected_router.get("/user/get-funds-and-margin")

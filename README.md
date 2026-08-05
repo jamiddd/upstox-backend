@@ -128,6 +128,9 @@ https://api.scalp8.xyz
 
 See `docs/VPS_DEPLOYMENT.md` for the VPS checklist, smoke test steps, OAuth validation, and reverse proxy notes.
 
+Setting this backend up for the first time as a new user (own Upstox app, own server/domain, own
+Firebase project)? See `NEW_USER_SETUP.md`.
+
 ## Screen APIs
 - Main screen backend contract: `docs/MAIN_SCREEN_API.md`
 - Search screen backend contract: `docs/SEARCH_SCREEN_API.md`

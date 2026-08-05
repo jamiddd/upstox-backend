@@ -26,6 +26,8 @@ class _CacheEntry:
 
 
 _CACHE: dict[tuple[Any, ...], _CacheEntry] = {}
+_SUMMARY_IDLE_CACHE_TTL_SECONDS = 60.0
+_SUMMARY_LIVE_CACHE_TTL_SECONDS = 1.0
 
 
 class MainScreenService:
@@ -382,7 +384,20 @@ class MainScreenService:
                     }
             except (TypeError, ValueError):
                 pass
-        _cache_set(cache_key, summary, ttl_seconds=5.0)
+        # Funds/margin is effectively static while the account has no open positions.  Once a
+        # position exists, keep the shorter cadence so live P&L and margin changes are reflected
+        # promptly.  The fast positions endpoint remains responsible for detecting a position
+        # opening/closing; a later summary request then naturally switches cadence again.
+        has_open_positions = bool(_positions_data(positions_payload))
+        _cache_set(
+            cache_key,
+            summary,
+            ttl_seconds=(
+                _SUMMARY_LIVE_CACHE_TTL_SECONDS
+                if has_open_positions
+                else _SUMMARY_IDLE_CACHE_TTL_SECONDS
+            ),
+        )
         return summary
 
     async def _resolve_contract(
