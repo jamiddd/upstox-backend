@@ -3658,6 +3658,29 @@ def test_analytics_summary_accepts_web_session_cookie(tmp_path: Path) -> None:
     assert response.json()["low_sample"] is True
 
 
+def test_correct_flat_brokerage_route_runs_backfill_once(tmp_path: Path) -> None:
+    settings = replace(_settings(), journal_database_path=tmp_path / "journal.sqlite3")
+    journal_store = JournalStore(settings)
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_journal_store] = lambda: journal_store
+    try:
+        response = client.post(
+            "/api/journal/maintenance/correct-flat-brokerage",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+        again = client.post(
+            "/api/journal/maintenance/correct-flat-brokerage",
+            headers={"X-API-Key": "mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"already_ran": False, "fills_corrected": 0, "trading_dates_rebuilt": 0}
+    assert again.json()["already_ran"] is True
+
+
 def test_all_dual_router_routes_reject_neither_api_key_nor_cookie(tmp_path: Path) -> None:
     """Every route moved onto dual_router across M1a/b/c must still 401 with no auth at all --
     one shared test for the invariant instead of one near-duplicate per route."""

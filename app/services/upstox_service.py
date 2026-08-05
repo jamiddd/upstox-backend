@@ -87,8 +87,15 @@ class UpstoxService:
         The public Upstox API calls the identifier ``instrument_token``. The rest of this
         backend consistently calls the same value ``instrument_key``, so the translation is
         deliberately kept here at the upstream boundary.
+
+        Upstox's ``charges.brokerage`` here always quotes the flat 30-per-order rate, but only
+        actually debits/settles 20 -- the extra 10 is held back overnight and adjusted off during
+        their next-day batch reconciliation, and never shows up in any live API response. Left
+        as-is, every journal trade (whose computed_charges sums this figure across its fills) and
+        every pre-trade charge estimate in the app both overstate real charges by 10/order. Patched
+        here, at the single call site both paths share, rather than in each caller separately.
         """
-        return await self._get_json(
+        payload = await self._get_json(
             "/charges/brokerage",
             access_token,
             params={
@@ -99,6 +106,8 @@ class UpstoxService:
                 "price": str(price),
             },
         )
+        _correct_flat_brokerage(payload)
+        return payload
 
     async def get_margin(
         self,
@@ -714,3 +723,30 @@ class UpstoxService:
             upstox_code=upstox_code,
             details=details,
         )
+
+
+# Upstox's real per-order flat brokerage settlement -- see get_brokerage's own doc comment for
+# why this doesn't match what their /charges/brokerage response quotes.
+_FLAT_BROKERAGE = 20.0
+
+
+def _correct_flat_brokerage(payload: object) -> None:
+    """Mutates a `/charges/brokerage` response in place, replacing Upstox's quoted
+    ``data.charges.brokerage`` (always 30, overstated by 10) with [_FLAT_BROKERAGE] and adjusting
+    ``data.charges.total`` by the same delta. A no-op if the response isn't shaped as expected
+    (unrecognized/error payload) -- callers already handle a missing/malformed `total` themselves,
+    same as before this correction existed."""
+    if not isinstance(payload, dict):
+        return
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return
+    charges = data.get("charges")
+    if not isinstance(charges, dict):
+        return
+    brokerage = charges.get("brokerage")
+    total = charges.get("total")
+    if not isinstance(brokerage, (int, float)) or not isinstance(total, (int, float)):
+        return
+    charges["total"] = total - brokerage + _FLAT_BROKERAGE
+    charges["brokerage"] = _FLAT_BROKERAGE

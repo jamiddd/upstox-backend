@@ -138,12 +138,14 @@ def test_total_charges_for_date_sums_only_that_dates_fills(tmp_path) -> None:
     assert store.total_charges_for_date("2026-07-27") == 0.0
 
 
-def _closed_round_trip(store: JournalStore, trade_date: str, buy_id: str, sell_id: str) -> None:
-    buy = _fill(buy_id, trade_date, 5.0)
+def _closed_round_trip(
+    store: JournalStore, trade_date: str, buy_id: str, sell_id: str, *, charges_per_fill: float = 5.0,
+) -> None:
+    buy = _fill(buy_id, trade_date, charges_per_fill)
     buy["transaction_type"] = "BUY"
     sell = dict(buy)
     sell.update(fill_id=sell_id, order_id=f"order-{sell_id}", transaction_type="SELL",
-                price=110.0, executed_at=f"{trade_date}T04:05:00+00:00", computed_charges=5.0)
+                price=110.0, executed_at=f"{trade_date}T04:05:00+00:00", computed_charges=charges_per_fill)
     store.upsert_fill(buy)
     store.upsert_fill(sell)
     store.rebuild_session(trade_date)
@@ -170,4 +172,33 @@ def test_weekday_breakdown_always_returns_seven_days_monday_first(tmp_path) -> N
             "label": empty_label, "trade_count": 0, "net_pnl": 0.0,
             "win_rate": 0.0, "low_sample": True,
         }
+
+
+def test_backfill_flat_brokerage_correction_fixes_fills_and_rebuilds_journal_trades(tmp_path) -> None:
+    store = JournalStore(_settings(tmp_path))
+    # Each fill's stored charge still has the old, overstated Upstox flat-brokerage figure
+    # baked in (30 instead of the real 20 -- see UpstoxService.get_brokerage's own doc comment).
+    _closed_round_trip(store, "2026-07-27", "buy-1", "sell-1", charges_per_fill=32.5)
+    # A fallback 0.0 from a failed charge lookup (see JournalReconciler._charges) -- below the
+    # correction threshold, must be left alone rather than pushed negative.
+    store.upsert_fill(_fill("fallback-fill", "2026-07-28", 0.0))
+
+    result = store.backfill_flat_brokerage_correction()
+
+    assert result == {"already_ran": False, "fills_corrected": 2, "trading_dates_rebuilt": 2}
+    fills = {f["fill_id"]: f["computed_charges"] for f in store.fills_for_session("2026-07-27")}
+    assert fills == {"buy-1": 22.5, "sell-1": 22.5}
+    untouched = store.fills_for_session("2026-07-28")
+    assert untouched[0]["computed_charges"] == 0.0
+
+    # journal_trades.computed_charges (derived from the fills via rebuild_session) reflects the
+    # correction too, not just the raw fill rows.
+    trade = store.list_trades()[0][0]
+    assert trade["computed_charges"] == 45.0  # 22.5 + 22.5
+
+    # Idempotent: a second call is a no-op, doesn't double-correct.
+    again = store.backfill_flat_brokerage_correction()
+    assert again == {"already_ran": True, "fills_corrected": 0, "trading_dates_rebuilt": 0}
+    fills_after = {f["fill_id"]: f["computed_charges"] for f in store.fills_for_session("2026-07-27")}
+    assert fills_after == {"buy-1": 22.5, "sell-1": 22.5}
 

@@ -1235,6 +1235,16 @@ def journal_analytics_summary(
     return result
 
 
+@protected_router.post("/journal/maintenance/correct-flat-brokerage")
+def correct_flat_brokerage(store: JournalStore = Depends(get_journal_store)) -> dict[str, Any]:
+    """One-off maintenance endpoint: corrects `computed_charges` recorded before
+    UpstoxService.get_brokerage's flat-brokerage fix (30 -> 20/order). Trigger once by hand after
+    deploying that fix; safe to call again (or leave in a cron/curl one-liner) -- a no-op past the
+    first successful run. See JournalStore.backfill_flat_brokerage_correction's own doc comment.
+    """
+    return store.backfill_flat_brokerage_correction()
+
+
 @protected_router.post("/notifications/read-all")
 async def mark_all_notifications_read(
     store: NotificationStore = Depends(get_notification_store),

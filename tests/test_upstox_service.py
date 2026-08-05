@@ -108,6 +108,64 @@ def test_get_brokerage_sends_order_parameters() -> None:
     assert payload == {"status": "success", "data": {"charges": {}}}
 
 
+def test_get_brokerage_corrects_upstox_flat_brokerage_to_20() -> None:
+    """Upstox's /charges/brokerage always quotes a flat 30/order brokerage, but only actually
+    settles 20 -- see UpstoxService.get_brokerage's own doc comment. The response should come
+    back with brokerage patched to 20 and total adjusted by the same -10 delta."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "status": "success",
+            "data": {
+                "charges": {
+                    "total": 45.5,
+                    "brokerage": 30.0,
+                    "taxes": {"gst": 5.4, "stt": 10.0, "stamp_duty": 0.1},
+                    "other_charges": {"transaction": 0.0, "clearing": 0.0, "ipft": 0.0, "sebi_turnover": 0.0},
+                },
+            },
+        })
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_brokerage(
+                "upstox-token",
+                instrument_key="NSE_FO|35271",
+                quantity=75,
+                product="I",
+                transaction_type="BUY",
+                price=125.5,
+            )
+
+    payload = anyio.run(run)
+    charges = payload["data"]["charges"]
+    assert charges["brokerage"] == 20.0
+    assert charges["total"] == 35.5  # 45.5 - 30 + 20
+    assert charges["taxes"] == {"gst": 5.4, "stt": 10.0, "stamp_duty": 0.1}  # untouched
+
+
+def test_get_brokerage_leaves_malformed_charges_payload_untouched() -> None:
+    """A response missing the expected charges shape (error payload, unrecognized fields) should
+    pass through as-is rather than raising."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "error", "errors": [{"message": "no funds"}]})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_brokerage(
+                "upstox-token",
+                instrument_key="NSE_FO|35271",
+                quantity=75,
+                product="I",
+                transaction_type="BUY",
+                price=125.5,
+            )
+
+    payload = anyio.run(run)
+    assert payload == {"status": "error", "errors": [{"message": "no funds"}]}
+
+
 def test_get_margin_posts_single_instrument_batch() -> None:
     """Calculate actual required margin using Upstox's Margin Calculator endpoint."""
     async def handler(request: httpx.Request) -> httpx.Response:

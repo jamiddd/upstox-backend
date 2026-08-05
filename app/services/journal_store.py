@@ -15,6 +15,10 @@ from app.core.config import Settings
 # filtered out) so the chart always renders a full, consistently-ordered 7-bar week.
 _WEEKDAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
+# See JournalStore.backfill_flat_brokerage_correction's own doc comment.
+_FLAT_BROKERAGE_CORRECTION = 10.0
+_MIN_CORRECTABLE_CHARGE = 10.0
+
 
 class DuplicateJournalTradeError(ValueError):
     def __init__(self, trade_id: str) -> None:
@@ -308,6 +312,57 @@ class JournalStore:
                 fill_ids,
             ).fetchall()
         return {row["fill_id"]: row["computed_charges"] for row in rows}
+
+    def backfill_flat_brokerage_correction(self) -> dict[str, Any]:
+        """One-off, idempotent correction for `computed_charges` stored before
+        `UpstoxService.get_brokerage`'s flat-brokerage fix (30 -> 20/order): every already-stored
+        `trade_fills.computed_charges` still has the old, overstated-by-10 Upstox figure baked in.
+
+        Corrects every fill whose stored charge is at least [_MIN_CORRECTABLE_CHARGE] (a real
+        charge response is always comfortably above this; anything lower is almost certainly a
+        pre-existing 0.0 fallback from a failed charge lookup, not a genuine corrected-by-this
+        figure, and subtracting further would push it negative) by exactly -10, then re-derives
+        every affected trading day's `journal_trades.computed_charges` via [rebuild_session] --
+        cheaper and less error-prone than recomputing the round-trip sums here directly, and
+        reuses the exact same matching logic so `journal_trade_fills` linkage stays untouched
+        (same fill sets -> same match_fingerprints -> in-place UPDATE, not delete/reinsert, so
+        existing notes/tags on already-annotated trades are preserved).
+
+        A no-op (returning `already_ran=True`) on every call after the first -- guarded by a
+        `journal_metadata` flag, since this is a blind per-fill -10 that would double-correct if
+        run twice.
+        """
+        with self._connect() as connection:
+            already_ran = connection.execute(
+                "SELECT 1 FROM journal_metadata WHERE key='flat_brokerage_backfilled_at'",
+            ).fetchone() is not None
+        if already_ran:
+            return {"already_ran": True, "fills_corrected": 0, "trading_dates_rebuilt": 0}
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE trade_fills SET computed_charges = computed_charges - ?, updated_at = ?
+                WHERE computed_charges >= ?
+                """,
+                (_FLAT_BROKERAGE_CORRECTION, now, _MIN_CORRECTABLE_CHARGE),
+            )
+            fills_corrected = cursor.rowcount
+            trading_dates = [
+                row[0] for row in connection.execute("SELECT DISTINCT trade_date FROM trade_fills")
+            ]
+            connection.execute(
+                "INSERT INTO journal_metadata (key, value) VALUES ('flat_brokerage_backfilled_at', ?)",
+                (now,),
+            )
+        for trading_date in trading_dates:
+            self.rebuild_session(trading_date)
+        return {
+            "already_ran": False,
+            "fills_corrected": fills_corrected,
+            "trading_dates_rebuilt": len(trading_dates),
+        }
 
     def fills_for_session(self, trading_date: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
