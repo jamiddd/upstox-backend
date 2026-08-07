@@ -741,7 +741,13 @@ if _cors_origin:
         CORSMiddleware,
         allow_origins=[_cors_origin],
         allow_credentials=True,
-        allow_methods=["GET", "POST"],
+        # GET/POST covered reads and order placement, but the web client also modifies/cancels
+        # GTT brackets (PUT /orders/gtt/modify, PUT /orders/modify, DELETE /orders/gtt/cancel) --
+        # those methods were never added here, so the browser's own CORS preflight for them was
+        # rejected before the actual request was ever sent, surfacing client-side as a generic
+        # "Failed to fetch" with no server-side trace at all (dev tools' Network tab shows the
+        # blocked OPTIONS preflight, not a real request/response).
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Content-Type", "X-API-Key"],
     )
 
