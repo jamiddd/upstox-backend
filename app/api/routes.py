@@ -559,7 +559,7 @@ async def get_brokerage(
         raise _upstox_http_error(exc) from exc
 
 
-@protected_router.post("/charges/margin")
+@dual_router.post("/charges/margin")
 async def get_margin(
     request: MarginRequest,
     service: UpstoxService = Depends(get_upstox_service),
@@ -567,6 +567,9 @@ async def get_margin(
 ) -> dict[str, Any]:
     """Return Upstox's actual required margin for one proposed order -- the real fund block for
     a SELL (short options), unlike /charges/brokerage's statutory-charges-only figure.
+
+    On dual_router (require_mobile_or_web) -- the web client's chart GTT-edit dialog needs this
+    for a real (not capital-heuristic) qty/price validation before submitting a bracket edit.
     """
     access_token = _load_access_token(token_store)
     try:
