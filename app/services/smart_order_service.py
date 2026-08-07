@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, Optional
 
 from app.core.exceptions import AppConfigError, UpstoxApiError
+from app.services.gtt_history_store import GttHistoryStore
 from app.services.instrument_rules_service import InstrumentRulesService, slice_quantity_for_freeze
 from app.services.upstox_service import UpstoxService
 
@@ -14,8 +15,13 @@ _EXIT_RETRY_DELAY_SECONDS = 1.0
 class SmartOrderService:
     """Translate app smart-order requests into Upstox GTT orders."""
 
-    def __init__(self, upstox_service: UpstoxService) -> None:
+    def __init__(self, upstox_service: UpstoxService, history_store: Optional[GttHistoryStore] = None) -> None:
         self.upstox = upstox_service
+        # Optional -- every production call site passes one (see routes.py), but existing tests
+        # construct SmartOrderService(fake_upstox) without one and shouldn't have to change just
+        # to keep working. None means place/modify simply skip the direct-write hook below (falls
+        # back to the old archive()-on-read behavior for that call), rather than erroring.
+        self.history_store = history_store
 
     async def place_bracket_order(
         self,
@@ -74,6 +80,25 @@ class SmartOrderService:
                     "upstox_response": response,
                 }
             )
+            # Persist directly, right here, the moment Upstox's own place response confirms the
+            # order -- not as a side effect of some later GET /orders/gtt call happening to
+            # include it in its list (see GttHistoryStore's own doc comment for why that's the
+            # actual bug this fixes). A partial multi-slice failure still leaves every slice that
+            # DID place recorded, since this runs per-slice before the loop can hit a later error.
+            if self.history_store is not None:
+                for gtt_order_id in _extract_gtt_order_ids(response):
+                    self.history_store.record_placed(
+                        gtt_order_id,
+                        instrument_key,
+                        {
+                            "gtt_order_id": gtt_order_id,
+                            "instrument_token": instrument_key,
+                            "quantity": slice_qty,
+                            "product": product,
+                            "status": "ACTIVE",
+                            "rules": upstox_order["rules"],
+                        },
+                    )
 
         return {
             "status": "success",
@@ -134,10 +159,20 @@ class SmartOrderService:
     async def get_gtt_orders_for_instrument(
         self, access_token: str, *, instrument_key: str | None = None, include_history: bool = False
     ) -> list[dict[str, Any]]:
-        """GTT orders, optionally filtered to one instrument -- one Upstox fetch (see
-        get_all_gtt_orders) narrowed by filter_gtt_orders; see that method for the status rules.
+        """GTT orders, optionally filtered to one instrument, narrowed by filter_gtt_orders (see
+        that method for the status rules).
+
+        Reads from this backend's own persistent record (GttHistoryStore) when one is configured
+        -- no live Upstox call, and reliable even when Upstox's own list endpoint is having one of
+        its unreliable moments (see GttHistoryStore's own doc comment for why that matters). Falls
+        back to a live Upstox fetch (the old behavior) only when this instance has no
+        history_store, e.g. a SmartOrderService constructed purely for the max-loss watcher's own
+        stray-GTT cleanup role.
         """
-        normalized_orders = await self.get_all_gtt_orders(access_token)
+        if self.history_store is not None:
+            normalized_orders = self.history_store.list()
+        else:
+            normalized_orders = await self.get_all_gtt_orders(access_token)
         return self.filter_gtt_orders(
             normalized_orders, instrument_key=instrument_key, include_history=include_history
         )
@@ -154,10 +189,16 @@ class SmartOrderService:
         target_trigger_price: float,
         stoploss_trigger_price: float,
         trailing_gap: Optional[float] = None,
+        instrument_key: Optional[str] = None,
     ) -> dict[str, Any]:
         """Re-points an existing GTT bracket's target/stoploss. The entry rule is resent
         unchanged (already triggered, since this only ever runs against an open position) --
         Upstox's GTT modify contract expects the full rule set, not a partial patch.
+
+        instrument_key is optional purely for backward call-site compatibility -- pass it so the
+        successful modify can be persisted directly (see GttHistoryStore.record_modified); without
+        it the store write is skipped (falls back to the old on-next-list-read behavior for this
+        one order).
         """
         rules = _build_gtt_rules(
             entry_trigger_type=entry_trigger_type,
@@ -173,7 +214,23 @@ class SmartOrderService:
             "product": product,
             "rules": rules,
         }
-        return await self.upstox.modify_gtt_order(access_token, upstox_order)
+        response = await self.upstox.modify_gtt_order(access_token, upstox_order)
+        # Persist directly, right here, the moment Upstox's modify response confirms it -- same
+        # "no dependency on a later list call" reasoning as place_bracket_order above.
+        if self.history_store is not None and instrument_key:
+            self.history_store.record_modified(
+                gtt_order_id,
+                instrument_key,
+                {
+                    "gtt_order_id": gtt_order_id,
+                    "instrument_token": instrument_key,
+                    "quantity": quantity,
+                    "product": product,
+                    "status": "ACTIVE",
+                    "rules": rules,
+                },
+            )
+        return response
 
     async def exit_all_positions(
         self,
@@ -361,6 +418,8 @@ class SmartOrderService:
                     await self.upstox.cancel_gtt_order(access_token, gtt_order_id)
                 except UpstoxApiError:
                     continue
+                if self.history_store is not None:
+                    self.history_store.record_cancelled(gtt_order_id)
 
 
 # Terminal GTT statuses -- anything else (e.g. a still-pending/triggered rule) is treated as
@@ -437,6 +496,25 @@ def _build_gtt_rules(
         for rule in rules:
             rule["market_protection"] = market_protection
     return rules
+
+
+def _extract_gtt_order_ids(place_gtt_response: dict[str, Any]) -> list[str]:
+    """Pulls the id(s) out of Upstox's own place_gtt_order response, defensively.
+
+    Upstox's real response shape is `{"status": "success", "data": {"gtt_order_ids": [...]}}` --
+    plural, a list, even for a single-rule bracket (confirmed against docs/ORDER_PLACEMENT_API.md
+    and tests/test_upstox_service.py's own fixtures) -- never assume a bare singular
+    `gtt_order_id` key exists. Returns [] for any unexpected shape rather than raising, since a
+    malformed response here shouldn't take down order placement itself (the order may well have
+    still gone through on Upstox's side; this only affects whether *this* backend can track it).
+    """
+    data = place_gtt_response.get("data")
+    if not isinstance(data, dict):
+        return []
+    ids = data.get("gtt_order_ids")
+    if not isinstance(ids, list):
+        return []
+    return [order_id for order_id in ids if isinstance(order_id, str) and order_id]
 
 
 def _build_gtt_order(

@@ -24,6 +24,7 @@ from app.services.auto_login_scheduler import run_auto_login_scheduler
 from app.services.candle_cache_store import CandleCacheStore
 from app.services.fcm_service import FcmService
 from app.services.feed_subscription_manager import FeedSubscriptionManager
+from app.services.gtt_status_poller import run_gtt_status_poller
 from app.services.instrument_rules_service import InstrumentRulesService
 from app.services.journal_store import JournalStore
 from app.services.journal_reconciler import JournalReconciler, run_journal_reconciler
@@ -290,6 +291,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     auth_watchdog_task = asyncio.create_task(run_auth_watchdog(settings, notification_service))
     notification_retention_task = asyncio.create_task(run_notification_retention(settings))
+    # See gtt_status_poller.py's own doc comment -- background-only reconciliation now that
+    # place/modify/cancel (smart_order_service.py) write directly to GttHistoryStore themselves.
+    gtt_status_poller_task = asyncio.create_task(run_gtt_status_poller(settings))
 
     # Backend-side backstop for max-loss auto square-off -- reacts even if the app is closed,
     # backgrounded, or offline, and (see check_max_loss_now's own doc comment) reacts to live
@@ -299,6 +303,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     max_loss_upstox = UpstoxService(settings, client=upstox_http_client)
     position_tracker = PositionPnlTracker(max_loss_upstox, max_loss_token_store)
     max_loss_settings_store = MaxLossSettingsStore(settings)
+    # No history_store here (unlike the route-level SmartOrderService constructions in routes.py)
+    # -- keeps _cancel_stray_gtts's own lookup on its established live-Upstox-read fallback path
+    # (self.history_store is None), rather than pulling this watcher's own stray-GTT cleanup into
+    # this pass's scope. GttHistoryStore.record_placed/record_modified/record_cancelled -- the
+    # actual fix -- still fire for every order this backend places/modifies/cancels regardless of
+    # which SmartOrderService instance runs them, since those routes always pass a store.
     max_loss_smart_order_service = SmartOrderService(max_loss_upstox)
     max_loss_instrument_rules_service = InstrumentRulesService(settings)
 
@@ -482,6 +492,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         account_snapshot_task.cancel()
         auth_watchdog_task.cancel()
         notification_retention_task.cancel()
+        gtt_status_poller_task.cancel()
         max_loss_watcher_task.cancel()
         subscription_refresh_task.cancel()
         position_tracker_refresh_task.cancel()
@@ -497,6 +508,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await auth_watchdog_task
         with contextlib.suppress(asyncio.CancelledError):
             await notification_retention_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await gtt_status_poller_task
         with contextlib.suppress(asyncio.CancelledError):
             await max_loss_watcher_task
         with contextlib.suppress(asyncio.CancelledError):

@@ -1316,7 +1316,7 @@ async def place_smart_bracket_order(
         validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
         validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
         slice_quantity = order.slice_quantity or slice_quantity_for_freeze(order.quantity, rules)
-        result = await SmartOrderService(service).place_bracket_order(
+        result = await SmartOrderService(service, history_store=GttHistoryStore(settings)).place_bracket_order(
             access_token,
             instrument_key=order.instrument_key,
             transaction_type=order.transaction_type,
@@ -1404,31 +1404,19 @@ async def get_gtt_orders(
     a position, or (with include_history=true) its historical bracket.
     See SmartOrderService.get_gtt_orders_for_instrument.
 
-    Every order Upstox currently reports -- any status, any instrument -- is archived to
-    GttHistoryStore on each call, not just the ones this response ends up returning. That's
-    deliberate: the live response deliberately excludes terminal statuses (cancelled/rejected/
-    completed) by default, and completed-request cleanup (see SmartOrderService's
-    _cancel_stray_gtts) cancels brackets out from under a position the moment it's flattened -- an
-    archive fed only from a filtered view would never observe either transition and would keep
-    serving a stale pre-transition status forever.
+    Reads straight from GttHistoryStore -- no live Upstox call at all. Upstox's own GTT list
+    endpoint isn't reliable enough to be this response's data source (see GttHistoryStore's own
+    doc comment); place/modify/cancel already write directly to the store the moment Upstox
+    confirms each one, and a background poller (gtt_status_poller.py) separately keeps statuses
+    (fired/expired) fresh without this read path ever depending on that call succeeding.
 
     On dual_router (require_mobile_or_web) -- the web client's GTT screen (M3d) needs this.
     """
     access_token = _load_access_token(token_store)
     try:
-        smart_order_service = SmartOrderService(service)
-        all_orders = await smart_order_service.get_all_gtt_orders(access_token)
-        history = GttHistoryStore(settings)
-        history.archive(all_orders)
-        if include_history:
-            # Read back from the archive rather than all_orders -- durability is the point:
-            # an order Upstox has since stopped listing entirely (aged out of its own API) still
-            # needs to show up here if it was ever observed, which all_orders alone can't provide.
-            return smart_order_service.filter_gtt_orders(
-                history.list(instrument_key), include_history=True
-            )
-        return smart_order_service.filter_gtt_orders(
-            all_orders, instrument_key=instrument_key, include_history=False
+        smart_order_service = SmartOrderService(service, history_store=GttHistoryStore(settings))
+        return await smart_order_service.get_gtt_orders_for_instrument(
+            access_token, instrument_key=instrument_key, include_history=include_history
         )
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
@@ -1452,7 +1440,7 @@ async def modify_gtt_order(
         validate_price(order.entry_trigger_price, rules, field_name="entry_trigger_price")
         validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
         validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
-        return await SmartOrderService(service).modify_gtt_bracket(
+        return await SmartOrderService(service, history_store=GttHistoryStore(settings)).modify_gtt_bracket(
             access_token,
             gtt_order_id=order.gtt_order_id,
             quantity=order.quantity,
@@ -1462,6 +1450,7 @@ async def modify_gtt_order(
             target_trigger_price=order.target_trigger_price,
             stoploss_trigger_price=order.stoploss_trigger_price,
             trailing_gap=order.trailing_gap,
+            instrument_key=order.instrument_key,
         )
     except AppConfigError as exc:
         raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -1474,6 +1463,7 @@ async def cancel_gtt_order(
     order: CancelGttOrderRequest,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
     """Cancels an untriggered GTT order and all associated rules.
 
@@ -1481,7 +1471,12 @@ async def cancel_gtt_order(
     """
     access_token = _load_access_token(token_store)
     try:
-        return await service.cancel_gtt_order(access_token, order.gtt_order_id)
+        result = await service.cancel_gtt_order(access_token, order.gtt_order_id)
+        # Persist directly, right here, the moment Upstox confirms the cancel -- same "no
+        # dependency on a later list call" reasoning as place/modify (see GttHistoryStore's own
+        # doc comment).
+        GttHistoryStore(settings).record_cancelled(order.gtt_order_id)
+        return result
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
 

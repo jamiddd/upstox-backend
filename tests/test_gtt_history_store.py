@@ -69,3 +69,48 @@ def test_archive_retains_an_order_even_once_a_later_call_omits_it(tmp_path: Path
     store.archive([other])  # A later poll no longer reports GTT-1 at all.
 
     assert {order["gtt_order_id"] for order in store.list()} == {"GTT-1", "GTT-2"}
+
+
+def test_record_placed_is_durable_with_no_prior_archive_call(tmp_path: Path) -> None:
+    """The actual fix: a placed order is known here the moment it's recorded, independent of
+    archive()/a live Upstox list ever having run at all."""
+    store = GttHistoryStore(_settings(tmp_path / "gtt.sqlite3"))
+
+    store.record_placed("GTT-1", "NSE_FO|111", {"gtt_order_id": "GTT-1", "quantity": 75})
+
+    rows = store.list("NSE_FO|111")
+    assert len(rows) == 1
+    assert rows[0]["gtt_order_id"] == "GTT-1"
+    assert rows[0]["status"] == "ACTIVE"
+    assert rows[0]["quantity"] == 75
+
+
+def test_record_modified_overwrites_the_stored_payload(tmp_path: Path) -> None:
+    store = GttHistoryStore(_settings(tmp_path / "gtt.sqlite3"))
+    store.record_placed("GTT-1", "NSE_FO|111", {"gtt_order_id": "GTT-1", "quantity": 75})
+
+    store.record_modified("GTT-1", "NSE_FO|111", {"gtt_order_id": "GTT-1", "quantity": 150})
+
+    rows = store.list("NSE_FO|111")
+    assert len(rows) == 1
+    assert rows[0]["quantity"] == 150
+
+
+def test_record_cancelled_marks_a_known_order_cancelled(tmp_path: Path) -> None:
+    store = GttHistoryStore(_settings(tmp_path / "gtt.sqlite3"))
+    store.record_placed("GTT-1", "NSE_FO|111", {"gtt_order_id": "GTT-1", "status": "ACTIVE"})
+
+    store.record_cancelled("GTT-1")
+
+    rows = store.list("NSE_FO|111")
+    assert rows[0]["status"] == "CANCELLED"
+
+
+def test_record_cancelled_is_a_no_op_for_an_unknown_id(tmp_path: Path) -> None:
+    """A cancel for an id this backend never recorded (e.g. a GTT placed before this backend
+    tracked its own placements) must not fabricate a row out of nothing."""
+    store = GttHistoryStore(_settings(tmp_path / "gtt.sqlite3"))
+
+    store.record_cancelled("GTT-never-seen")
+
+    assert store.list() == []

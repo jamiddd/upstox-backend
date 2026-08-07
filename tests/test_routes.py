@@ -31,6 +31,7 @@ from app.services.journal_store import JournalStore
 from app.services import oi_analysis_service
 from app.services.oi_snapshot_store import OiStrikeDiff, OiStrikesDiff, SnapshotNotFoundError
 from app.services import search_screen_service
+from app.services.smart_order_service import SmartOrderService
 from app.services.search_screen_service import _SEARCH_CACHE
 from app.services import underlying_signals_service
 
@@ -2700,10 +2701,148 @@ def test_place_smart_bracket_order_submits_multi_leg_gtt() -> None:
     assert payload["slices"][0]["upstox_response"]["data"] == {"gtt_order_ids": ["GTT-123"]}
 
 
-def test_get_gtt_orders_filters_by_instrument_and_active_status() -> None:
+class _EmptyListFakeUpstoxService(FakeUpstoxService):
+    """place_gtt_order behaves normally, but get_gtt_orders always returns an empty list --
+    simulates Upstox's own list endpoint failing to report a just-placed order. This is the
+    actual real-world bug this pass fixes (see GttHistoryStore's own doc comment)."""
+
+    async def get_gtt_orders(self, access_token: str) -> dict[str, Any]:
+        return {"status": "success", "data": []}
+
+
+def test_place_smart_bracket_order_is_visible_via_get_even_when_upstox_list_is_empty(
+    tmp_path: Path,
+) -> None:
+    """The regression test for the actual bug this pass fixes: a placed order must show up in
+    GET /orders/gtt even when Upstox's own list endpoint doesn't report it at all -- because
+    place_bracket_order now writes directly to GttHistoryStore the moment Upstox's place response
+    confirms the order, rather than depending on a later (unreliable) list call to ever observe
+    it."""
+    settings = replace(_settings(), gtt_database_path=tmp_path / "gtt.sqlite3")
+    fake_service = _EmptyListFakeUpstoxService()
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_upstox_service] = lambda: fake_service
+    try:
+        place_response = client.post(
+            "/api/orders/smart-bracket",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "instrument_key": "NSE_FO|111",
+                "transaction_type": "BUY",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 140.0,
+                "stoploss_trigger_price": 118.0,
+            },
+        )
+        get_response = client.get(
+            "/api/orders/gtt",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert place_response.status_code == 200
+    assert get_response.status_code == 200
+    payload = get_response.json()
+    assert [order["gtt_order_id"] for order in payload] == ["GTT-123"]
+    assert payload[0]["status"] == "ACTIVE"
+    assert payload[0]["quantity"] == 75
+
+
+def test_modify_gtt_order_updates_the_store_directly(tmp_path: Path) -> None:
+    """The store reflects a successful modify's new rules immediately -- no live list call
+    involved (see GttHistoryStore.record_modified)."""
+    from app.services.gtt_history_store import GttHistoryStore
+
+    settings = replace(_settings(), gtt_database_path=tmp_path / "gtt.sqlite3")
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        response = client.put(
+            "/api/orders/gtt/modify",
+            headers={"X-API-Key": "mobile-secret"},
+            json={
+                "gtt_order_id": "GTT-111",
+                "instrument_key": "NSE_FO|111",
+                "quantity": 75,
+                "product": "I",
+                "entry_trigger_type": "IMMEDIATE",
+                "entry_trigger_price": 125.5,
+                "target_trigger_price": 145.0,
+                "stoploss_trigger_price": 115.0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    stored = GttHistoryStore(settings).list("NSE_FO|111")
+    assert len(stored) == 1
+    assert stored[0]["status"] == "ACTIVE"
+    rule_prices = {rule["strategy"]: rule["trigger_price"] for rule in stored[0]["rules"]}
+    assert rule_prices == {"ENTRY": 125.5, "TARGET": 145.0, "STOPLOSS": 115.0}
+
+
+def test_cancel_gtt_order_marks_the_store_cancelled_directly(tmp_path: Path) -> None:
+    """The store reflects a successful cancel immediately -- no live list call involved (see
+    GttHistoryStore.record_cancelled)."""
+    from app.services.gtt_history_store import GttHistoryStore
+
+    settings = replace(_settings(), gtt_database_path=tmp_path / "gtt.sqlite3")
+    GttHistoryStore(settings).record_placed(
+        "GTT-111",
+        "NSE_FO|111",
+        {
+            "gtt_order_id": "GTT-111",
+            "instrument_token": "NSE_FO|111",
+            "status": "ACTIVE",
+            "quantity": 75,
+            "rules": [],
+        },
+    )
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        response = client.request(
+            "DELETE",
+            "/api/orders/gtt/cancel",
+            headers={"X-API-Key": "mobile-secret"},
+            json={"gtt_order_id": "GTT-111"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    stored = GttHistoryStore(settings).list("NSE_FO|111")
+    assert stored[0]["status"] == "CANCELLED"
+
+
+def _seed_gtt_store(settings: Settings) -> None:
+    """Seeds a fresh GttHistoryStore with the same normalized orders FakeUpstoxService's
+    get_gtt_orders fixture used to provide live -- GET /orders/gtt now reads from the store, not
+    a live Upstox call (see GttHistoryStore's own doc comment for why), so a test asserting on its
+    response has to seed the store the way place/modify/cancel or the background status poller
+    (gtt_status_poller.py) would in production, instead of relying on the fixture being read
+    directly.
+    """
+    from app.services.gtt_history_store import GttHistoryStore
+
+    normalized = anyio.run(lambda: SmartOrderService(FakeUpstoxService()).get_all_gtt_orders("token"))
+    GttHistoryStore(settings).archive(normalized)
+
+
+def test_get_gtt_orders_filters_by_instrument_and_active_status(tmp_path: Path) -> None:
     """Only ACTIVE orders for the requested instrument come back -- CANCELLED and other
     instruments' orders are excluded (see FakeUpstoxService.get_gtt_orders's fixture)."""
+    settings = replace(_settings(), gtt_database_path=tmp_path / "gtt.sqlite3")
+    _seed_gtt_store(settings)
     client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
     try:
         response = client.get(
             "/api/orders/gtt",
@@ -2719,9 +2858,12 @@ def test_get_gtt_orders_filters_by_instrument_and_active_status() -> None:
     assert payload[0]["status"] == "ACTIVE"
 
 
-def test_get_gtt_orders_without_instrument_returns_all_active_orders() -> None:
+def test_get_gtt_orders_without_instrument_returns_all_active_orders(tmp_path: Path) -> None:
     """The Main screen can request the complete active GTT order book."""
+    settings = replace(_settings(), gtt_database_path=tmp_path / "gtt.sqlite3")
+    _seed_gtt_store(settings)
     client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
     try:
         response = client.get(
             "/api/orders/gtt",
@@ -2735,11 +2877,14 @@ def test_get_gtt_orders_without_instrument_returns_all_active_orders() -> None:
     assert {order["gtt_order_id"] for order in payload} == {"GTT-111", "GTT-other"}
 
 
-def test_get_gtt_orders_with_history_includes_completed_but_not_cancelled() -> None:
+def test_get_gtt_orders_with_history_includes_completed_but_not_cancelled(tmp_path: Path) -> None:
     """include_history=true also returns COMPLETED brackets (so a closed order's historical
     target/stoploss can be recovered), but still excludes CANCELLED/REJECTED -- those never
     actually fired so they aren't a real target/stoploss the position had."""
+    settings = replace(_settings(), gtt_database_path=tmp_path / "gtt.sqlite3")
+    _seed_gtt_store(settings)
     client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
     try:
         response = client.get(
             "/api/orders/gtt",
@@ -2781,52 +2926,48 @@ class _StatusFlippingFakeUpstoxService(FakeUpstoxService):
         }
 
 
-def test_get_gtt_orders_history_reflects_a_status_transition_not_a_stale_first_snapshot(
+def test_gtt_status_poller_reflects_a_status_transition_not_a_stale_first_snapshot(
     tmp_path: Path,
 ) -> None:
-    """The archive backing include_history=true must be fed the unfiltered order set on every
-    call (see get_all_gtt_orders), not just whatever a given response happened to return --
-    otherwise a transition into an excluded status (e.g. ACTIVE -> CANCELLED once
-    _cancel_stray_gtts fires) would never be observed and the archive would serve the first,
-    now-stale snapshot forever."""
+    """GET /orders/gtt no longer archives on every call (it reads the store directly, see
+    GttHistoryStore's own doc comment) -- gtt_status_poller.py's own archive() call, run here
+    directly rather than via the app's background task, is what's now responsible for a status
+    transition (e.g. ACTIVE -> CANCELLED once _cancel_stray_gtts fires elsewhere) eventually
+    reaching the store. Two poll cycles must never leave a stale first-seen snapshot behind."""
+    from app.services.gtt_history_store import GttHistoryStore
+
     settings = replace(_settings(), gtt_database_path=tmp_path / "gtt.sqlite3")
-    client = _client(FakeTokenStore(token="stored-token"))
     fake_service = _StatusFlippingFakeUpstoxService()
+    smart_order_service = SmartOrderService(fake_service)
+    store = GttHistoryStore(settings)
+
+    async def poll_once() -> None:
+        orders = await smart_order_service.get_all_gtt_orders("token")
+        store.archive(orders)
+
+    anyio.run(poll_once)
+    assert [order["status"] for order in store.list("NSE_FO|111")] == ["ACTIVE"]
+
+    anyio.run(poll_once)
+    # The stored row must reflect the true final status, not the first ACTIVE snapshot -- a
+    # transition into an excluded-from-the-active-view status must still be observed here, or
+    # the store would keep serving a stale pre-transition status forever.
+    archived = store.list("NSE_FO|111")
+    assert [order["status"] for order in archived] == ["CANCELLED"]
+
+    # GET /orders/gtt's own default (active-only) view now correctly reflects it too, reading
+    # straight from what the poller just wrote -- no live Upstox call in this read path at all.
+    client = _client(FakeTokenStore(token="stored-token"))
     app.dependency_overrides[get_settings] = lambda: settings
-    # A shared instance, not the class itself -- get_upstox_service is a per-request dependency
-    # factory, so overriding with the bare class would construct a fresh call_count=0 instance on
-    # every request and the status would never actually flip across the three calls below.
-    app.dependency_overrides[get_upstox_service] = lambda: fake_service
     try:
-        first = client.get(
+        response = client.get(
             "/api/orders/gtt",
             headers={"X-API-Key": "mobile-secret"},
             params={"instrument_key": "NSE_FO|111"},
-        )
-        second = client.get(
-            "/api/orders/gtt",
-            headers={"X-API-Key": "mobile-secret"},
-            params={"instrument_key": "NSE_FO|111"},
-        )
-        history = client.get(
-            "/api/orders/gtt",
-            headers={"X-API-Key": "mobile-secret"},
-            params={"instrument_key": "NSE_FO|111", "include_history": "true"},
         )
     finally:
         app.dependency_overrides.clear()
-
-    assert [order["status"] for order in first.json()] == ["ACTIVE"]
-    # CANCELLED is excluded from the live "active" view -- GTT-flip drops out entirely.
-    assert second.json() == []
-    # But the archive that include_history reads from must show its true final status, not the
-    # first ACTIVE snapshot it was never given a chance to overwrite.
-    history_payload = history.json()
-    assert [order["gtt_order_id"] for order in history_payload] == []
-    from app.services.gtt_history_store import GttHistoryStore
-
-    archived = GttHistoryStore(settings).list("NSE_FO|111")
-    assert [order["status"] for order in archived] == ["CANCELLED"]
+    assert response.json() == []
 
 
 def test_modify_gtt_order_resends_full_rule_set() -> None:
@@ -3853,9 +3994,12 @@ def test_exit_positions_rejects_neither_api_key_nor_cookie() -> None:
 # (modify, cancel) ---
 
 
-def test_get_gtt_orders_accepts_web_session_cookie() -> None:
+def test_get_gtt_orders_accepts_web_session_cookie(tmp_path: Path) -> None:
     """The web client's GTT screen (M3d) lists active brackets with only its session cookie."""
-    settings = replace(_settings(), web_session_secret="test-web-secret")
+    settings = replace(
+        _settings(), web_session_secret="test-web-secret", gtt_database_path=tmp_path / "gtt.sqlite3"
+    )
+    _seed_gtt_store(settings)
     client = _client(FakeTokenStore(token="stored-token"))
     app.dependency_overrides[get_settings] = lambda: settings
     try:
