@@ -2856,6 +2856,43 @@ def test_get_gtt_orders_filters_by_instrument_and_active_status(tmp_path: Path) 
     payload = response.json()
     assert [order["gtt_order_id"] for order in payload] == ["GTT-111"]
     assert payload[0]["status"] == "ACTIVE"
+    # Upstox's own GTT list carries no trading_symbol at all -- the route enriches it from
+    # InstrumentRulesService's own instrument-master cache (same one _client() seeds for
+    # tick/lot-size validation elsewhere), so the client never has to show a bare instrument_token.
+    assert payload[0]["trading_symbol"] == "NIFTY26JUL25000CE"
+
+
+def test_get_gtt_orders_leaves_trading_symbol_absent_for_an_unknown_instrument(tmp_path: Path) -> None:
+    """A lookup failure for one instrument (e.g. delisted/expired, no longer in the master) must
+    not fail the whole response -- that order's trading_symbol is simply left out."""
+    from app.services.gtt_history_store import GttHistoryStore
+
+    settings = replace(_settings(), gtt_database_path=tmp_path / "gtt.sqlite3")
+    GttHistoryStore(settings).record_placed(
+        "GTT-unknown",
+        "NSE_FO|999999",
+        {
+            "gtt_order_id": "GTT-unknown",
+            "instrument_token": "NSE_FO|999999",
+            "status": "ACTIVE",
+            "quantity": 75,
+        },
+    )
+    client = _client(FakeTokenStore(token="stored-token"))
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        response = client.get(
+            "/api/orders/gtt",
+            headers={"X-API-Key": "mobile-secret"},
+            params={"instrument_key": "NSE_FO|999999"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload[0]["gtt_order_id"] == "GTT-unknown"
+    assert payload[0]["trading_symbol"] is None
 
 
 def test_get_gtt_orders_without_instrument_returns_all_active_orders(tmp_path: Path) -> None:

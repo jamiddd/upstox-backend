@@ -1415,11 +1415,42 @@ async def get_gtt_orders(
     access_token = _load_access_token(token_store)
     try:
         smart_order_service = SmartOrderService(service, history_store=GttHistoryStore(settings))
-        return await smart_order_service.get_gtt_orders_for_instrument(
+        orders = await smart_order_service.get_gtt_orders_for_instrument(
             access_token, instrument_key=instrument_key, include_history=include_history
         )
+        return await _attach_trading_symbols(orders, settings)
     except UpstoxApiError as exc:
         raise _upstox_http_error(exc) from exc
+
+
+async def _attach_trading_symbols(orders: list[dict[str, Any]], settings: Settings) -> list[dict[str, Any]]:
+    """Upstox's GTT list response carries no trading_symbol at all -- only instrument_token,
+    which isn't human-readable (see docs/ORDER_PLACEMENT_API.md's own example response).
+    InstrumentRulesService already caches the BOD instrument master (trading_symbol included) for
+    tick/lot-size validation elsewhere, so this reuses that same cache rather than adding a second
+    lookup path. Best-effort: a lookup failure for one instrument (e.g. a delisted/expired
+    contract no longer in the master) leaves that one order's trading_symbol simply absent, not
+    the whole response failing.
+    """
+    rules_service = InstrumentRulesService(settings)
+    unique_keys = {
+        order["instrument_token"] for order in orders if isinstance(order.get("instrument_token"), str)
+    }
+
+    async def _lookup(key: str) -> tuple[str, Optional[str]]:
+        try:
+            rules = await rules_service.get_rules(key)
+            return key, rules.trading_symbol or None
+        except AppConfigError:
+            return key, None
+
+    resolved = dict(await asyncio.gather(*(_lookup(key) for key in unique_keys)))
+    return [
+        {**order, "trading_symbol": resolved.get(order["instrument_token"])}
+        if isinstance(order.get("instrument_token"), str)
+        else order
+        for order in orders
+    ]
 
 
 @dual_router.put("/orders/gtt/modify")
