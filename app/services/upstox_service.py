@@ -286,6 +286,7 @@ class UpstoxService:
         order_type: str,
         price: float = 0,
         trigger_price: float = 0,
+        tag: Optional[str] = None,
     ) -> dict[str, Any]:
         """Places a regular (non-GTT) order via Place Order V3 -- unlike place_gtt_order (a
         conditional GTT rule watched by Upstox's own GTT engine), this becomes a real live order
@@ -295,10 +296,17 @@ class UpstoxService:
         (stoploss) exit legs SmartOrderService.attach_exit_orders places instead -- see that
         method's own doc comment.
 
+        [tag] is Upstox's own client-supplied order-tagging field (short, alphanumeric), echoed
+        back on every order-book/order-details read -- OrderEngineOrderService uses it as the one
+        available idempotency mechanism for the self-hosted trigger engine's real order placement
+        (`docs/ORDER_POSITION_OVERHAUL_DESIGN.md` §6.3/§6.4), since Upstox's API has no native
+        idempotency-key concept. `None` (every other existing caller) omits it entirely, same as
+        before this parameter existed.
+
         Only documented on the separate api-hft.upstox.com host (upstox_api_hft_base_url), not the
         regular v3 base URL the rest of this class's order endpoints use.
         """
-        order = {
+        order: dict[str, Any] = {
             "quantity": quantity,
             "product": product,
             "validity": "DAY",
@@ -310,6 +318,8 @@ class UpstoxService:
             "trigger_price": trigger_price,
             "is_amo": False,
         }
+        if tag is not None:
+            order["tag"] = tag
         response = await self._request(
             "POST",
             f"{self.settings.upstox_api_hft_base_url}/order/place",
