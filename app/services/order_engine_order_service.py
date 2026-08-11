@@ -23,6 +23,14 @@ def derive_order_tag(idempotency_key: str) -> str:
     return sha256(idempotency_key.encode("utf-8")).hexdigest()[:_TAG_LENGTH]
 
 
+class UnintendedShortGuardError(ValueError):
+    """Raised by [OrderEngineOrderService.place_order] when [guard_against_unintended_short] is
+    set and a `SELL` would exceed the instrument's actual currently-held long quantity -- see that
+    parameter's own doc comment. A route layer catches this and maps it to a real, final
+    rejection (422), same as a genuine broker-side rejection -- never ambiguous, since no broker
+    call was even attempted."""
+
+
 @dataclass
 class OrderEnginePlacementResult:
     """[already_existed] distinguishes "found and returned a prior order for this idempotency
@@ -70,6 +78,50 @@ class OrderEngineOrderService:
                 return order
         return None
 
+    async def resolve_signed_position_quantity(self, access_token: str, instrument_key: str) -> float:
+        """Re-fetches Upstox's own real positions (never a cached/ledger value) and returns the
+        raw signed net quantity for [instrument_key] -- positive for a long, negative for a short,
+        `0.0` if flat or the instrument isn't in the positions response at all. The shared
+        broker-truth primitive both [resolve_held_long_quantity] and
+        [resolve_closeable_quantity] derive from."""
+        payload = await self.upstox.get_positions(access_token)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        positions = [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+        for position in positions:
+            key = position.get("instrument_token") or position.get("instrument_key")
+            if key != instrument_key:
+                continue
+            quantity = position.get("quantity")
+            if isinstance(quantity, (int, float)) and not isinstance(quantity, bool):
+                return float(quantity)
+            return 0.0
+        return 0.0
+
+    async def resolve_held_long_quantity(self, access_token: str, instrument_key: str) -> float:
+        """The currently-held *long* quantity for [instrument_key] -- exactly the broker-truth
+        re-confirmation [place_order]'s own `guard_against_unintended_short` needs. `0.0` if flat,
+        absent, or already net-short (a negative broker-reported quantity means there's nothing
+        long left to sell against -- floored at zero, never returned as a negative "held"
+        amount)."""
+        return max(await self.resolve_signed_position_quantity(access_token, instrument_key), 0.0)
+
+    async def resolve_closeable_quantity(
+        self, access_token: str, instrument_key: str, entry_transaction_type: str,
+    ) -> float:
+        """The quantity of [instrument_key] actually available at the broker to close a lot whose
+        *entry* was [entry_transaction_type] -- `"BUY"` (a long lot, closes via `SELL`) reads the
+        held-long magnitude; `"SELL"` (a short lot, closes via `BUY`-to-cover) reads the held-short
+        magnitude. Used by `order_engine_max_loss_watcher.flatten_open_lots` to cap an emergency
+        exit at what's genuinely resting at the broker rather than trusting the ledger's own
+        (possibly stale) `remaining_quantity` blindly -- same broker-truth-over-cached-value
+        discipline as [resolve_held_long_quantity], generalized to both directions since a
+        flatten (unlike the manual-entry guard, which only ever fires on a `SELL`) can be closing
+        either a long or a short lot."""
+        signed = await self.resolve_signed_position_quantity(access_token, instrument_key)
+        if entry_transaction_type.upper() == "SELL":
+            return max(-signed, 0.0)
+        return max(signed, 0.0)
+
     async def place_order(
         self,
         access_token: str,
@@ -82,6 +134,7 @@ class OrderEngineOrderService:
         order_type: str,
         price: float = 0,
         trigger_price: float = 0,
+        guard_against_unintended_short: bool = False,
     ) -> OrderEnginePlacementResult:
         """Idempotent placement: returns the existing order for [idempotency_key] if one's
         already on today's order book, otherwise places a new one tagged with its derived tag.
@@ -89,7 +142,28 @@ class OrderEngineOrderService:
         uncaught -- the route layer is what translates those into the Rejected-vs-Ambiguous
         distinction the Android `BrokerOrderGateway` contract needs (a 4xx from Upstox is a real
         rejection; a 5xx or transport-level failure is genuinely ambiguous, since the order may or
-        may not have reached Upstox's own engine)."""
+        may not have reached Upstox's own engine).
+
+        [guard_against_unintended_short]: when `True` and [transaction_type] is `"SELL"`, this
+        assumes -- per explicit product direction -- that the caller intends to *close* an
+        existing long, never to open or extend a short, and re-confirms [instrument_key]'s actual
+        held long quantity via [resolve_held_long_quantity] before ever calling Upstox. A
+        [quantity] exceeding what's actually held raises [UnintendedShortGuardError] rather than
+        silently capping the order to a smaller amount or placing it anyway -- capping without
+        telling the caller would place a different order than what was actually requested, which
+        is its own kind of surprise; rejecting outright with a clear reason is the honest failure
+        mode here. This flag is opt-in and defaults `False` -- every pre-existing caller
+        (`TriggerExecutor`'s bracket-leg exits, `order_engine_max_loss_watcher.py`'s flatten) is
+        unaffected; only the manual entry-order path (`EntryOrderPlacer`, Android) sets it."""
+        if guard_against_unintended_short and transaction_type.upper() == "SELL":
+            held = await self.resolve_held_long_quantity(access_token, instrument_key)
+            if quantity > held:
+                raise UnintendedShortGuardError(
+                    f"Refusing to place a SELL of {quantity} for {instrument_key} -- only "
+                    f"{held:g} is currently held long. This would open or extend a short "
+                    "position, which this screen assumes is a mistake rather than intended."
+                )
+
         existing = await self.find_existing_order(access_token, idempotency_key)
         if existing is not None:
             return OrderEnginePlacementResult(already_existed=True, order=existing)

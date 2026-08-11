@@ -2,6 +2,7 @@ import pytest
 
 from app.services.order_engine_order_service import (
     OrderEngineOrderService,
+    UnintendedShortGuardError,
     derive_order_tag,
 )
 
@@ -12,11 +13,15 @@ class FakeUpstox:
     service method's *second* find_existing_order call (the post-mutation confirm) sees the
     updated state, not a frozen snapshot."""
 
-    def __init__(self, order_book_data=None) -> None:
+    def __init__(self, order_book_data=None, positions_data=None) -> None:
         self.place_order_calls: list[dict] = []
         self.cancel_order_calls: list[str] = []
         self.modify_order_calls: list[dict] = []
         self.order_book_data = order_book_data if order_book_data is not None else []
+        self.positions_data = positions_data if positions_data is not None else []
+
+    async def get_positions(self, access_token):
+        return {"status": "success", "data": self.positions_data}
 
     async def get_order_book(self, access_token):
         return {"status": "success", "data": self.order_book_data}
@@ -202,3 +207,152 @@ async def test_modify_order_quantity_returns_none_when_nothing_matches_and_never
 
     assert result is None
     assert fake.modify_order_calls == []
+
+
+# -- guard_against_unintended_short -- "assume the user doesn't want to open a short, it's a
+# mistake" (direct product direction). See OrderEngineOrderService.place_order's own doc comment.
+
+
+@pytest.mark.anyio
+async def test_resolve_held_long_quantity_returns_the_matching_positions_quantity():
+    fake = FakeUpstox(positions_data=[{"instrument_token": "NSE_FO|1", "quantity": 50}])
+    service = OrderEngineOrderService(fake)
+
+    held = await service.resolve_held_long_quantity("token", "NSE_FO|1")
+
+    assert held == 50.0
+
+
+@pytest.mark.anyio
+async def test_resolve_held_long_quantity_floors_a_short_position_at_zero():
+    fake = FakeUpstox(positions_data=[{"instrument_token": "NSE_FO|1", "quantity": -20}])
+    service = OrderEngineOrderService(fake)
+
+    held = await service.resolve_held_long_quantity("token", "NSE_FO|1")
+
+    assert held == 0.0
+
+
+@pytest.mark.anyio
+async def test_resolve_held_long_quantity_is_zero_when_instrument_not_in_positions_at_all():
+    fake = FakeUpstox(positions_data=[{"instrument_token": "NSE_FO|OTHER", "quantity": 50}])
+    service = OrderEngineOrderService(fake)
+
+    held = await service.resolve_held_long_quantity("token", "NSE_FO|1")
+
+    assert held == 0.0
+
+
+@pytest.mark.anyio
+async def test_place_order_guard_allows_a_sell_within_the_held_quantity():
+    fake = FakeUpstox(positions_data=[{"instrument_token": "NSE_FO|1", "quantity": 50}])
+    service = OrderEngineOrderService(fake)
+
+    result = await service.place_order(
+        "token", idempotency_key="entry-1", instrument_key="NSE_FO|1",
+        transaction_type="SELL", quantity=50, product="I", order_type="MARKET",
+        guard_against_unintended_short=True,
+    )
+
+    assert result.already_existed is False
+    assert len(fake.place_order_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_place_order_guard_rejects_a_sell_exceeding_the_held_quantity():
+    fake = FakeUpstox(positions_data=[{"instrument_token": "NSE_FO|1", "quantity": 30}])
+    service = OrderEngineOrderService(fake)
+
+    with pytest.raises(UnintendedShortGuardError):
+        await service.place_order(
+            "token", idempotency_key="entry-1", instrument_key="NSE_FO|1",
+            transaction_type="SELL", quantity=50, product="I", order_type="MARKET",
+            guard_against_unintended_short=True,
+        )
+
+    assert fake.place_order_calls == []  # never reached Upstox's own placement call at all
+
+
+@pytest.mark.anyio
+async def test_place_order_guard_rejects_a_sell_with_nothing_held_at_all():
+    fake = FakeUpstox(positions_data=[])
+    service = OrderEngineOrderService(fake)
+
+    with pytest.raises(UnintendedShortGuardError):
+        await service.place_order(
+            "token", idempotency_key="entry-1", instrument_key="NSE_FO|1",
+            transaction_type="SELL", quantity=1, product="I", order_type="MARKET",
+            guard_against_unintended_short=True,
+        )
+
+
+@pytest.mark.anyio
+async def test_place_order_guard_does_not_apply_to_buy_orders():
+    fake = FakeUpstox(positions_data=[])  # nothing held, irrelevant for a BUY
+    service = OrderEngineOrderService(fake)
+
+    result = await service.place_order(
+        "token", idempotency_key="entry-1", instrument_key="NSE_FO|1",
+        transaction_type="BUY", quantity=50, product="I", order_type="MARKET",
+        guard_against_unintended_short=True,
+    )
+
+    assert result.already_existed is False
+    assert len(fake.place_order_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_place_order_guard_is_off_by_default_and_never_checks_positions():
+    fake = FakeUpstox(positions_data=[])  # would reject if the guard ran
+    service = OrderEngineOrderService(fake)
+
+    result = await service.place_order(
+        "token", idempotency_key="entry-1", instrument_key="NSE_FO|1",
+        transaction_type="SELL", quantity=50, product="I", order_type="MARKET",
+    )
+
+    assert result.already_existed is False
+    assert len(fake.place_order_calls) == 1
+
+
+# -- resolve_closeable_quantity -- flatten_open_lots' broker-truth cap, bidirectional (long-close
+# via SELL, short-cover via BUY), distinct from resolve_held_long_quantity (SELL-only guard use).
+
+
+@pytest.mark.anyio
+async def test_resolve_closeable_quantity_for_a_long_lot_reads_the_held_long_magnitude():
+    fake = FakeUpstox(positions_data=[{"instrument_token": "NSE_FO|1", "quantity": 40}])
+    service = OrderEngineOrderService(fake)
+
+    closeable = await service.resolve_closeable_quantity("token", "NSE_FO|1", "BUY")
+
+    assert closeable == 40.0
+
+
+@pytest.mark.anyio
+async def test_resolve_closeable_quantity_for_a_short_lot_reads_the_held_short_magnitude():
+    fake = FakeUpstox(positions_data=[{"instrument_token": "NSE_FO|1", "quantity": -25}])
+    service = OrderEngineOrderService(fake)
+
+    closeable = await service.resolve_closeable_quantity("token", "NSE_FO|1", "SELL")
+
+    assert closeable == 25.0
+
+
+@pytest.mark.anyio
+async def test_resolve_closeable_quantity_is_zero_for_a_long_lot_when_the_broker_shows_a_short():
+    fake = FakeUpstox(positions_data=[{"instrument_token": "NSE_FO|1", "quantity": -25}])
+    service = OrderEngineOrderService(fake)
+
+    closeable = await service.resolve_closeable_quantity("token", "NSE_FO|1", "BUY")
+
+    assert closeable == 0.0
+
+
+@pytest.mark.anyio
+async def test_resolve_closeable_quantity_is_zero_when_nothing_is_held_at_all():
+    fake = FakeUpstox(positions_data=[])
+    service = OrderEngineOrderService(fake)
+
+    assert await service.resolve_closeable_quantity("token", "NSE_FO|1", "BUY") == 0.0
+    assert await service.resolve_closeable_quantity("token", "NSE_FO|1", "SELL") == 0.0

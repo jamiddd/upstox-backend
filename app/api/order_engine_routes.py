@@ -7,10 +7,15 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.api.dependencies import get_token_store, get_upstox_service
+from app.api.dependencies import (
+    get_order_engine_ledger_store,
+    get_token_store,
+    get_upstox_service,
+)
 from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequiredError
 from app.core.security import require_mobile_api_key
-from app.services.order_engine_order_service import OrderEngineOrderService
+from app.services.order_engine_ledger_store import OrderEngineLedgerStore
+from app.services.order_engine_order_service import OrderEngineOrderService, UnintendedShortGuardError
 from app.services.token_store import EncryptedTokenStore
 from app.services.trade_context_service import extract_order_ids
 from app.services.upstox_service import UpstoxService
@@ -39,6 +44,10 @@ class OrderEnginePlaceOrderRequest(BaseModel):
     order_type: Literal["MARKET", "LIMIT", "SL", "SL-M"] = "MARKET"
     price: float = Field(default=0.0, ge=0)
     trigger_price: float = Field(default=0.0, ge=0)
+    # See OrderEngineOrderService.place_order's own doc comment -- opt-in, defaults False so every
+    # pre-existing caller (trigger-fired exits, max-loss flatten) is unaffected; only the manual
+    # entry-order screen (Android's EntryOrderPlacer) sets this True.
+    guard_against_unintended_short: bool = False
 
 
 class OrderEnginePlaceOrderResponse(BaseModel):
@@ -135,7 +144,13 @@ async def place_order_engine_order(
             order_type=order.order_type,
             price=order.price,
             trigger_price=order.trigger_price,
+            guard_against_unintended_short=order.guard_against_unintended_short,
         )
+    except UnintendedShortGuardError as exc:
+        # A real, final rejection -- no broker call was even attempted, so there's nothing
+        # ambiguous about it (unlike the UpstoxApiError/transport cases below).
+        logger.warning("order-engine placement rejected -- unintended-short guard: %s", exc)
+        raise _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except UpstoxApiError as exc:
         if exc.status_code < 500:
             logger.warning("order-engine placement rejected by Upstox: %s", exc.message)
@@ -239,3 +254,221 @@ async def modify_order_engine_order_quantity(
         raise _http_error(status.HTTP_404_NOT_FOUND, "No matching order found to modify")
 
     return OrderEngineModifyQuantityResponse(status=confirmed.get("status"), raw=confirmed)
+
+
+# -- §8's server-authoritative ledger -----------------------------------------------------------
+#
+# These four routes are the ledger half of Part 4 (`docs/ORDER_POSITION_OVERHAUL_DESIGN.md` §8.1),
+# distinct from everything above: the routes above place/cancel/modify a *real broker order*, these
+# four just record durable server-side state about a `Lot`/`TriggerRule` the client already has.
+# The server becomes authoritative for this record (§8.1's own framing: the client's local Room DB
+# becomes a synced cache, not the primary record) -- but the client-side `TriggerEvaluator` still
+# makes the actual fire decision locally, fast, off its own tick stream; nothing here evaluates or
+# fires anything, it only remembers what the client has already decided.
+#
+# All four are simple upsert-by-id calls -- the client generates every id (`Lot.id`/
+# `TriggerRule.id`), so a resend (retry after a dropped response) always lands on the same row
+# rather than duplicating it, matching `OrderEngineLedgerStore.upsert_lot`/`upsert_trigger_rule`'s
+# own idempotent-by-construction behavior.
+
+
+class OrderEngineLotUpsertRequest(BaseModel):
+    """Mirrors the Android `Lot`/`LotBracket` shape closely enough for a durable server-side
+    record -- not a 1:1 field copy, just what §8's exit-reconciliation/live-PnL/max-loss watcher
+    machinery actually needs to know."""
+
+    lot_id: str = Field(min_length=1)
+    instrument_key: str = Field(min_length=1)
+    transaction_type: Literal["BUY", "SELL"]
+    entry_price: Optional[float] = None
+    entry_quantity: int = Field(gt=0)
+    remaining_quantity: int = Field(ge=0)
+    realized_pnl: float = 0.0
+    state: str = Field(min_length=1)
+    target_price: Optional[float] = None
+    stoploss_price: Optional[float] = None
+    trailing_gap: Optional[float] = None
+    target_rule_id: Optional[str] = None
+    stoploss_rule_id: Optional[str] = None
+
+
+class OrderEngineLotResponse(BaseModel):
+    lot: dict[str, Any]
+
+
+class OrderEngineTriggerRuleUpsertRequest(BaseModel):
+    rule_id: str = Field(min_length=1)
+    lot_id: Optional[str] = None
+    instrument_key: str = Field(min_length=1)
+    role: Optional[str] = None
+    state: str = Field(min_length=1)
+    condition_op: Optional[str] = None
+    condition_value: Optional[float] = None
+    sibling_rule_id: Optional[str] = None
+
+
+class OrderEngineTriggerRuleResponse(BaseModel):
+    trigger_rule: dict[str, Any]
+
+
+class OrderEngineTightenStopLossRequest(BaseModel):
+    """A value-only update -- mirrors `TriggerDao.casUpdateConditionValue`'s own scope, since a
+    trailing tighten never changes anything about a rule except its `condition_value`."""
+
+    condition_value: float
+
+
+@router.put("/ledger/lots", response_model=OrderEngineLotResponse)
+async def upsert_ledger_lot(
+    body: OrderEngineLotUpsertRequest,
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineLotResponse:
+    """Records/updates one `Lot` durably server-side -- called after every local
+    `LotRepository` mutation (create, exit, transition) per §8.1. Idempotent by `lot_id`."""
+    lot = ledger.upsert_lot(
+        lot_id=body.lot_id,
+        instrument_key=body.instrument_key,
+        transaction_type=body.transaction_type,
+        entry_price=body.entry_price,
+        entry_quantity=body.entry_quantity,
+        remaining_quantity=body.remaining_quantity,
+        realized_pnl=body.realized_pnl,
+        state=body.state,
+        target_price=body.target_price,
+        stoploss_price=body.stoploss_price,
+        trailing_gap=body.trailing_gap,
+        target_rule_id=body.target_rule_id,
+        stoploss_rule_id=body.stoploss_rule_id,
+    )
+    ledger.record_event(event_type="LOT_UPSERTED", lot_id=body.lot_id, payload={"state": body.state})
+    return OrderEngineLotResponse(lot=lot)
+
+
+@router.get("/ledger/lots/{lot_id}", response_model=OrderEngineLotResponse)
+async def get_ledger_lot(
+    lot_id: str,
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineLotResponse:
+    lot = ledger.get_lot(lot_id)
+    if lot is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "No matching lot found")
+    return OrderEngineLotResponse(lot=lot)
+
+
+@router.put(
+    "/ledger/trigger-rules", response_model=OrderEngineTriggerRuleResponse,
+)
+async def upsert_ledger_trigger_rule(
+    body: OrderEngineTriggerRuleUpsertRequest,
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineTriggerRuleResponse:
+    """Records/updates one `TriggerRule` durably server-side -- called after every local
+    `TriggerRepository` state transition (arm, fire, cancel, OCO-cancel) per §8.1. The server
+    never evaluates this rule itself; it only remembers what the client's own `TriggerEvaluator`
+    already decided."""
+    rule = ledger.upsert_trigger_rule(
+        rule_id=body.rule_id,
+        lot_id=body.lot_id,
+        instrument_key=body.instrument_key,
+        role=body.role,
+        state=body.state,
+        condition_op=body.condition_op,
+        condition_value=body.condition_value,
+        sibling_rule_id=body.sibling_rule_id,
+    )
+    ledger.record_event(
+        event_type="TRIGGER_RULE_UPSERTED", lot_id=body.lot_id, rule_id=body.rule_id,
+        payload={"state": body.state},
+    )
+    return OrderEngineTriggerRuleResponse(trigger_rule=rule)
+
+
+@router.put(
+    "/ledger/trigger-rules/{rule_id}/tighten-stop-loss",
+    response_model=OrderEngineTriggerRuleResponse,
+)
+async def tighten_ledger_trigger_rule_stop_loss(
+    rule_id: str,
+    body: OrderEngineTightenStopLossRequest,
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineTriggerRuleResponse:
+    """Mirrors `TriggerRepository.tightenStopLoss`'s value-only CAS -- the rule stays `ARMED`
+    throughout, only `condition_value` moves. 404 if the client references a rule the server has
+    never seen (e.g. this call raced ahead of the rule's own initial upsert)."""
+    existing = ledger.get_trigger_rule(rule_id)
+    if existing is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "No matching trigger rule found")
+
+    rule = ledger.upsert_trigger_rule(
+        rule_id=rule_id,
+        lot_id=existing["lot_id"],
+        instrument_key=existing["instrument_key"],
+        role=existing["role"],
+        state=existing["state"],
+        condition_op=existing["condition_op"],
+        condition_value=body.condition_value,
+        sibling_rule_id=existing["sibling_rule_id"],
+    )
+    ledger.record_event(
+        event_type="TRIGGER_RULE_TIGHTENED", lot_id=existing["lot_id"], rule_id=rule_id,
+        payload={"condition_value": body.condition_value},
+    )
+    return OrderEngineTriggerRuleResponse(trigger_rule=rule)
+
+
+class OrderEngineMaxLossEpochUpsertRequest(BaseModel):
+    """§7.10's 2026-08-12 amendment: the user chooses, client-side, whether `threshold_x` is a
+    fixed absolute amount or a percentage of the breach formula's own reference point -- this
+    request carries that choice to the server so `order_engine_max_loss_watcher.py` (the primary,
+    server-side enforcer per §8.3) honors it, not just the client's own local
+    `MaxLossAggregator` backstop."""
+
+    opening_balance: float
+    peak_equity: float
+    threshold_x: float = Field(gt=0)
+    threshold_mode: Literal["ABSOLUTE", "PERCENTAGE"] = "ABSOLUTE"
+    epoch_started_at: str
+
+
+class OrderEngineMaxLossEpochResponse(BaseModel):
+    epoch: dict[str, Any]
+
+
+@router.put("/ledger/max-loss-epoch", response_model=OrderEngineMaxLossEpochResponse)
+async def upsert_ledger_max_loss_epoch(
+    body: OrderEngineMaxLossEpochUpsertRequest,
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineMaxLossEpochResponse:
+    """Mirrors the client's own `MaxLossEpochRepository.startEpoch` -- called whenever the user
+    (re)starts a max-loss epoch from `NewEngineHomeScreen`'s form, so the server-side watcher
+    enforces the exact same opening balance/threshold/mode the client just armed locally, not a
+    stale or default one. Single-row, same upsert-wholesale semantics as every other ledger write
+    here."""
+    epoch = ledger.upsert_max_loss_epoch(
+        opening_balance=body.opening_balance,
+        peak_equity=body.peak_equity,
+        threshold_x=body.threshold_x,
+        threshold_mode=body.threshold_mode,
+        epoch_started_at=body.epoch_started_at,
+    )
+    ledger.record_event(
+        event_type="MAX_LOSS_EPOCH_UPSERTED",
+        payload={"threshold_x": body.threshold_x, "threshold_mode": body.threshold_mode},
+    )
+    return OrderEngineMaxLossEpochResponse(epoch=epoch)
+
+
+@router.get("/ledger/max-loss-epoch", response_model=OrderEngineMaxLossEpochResponse)
+async def get_ledger_max_loss_epoch(
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineMaxLossEpochResponse:
+    """Lets the client stay synced with what the server-side watcher actually has armed --
+    without this, `PUT` was write-only and a client (a fresh install, a second device, or just a
+    screen re-opened after the app was killed) had no way to confirm the epoch it's displaying
+    still matches what `order_engine_max_loss_watcher.py` is really enforcing. 404 if no epoch has
+    ever been started -- never a fabricated default, same "confirmed absent, not guessed" posture
+    every other lookup route in this file already uses."""
+    epoch = ledger.get_max_loss_epoch()
+    if epoch is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "No max-loss epoch has been started")
+    return OrderEngineMaxLossEpochResponse(epoch=epoch)

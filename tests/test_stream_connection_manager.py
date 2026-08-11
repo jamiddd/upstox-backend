@@ -260,6 +260,45 @@ async def test_dispatch_order_update_reaches_every_connected_session() -> None:
 
 
 @pytest.mark.anyio
+async def test_dispatch_order_engine_lot_status_reaches_every_connected_session() -> None:
+    from app.services.order_engine_lot_tracker import LotPnlStatus
+
+    manager, _ = _manager()
+    a = _FakeWebSocket()
+    b = _FakeWebSocket()
+    await manager.connect(a)  # type: ignore[arg-type]
+    await manager.connect(b)  # type: ignore[arg-type]
+
+    status = LotPnlStatus(
+        lot_id="lot-1", instrument_key="NSE_FO|1", entry_price=100.0,
+        target_price=110.0, stoploss_price=90.0, ltp=105.0, live_pnl=250.0, state="OPEN",
+    )
+    await manager.dispatch_order_engine_lot_status([status])
+
+    expected = [{
+        "type": "order_engine_lot_status",
+        "data": [{
+            "lot_id": "lot-1", "instrument_key": "NSE_FO|1", "entry_price": 100.0,
+            "target_price": 110.0, "stoploss_price": 90.0, "ltp": 105.0, "live_pnl": 250.0,
+            "state": "OPEN",
+        }],
+    }]
+    assert a.sent == expected
+    assert b.sent == expected
+
+
+@pytest.mark.anyio
+async def test_dispatch_order_engine_lot_status_is_a_no_op_when_empty() -> None:
+    manager, _ = _manager()
+    a = _FakeWebSocket()
+    await manager.connect(a)  # type: ignore[arg-type]
+
+    await manager.dispatch_order_engine_lot_status([])
+
+    assert a.sent == []
+
+
+@pytest.mark.anyio
 async def test_dispatch_notification_reaches_every_connected_session() -> None:
     manager, _ = _manager()
     a = _FakeWebSocket()

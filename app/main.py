@@ -28,6 +28,8 @@ from app.services.feed_subscription_manager import FeedSubscriptionManager
 from app.services.gtt_status_poller import run_gtt_status_poller
 from app.services.instrument_rules_service import InstrumentRulesService
 from app.services.journal_store import JournalStore
+from app.services.order_engine_ledger_store import OrderEngineLedgerStore
+from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 from app.services.journal_reconciler import JournalReconciler, run_journal_reconciler
 from app.services.live_candle_builder import LiveCandleBuilder, feed_candle_to_cache_row
 from app.services.max_loss_settings_store import MaxLossSettingsStore
@@ -349,6 +351,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     order_fill_detector = OrderFillDetector()
     order_flow_service = OrderFlowService()
     journal_store = JournalStore(settings)
+    # §8's server-side live-PnL tracker (docs/ORDER_POSITION_OVERHAUL_DESIGN.md §8) -- reads the
+    # same ledger the order-engine routes write to, cheap enough to query per-tick since it's a
+    # local SQLite file, not a network call (see OrderEngineLotTracker's own doc comment).
+    order_engine_ledger_store = OrderEngineLedgerStore(settings)
+    order_engine_lot_tracker = OrderEngineLotTracker(order_engine_ledger_store)
     trade_context_token_store = EncryptedTokenStore(settings)
     trade_context_upstox = UpstoxService(settings, client=upstox_http_client)
     trade_context_service = TradeContextService(
@@ -380,7 +387,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         token_store=market_feed_token_store,
         on_tick=lambda tick: _on_market_tick(
             candle_builder, stream_manager, position_tracker, max_loss_watcher_deps,
-            order_flow_service, tick,
+            order_flow_service, order_engine_lot_tracker, tick,
         ),
         on_state_change=market_feed_notifier.handle,
     )
@@ -635,6 +642,7 @@ def _on_market_tick(
     position_tracker: PositionPnlTracker,
     max_loss_watcher_deps: _MaxLossWatcherDeps,
     order_flow_service: OrderFlowService,
+    order_engine_lot_tracker: OrderEngineLotTracker,
     tick: FeedTick,
 ) -> None:
     live_candle = candle_builder.handle_tick(tick)
@@ -647,6 +655,13 @@ def _on_market_tick(
         asyncio.create_task(
             stream_manager.dispatch_order_flow(tick.instrument_key, order_flow_snapshot.to_dict()),
         )
+
+    # §8's live-PnL push -- a no-op call for the (overwhelming majority of) ticks on an instrument
+    # with no open new-engine lot at all, since dispatch_order_engine_lot_status itself no-ops on
+    # an empty list.
+    lot_statuses = order_engine_lot_tracker.apply_tick(tick.instrument_key, tick.ltp)
+    if lot_statuses:
+        asyncio.create_task(stream_manager.dispatch_order_engine_lot_status(lot_statuses))
 
     position_tracker.apply_tick(tick.instrument_key, tick.ltp)
     if tick.instrument_key in position_tracker.instrument_keys():

@@ -334,6 +334,33 @@ class StreamConnectionManager:
                 "data": {"instrument_key": instrument_key, **snapshot},
             })
 
+    async def dispatch_order_engine_lot_status(self, statuses: list[Any]) -> None:
+        """§8's live-PnL push (`docs/ORDER_POSITION_OVERHAUL_DESIGN.md` §8, `OrderEngineLotTracker`)
+        -- one message per tick carrying every open new-engine lot on that tick's instrument,
+        unfiltered like dispatch_order_update (this screen graph holds no chart/instrument
+        subscription of its own to scope against, same reasoning). [statuses] is a list of
+        `LotPnlStatus` (see `order_engine_lot_tracker.py`); a no-op (never sent) if empty, so a
+        tick for an instrument with no open lot doesn't spam every session with an empty push."""
+        if not statuses:
+            return
+        for session in list(self._sessions.values()):
+            await session.send({
+                "type": "order_engine_lot_status",
+                "data": [
+                    {
+                        "lot_id": status.lot_id,
+                        "instrument_key": status.instrument_key,
+                        "entry_price": status.entry_price,
+                        "target_price": status.target_price,
+                        "stoploss_price": status.stoploss_price,
+                        "ltp": status.ltp,
+                        "live_pnl": status.live_pnl,
+                        "state": status.state,
+                    }
+                    for status in statuses
+                ],
+            })
+
     async def dispatch_order_update(self, payload: dict[str, Any]) -> None:
         # Order updates aren't scoped to a chart/instrument subscription the way ticks are --
         # every connected session needs to know about a fill regardless of what it's currently
