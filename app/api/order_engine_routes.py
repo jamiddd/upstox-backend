@@ -54,6 +54,26 @@ class OrderEngineOrderStatusResponse(BaseModel):
     raw: dict[str, Any]
 
 
+class OrderEngineModifyQuantityRequest(BaseModel):
+    """§7.7: quantity is the *only* field this route accepts -- price/order_type/trigger_price/
+    validity are always carried over unchanged from the order's own current broker-reported
+    values (see `OrderEngineOrderService.modify_order_quantity`), never taken from the caller."""
+
+    quantity: int = Field(gt=0)
+
+
+class OrderEngineCancelOrderResponse(BaseModel):
+    outcome: Literal["cancelled"] = "cancelled"
+    status: Optional[str] = None
+    raw: dict[str, Any]
+
+
+class OrderEngineModifyQuantityResponse(BaseModel):
+    outcome: Literal["modified"] = "modified"
+    status: Optional[str] = None
+    raw: dict[str, Any]
+
+
 def _http_error(status_code: int, message: str) -> HTTPException:
     """Same normalized `{"status": "error", "message": ...}` envelope routes.py's own
     `_http_error`/`_upstox_http_error` use -- matching it here (rather than a plain
@@ -61,6 +81,19 @@ def _http_error(status_code: int, message: str) -> HTTPException:
     `{"detail": message}` string) means Android's existing generic `ApiErrorBody` parsing already
     surfaces this route's real message with no route-specific parsing needed on that side."""
     return HTTPException(status_code=status_code, detail={"status": "error", "message": message})
+
+
+def _upstox_call_error(exc: Exception) -> HTTPException:
+    """Shared Rejected-vs-Ambiguous translation for a call already known to be against an
+    *existing* broker order (cancel/modify) -- same reasoning as the inline try/except in
+    [place_order_engine_order]/[get_order_engine_order] above, factored out here since cancel and
+    modify both need the identical mapping and there's no placement-specific nuance left to keep
+    them separate for."""
+    if isinstance(exc, UpstoxApiError):
+        if exc.status_code < 500:
+            return _http_error(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.message)
+        return _http_error(status.HTTP_502_BAD_GATEWAY, exc.message)
+    return _http_error(status.HTTP_502_BAD_GATEWAY, "Could not reach Upstox")
 
 
 def _load_access_token(token_store: EncryptedTokenStore) -> str:
@@ -153,3 +186,56 @@ async def get_order_engine_order(
         status=existing.get("status"),
         raw=existing,
     )
+
+
+@router.post("/orders/{idempotency_key}/cancel", response_model=OrderEngineCancelOrderResponse)
+async def cancel_order_engine_order(
+    idempotency_key: str,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> OrderEngineCancelOrderResponse:
+    """§7.7's "an actual broker order already in flight" cancel path -- "a real `cancel`/`modify`
+    API call, confirmed against broker state afterward rather than trusted from the API response
+    alone." 404 means [idempotency_key] has no matching order at all (nothing to cancel -- e.g.
+    it already filled, or was never placed), never conflated with a genuine cancel failure.
+    """
+    access_token = _load_access_token(token_store)
+    order_service = OrderEngineOrderService(service)
+    try:
+        confirmed = await order_service.cancel_order(access_token, idempotency_key)
+    except (UpstoxApiError, httpx.TimeoutException, httpx.TransportError) as exc:
+        raise _upstox_call_error(exc) from exc
+
+    if confirmed is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "No matching order found to cancel")
+
+    return OrderEngineCancelOrderResponse(status=confirmed.get("status"), raw=confirmed)
+
+
+@router.put("/orders/{idempotency_key}/quantity", response_model=OrderEngineModifyQuantityResponse)
+async def modify_order_engine_order_quantity(
+    idempotency_key: str,
+    body: OrderEngineModifyQuantityRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+) -> OrderEngineModifyQuantityResponse:
+    """§7.7's quantity-only modify path -- "offered only on genuine `LIMIT` conditional entries
+    ... the broker's native modify is called directly, result surfaced plainly." Every field
+    besides quantity is carried over unchanged from the order's own current broker-reported state
+    (see `OrderEngineOrderService.modify_order_quantity`); this route has no way to change price,
+    order type, or trigger price, by design. 404 has the same "nothing to modify" meaning as
+    [cancel_order_engine_order]'s own.
+    """
+    access_token = _load_access_token(token_store)
+    order_service = OrderEngineOrderService(service)
+    try:
+        confirmed = await order_service.modify_order_quantity(
+            access_token, idempotency_key, body.quantity,
+        )
+    except (UpstoxApiError, httpx.TimeoutException, httpx.TransportError) as exc:
+        raise _upstox_call_error(exc) from exc
+
+    if confirmed is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "No matching order found to modify")
+
+    return OrderEngineModifyQuantityResponse(status=confirmed.get("status"), raw=confirmed)

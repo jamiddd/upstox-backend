@@ -106,3 +106,52 @@ class OrderEngineOrderService:
             tag=derive_order_tag(idempotency_key),
         )
         return OrderEnginePlacementResult(already_existed=False, order=placed)
+
+    async def cancel_order(
+        self, access_token: str, idempotency_key: str
+    ) -> Optional[dict[str, Any]]:
+        """§7.7's "an actual broker order already in flight" cancel path: a real Upstox cancel
+        call, then re-confirmed against broker state afterward rather than trusted from the cancel
+        ack alone -- "confirmed against broker state afterward rather than trusted from the API
+        response alone ... that race's outcome ... is surfaced as a fact, never treated as an
+        error or silently swallowed." Returns `None` if [idempotency_key] has no matching order at
+        all (nothing to cancel -- the route layer surfaces this as 404, not a cancel failure).
+        Lets `UpstoxApiError`/transport exceptions propagate uncaught, same reasoning as
+        [place_order]."""
+        existing = await self.find_existing_order(access_token, idempotency_key)
+        if existing is None:
+            return None
+        order_id = existing.get("order_id")
+        await self.upstox.cancel_order(access_token, order_id)
+        confirmed = await self.find_existing_order(access_token, idempotency_key)
+        # A confirmed re-fetch that comes back empty (e.g. the cancelled order fell off today's
+        # book entirely) still needs *something* to return -- the pre-cancel snapshot is the best
+        # available fact in that edge case, never treated as "cancel silently failed."
+        return confirmed if confirmed is not None else existing
+
+    async def modify_order_quantity(
+        self, access_token: str, idempotency_key: str, quantity: int
+    ) -> Optional[dict[str, Any]]:
+        """§7.7's quantity-only modify path -- "offered only on genuine LIMIT conditional
+        entries ... the broker's native modify is called directly." Every other field
+        (price/order_type/trigger_price/validity) is carried over unchanged from the order's own
+        current broker-reported values, never re-supplied by the caller, so this can only ever
+        change quantity, matching the design's own scoping. Returns `None` if [idempotency_key]
+        has no matching order (route layer surfaces 404). Same confirm-after-mutate discipline as
+        [cancel_order]."""
+        existing = await self.find_existing_order(access_token, idempotency_key)
+        if existing is None:
+            return None
+        await self.upstox.modify_order(
+            access_token,
+            {
+                "order_id": existing.get("order_id"),
+                "quantity": quantity,
+                "validity": existing.get("validity", "DAY"),
+                "price": existing.get("price", 0),
+                "order_type": existing.get("order_type", "LIMIT"),
+                "trigger_price": existing.get("trigger_price", 0),
+            },
+        )
+        confirmed = await self.find_existing_order(access_token, idempotency_key)
+        return confirmed if confirmed is not None else existing
