@@ -48,6 +48,25 @@ def test_extract_order_ids_from_sliced_gtt_response() -> None:
     assert extract_order_ids(payload) == ["gtt-1", "gtt-2"]
 
 
+def test_extract_order_ids_from_place_order_v3_response() -> None:
+    # Regression case: a real order-engine placement (2026-08-12) filled cleanly at the broker but
+    # was reported back as broker_order_id=None, because Upstox's real Place Order V3 response
+    # shapes its id under a plural `order_ids` list, not the singular `order_id` key this function
+    # previously only recognized.
+    payload = {"status": "success", "data": {"order_ids": ["260812000184985"]}}
+    assert extract_order_ids(payload) == ["260812000184985"]
+
+
+def test_extract_order_ids_ignores_empty_order_ids_list() -> None:
+    payload = {"status": "success", "data": {"order_ids": []}}
+    assert extract_order_ids(payload) == []
+
+
+def test_extract_order_ids_handles_multiple_order_ids() -> None:
+    payload = {"status": "success", "data": {"order_ids": ["id-1", "id-2"]}}
+    assert extract_order_ids(payload) == ["id-1", "id-2"]
+
+
 async def test_capture_fetches_signals_and_contract_ltp(tmp_path) -> None:
     store = _store(tmp_path)
     service = TradeContextService(store=store, upstox=_Upstox(), signals=_Signals())

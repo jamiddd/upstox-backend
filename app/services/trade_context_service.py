@@ -110,7 +110,21 @@ class TradeContextService:
 
 
 def extract_order_ids(payload: Any) -> list[str]:
-    """Return broker order/GTT IDs from arbitrarily nested Upstox responses."""
+    """Return broker order/GTT IDs from arbitrarily nested Upstox responses.
+
+    FIX: Upstox's Place Order V3 response (`UpstoxService.place_order`'s own return value, hit
+    live by a real order placed through the new order engine) shapes its id as
+    `{"status": "success", "data": {"order_ids": ["260812000184985"]}}` -- a *plural* `order_ids`
+    key holding a list of id strings directly, not a nested object with its own singular
+    `order_id` key the way every other response shape this function was written against (GTT
+    slices, order-book listings) carries it. The old singular-key-only check silently found
+    nothing here: the list under `order_ids` doesn't match the key set, so control fell through to
+    `visit(child)` on the list, which then visited each bare string element and did nothing (a
+    string is neither a dict nor a list, so `visit` has no case for it) -- a real order that placed
+    and filled cleanly was reported back to the order-engine route as `broker_order_id=None`, which
+    `OrderEngineOrderService`'s callers (Android's `RealBrokerOrderGateway`) correctly but
+    needlessly treat as an ambiguous placement rather than a confirmed one.
+    """
     found: list[str] = []
 
     def visit(value: Any) -> None:
@@ -118,6 +132,8 @@ def extract_order_ids(payload: Any) -> list[str]:
             for key, child in value.items():
                 if key in {"order_id", "gtt_order_id"} and isinstance(child, str) and child:
                     found.append(child)
+                elif key == "order_ids" and isinstance(child, list):
+                    found.extend(item for item in child if isinstance(item, str) and item)
                 else:
                     visit(child)
         elif isinstance(value, list):
