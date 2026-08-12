@@ -11,6 +11,7 @@ from app.services.device_token_store import DeviceTokenStore
 from app.services.max_loss_settings_store import MaxLossSettingsStore
 from app.services.journal_store import JournalStore
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
+from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 from app.services.notification_service import NotificationService
 from app.services.notification_store import NotificationStore
 from app.services.oi_snapshot_store import OISnapshotStore
@@ -89,6 +90,16 @@ def get_order_engine_ledger_store(
     """Create the new order engine's server-authoritative ledger store for a request -- see
     `docs/ORDER_POSITION_OVERHAUL_DESIGN.md` §8."""
     return OrderEngineLedgerStore(settings)
+
+
+def get_order_engine_lot_tracker(request: Request) -> OrderEngineLotTracker:
+    """The app-lifetime `OrderEngineLotTracker` singleton (see `_lifespan`), not a fresh one --
+    unlike `get_order_engine_ledger_store` above (safe to construct fresh per request, since it
+    just opens the same SQLite file), this tracker's own value is its in-memory `_last_ltp` cache
+    accumulated from real live ticks; a fresh instance would have never seen a tick and would
+    report every open lot's live P&L as zero. Backs the new `GET .../ledger/pnl-summary` route --
+    the one place a REST caller needs the *live* number, not just the ledger's own stored rows."""
+    return request.app.state.order_engine_lot_tracker
 
 
 def get_device_token_store(settings: Settings = Depends(get_settings)) -> DeviceTokenStore:

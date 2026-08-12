@@ -5,10 +5,11 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_order_engine_ledger_store
+from app.api.dependencies import get_order_engine_ledger_store, get_order_engine_lot_tracker
 from app.core.config import Settings, get_settings
 from app.main import app
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
+from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 
 _HEADERS = {"X-API-Key": "mobile-secret"}
 
@@ -30,8 +31,13 @@ def _client(tmp_path: Path) -> TestClient:
     ledger = OrderEngineLedgerStore(
         replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
     )
+    # get_order_engine_lot_tracker normally reads the app-lifetime singleton off app.state (see
+    # its own doc comment) -- TestClient(app) here never runs the real lifespan, so this override
+    # supplies a tracker bound to the *same* ledger instance the test itself writes through,
+    # exactly like the real singleton would be.
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
     return TestClient(app)
 
 
@@ -232,5 +238,49 @@ def test_upsert_max_loss_epoch_rejects_a_non_positive_threshold(tmp_path) -> Non
             },
         )
         assert response.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_pnl_summary_sums_realized_across_open_and_closed_lots(tmp_path) -> None:
+    client = _client(tmp_path)
+    try:
+        client.put(
+            "/api/order-engine/ledger/lots",
+            headers=_HEADERS,
+            json={
+                "lot_id": "lot-open", "instrument_key": "NSE_FO|1", "transaction_type": "BUY",
+                "entry_price": 100.0, "entry_quantity": 50, "remaining_quantity": 50,
+                "realized_pnl": 250.0, "state": "OPEN",
+            },
+        )
+        client.put(
+            "/api/order-engine/ledger/lots",
+            headers=_HEADERS,
+            json={
+                "lot_id": "lot-closed", "instrument_key": "NSE_FO|2", "transaction_type": "SELL",
+                "entry_price": 200.0, "entry_quantity": 10, "remaining_quantity": 0,
+                "realized_pnl": -30.0, "state": "CLOSED",
+            },
+        )
+
+        response = client.get("/api/order-engine/ledger/pnl-summary", headers=_HEADERS)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["realized_pnl"] == 220.0  # 250 + (-30), both open and closed count
+        assert body["unrealized_pnl"] == 0.0  # no ticks seen by this fresh tracker
+        assert body["open_lot_count"] == 1  # only lot-open
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_pnl_summary_is_all_zero_with_no_lots_at_all(tmp_path) -> None:
+    client = _client(tmp_path)
+    try:
+        response = client.get("/api/order-engine/ledger/pnl-summary", headers=_HEADERS)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"realized_pnl": 0.0, "unrealized_pnl": 0.0, "open_lot_count": 0}
     finally:
         app.dependency_overrides.clear()

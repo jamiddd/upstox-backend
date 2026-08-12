@@ -472,6 +472,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         exit_all_lock=order_engine_exit_all_lock,
     )
 
+    app.state.order_engine_lot_tracker = order_engine_lot_tracker
     app.state.market_feed_client = market_feed_client
     app.state.portfolio_feed_client = portfolio_feed_client
     app.state.feed_subscription_manager = subscription_manager

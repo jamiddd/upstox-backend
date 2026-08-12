@@ -9,12 +9,14 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies import (
     get_order_engine_ledger_store,
+    get_order_engine_lot_tracker,
     get_token_store,
     get_upstox_service,
 )
 from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequiredError
 from app.core.security import require_mobile_api_key
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
+from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 from app.services.order_engine_order_service import OrderEngineOrderService, UnintendedShortGuardError
 from app.services.token_store import EncryptedTokenStore
 from app.services.trade_context_service import extract_order_ids
@@ -474,3 +476,39 @@ async def get_ledger_max_loss_epoch(
     if epoch is None:
         raise _http_error(status.HTTP_404_NOT_FOUND, "No max-loss epoch has been started")
     return OrderEngineMaxLossEpochResponse(epoch=epoch)
+
+
+class OrderEnginePnlSummaryResponse(BaseModel):
+    """§8.2's live-PnL formula, summarized -- the REST counterpart to the WS-pushed
+    `dispatch_order_engine_lot_status` (per-lot, not a total). Built for a feed-less screen (the
+    new engine's own home screen has no `BackendFeedClient` by design) that still wants a genuine
+    live open-position number rather than nothing, or a stale local-only one."""
+
+    realized_pnl: float
+    unrealized_pnl: float
+    open_lot_count: int
+
+
+@router.get("/ledger/pnl-summary", response_model=OrderEnginePnlSummaryResponse)
+async def get_ledger_pnl_summary(
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+    lot_tracker: OrderEngineLotTracker = Depends(get_order_engine_lot_tracker),
+) -> OrderEnginePnlSummaryResponse:
+    """`realized_pnl` sums every lot's own banked `realized_pnl` (open or closed, same whole-day
+    figure the client's own `PnLCalculator.realizedPnl` sums); `unrealized_pnl` is
+    [OrderEngineLotTracker.total_live_pnl] -- the *same* app-lifetime tracker instance the live
+    tick path/`order_engine_max_loss_watcher.py` already use (see
+    `get_order_engine_lot_tracker`'s own doc comment for why this must be the singleton, not a
+    fresh instance), so this number is only ever as stale as the tracker's own last-seen-tick
+    cache, never fabricated from a fresh, empty one. No auth/scope beyond the router's own
+    `require_mobile_api_key` -- there's nothing lot-specific or mutating here."""
+    total_realized = sum(_pnl_number(lot.get("realized_pnl")) for lot in ledger.get_all_lots())
+    return OrderEnginePnlSummaryResponse(
+        realized_pnl=total_realized,
+        unrealized_pnl=lot_tracker.total_live_pnl(),
+        open_lot_count=len(ledger.get_open_lots()),
+    )
+
+
+def _pnl_number(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
