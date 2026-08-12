@@ -59,6 +59,77 @@ def test_upsert_lot_inserts_then_updates_the_same_row(tmp_path) -> None:
     assert count == 1
 
 
+def test_upsert_lot_defaults_product_to_intraday(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+
+    lot = store.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN",
+    )
+
+    assert lot["product"] == "I"
+
+
+def test_upsert_lot_carries_an_explicit_product_through(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+
+    lot = store.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN", product="D",
+    )
+
+    assert lot["product"] == "D"
+    assert store.get_lot("lot-1")["product"] == "D"
+
+
+def test_a_lots_table_from_before_product_existed_gets_the_column_added_on_open(tmp_path) -> None:
+    """Simulates a real already-deployed lots table predating the `product` column -- the
+    `ALTER TABLE ... ADD COLUMN` migration in `_initialize` must retrofit it, not just define it
+    for brand-new tables via `CREATE TABLE IF NOT EXISTS` (a no-op against an existing table)."""
+    import sqlite3
+
+    settings = _settings(tmp_path)
+    settings.order_engine_ledger_database_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(settings.order_engine_ledger_database_path)
+    connection.execute(
+        """
+        CREATE TABLE lots (
+            id TEXT PRIMARY KEY,
+            instrument_key TEXT NOT NULL,
+            transaction_type TEXT NOT NULL,
+            entry_price REAL,
+            entry_quantity INTEGER NOT NULL,
+            remaining_quantity INTEGER NOT NULL,
+            realized_pnl REAL NOT NULL DEFAULT 0,
+            state TEXT NOT NULL,
+            target_price REAL,
+            stoploss_price REAL,
+            trailing_gap REAL,
+            target_rule_id TEXT,
+            stoploss_rule_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+    )
+    connection.execute(
+        "INSERT INTO lots (id, instrument_key, transaction_type, entry_quantity, remaining_quantity, "
+        "realized_pnl, state, created_at, updated_at) VALUES "
+        "('pre-existing-lot', 'NSE_FO|1', 'BUY', 10, 10, 0, 'OPEN', '2026-01-01T00:00:00+00:00', "
+        "'2026-01-01T00:00:00+00:00')",
+    )
+    connection.commit()
+    connection.close()
+
+    store = OrderEngineLedgerStore(settings)
+
+    assert store.get_lot("pre-existing-lot")["product"] == "I"
+    # Opening a second time (a real process restart) must not blow up on "duplicate column name".
+    OrderEngineLedgerStore(settings)
+
+
 def test_get_open_lots_excludes_closed(tmp_path) -> None:
     store = OrderEngineLedgerStore(_settings(tmp_path))
     store.upsert_lot(
@@ -107,6 +178,31 @@ def test_upsert_trigger_rule_and_get_armed(tmp_path) -> None:
     )
     armed_after = store.get_armed_trigger_rules()
     assert [rule["id"] for rule in armed_after] == ["rule-tp"]
+
+
+def test_get_trigger_rules_by_state_scopes_to_the_requested_state(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    store.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=10, remaining_quantity=10,
+        realized_pnl=0.0, state="OPEN",
+    )
+    store.upsert_trigger_rule(
+        rule_id="rule-sl", lot_id="lot-1", instrument_key="NSE_FO|1",
+        role="STOP_LOSS", state="PLACED", condition_op="BELOW", condition_value=90.0,
+        sibling_rule_id="rule-tp",
+    )
+    store.upsert_trigger_rule(
+        rule_id="rule-tp", lot_id="lot-1", instrument_key="NSE_FO|1",
+        role="TARGET", state="CANCELLED", condition_op="ABOVE", condition_value=110.0,
+        sibling_rule_id="rule-sl",
+    )
+
+    placed = store.get_trigger_rules_by_state("PLACED")
+
+    assert [rule["id"] for rule in placed] == ["rule-sl"]
+    assert store.get_trigger_rules_by_state("CANCELLED")[0]["id"] == "rule-tp"
+    assert store.get_trigger_rules_by_state("ARMED") == []
 
 
 def test_events_are_append_only_and_ordered(tmp_path) -> None:

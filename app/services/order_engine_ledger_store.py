@@ -63,6 +63,7 @@ class OrderEngineLedgerStore:
                     trailing_gap REAL,
                     target_rule_id TEXT,
                     stoploss_rule_id TEXT,
+                    product TEXT NOT NULL DEFAULT 'I',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -110,6 +111,18 @@ class OrderEngineLedgerStore:
                 );
                 """,
             )
+            # `CREATE TABLE IF NOT EXISTS` above is a no-op against an already-existing `lots`
+            # table from before `product` existed (this store's file persists across restarts,
+            # under the same Docker-volume-backed directory every other *_path store in this app
+            # uses) -- an explicit, idempotent ALTER is the only way an already-deployed table
+            # actually gains the column. `duplicate column name` is SQLite's own error text for
+            # "already migrated," swallowed the same way this repo's other one-shot ALTER-based
+            # migrations do; any other OperationalError is a genuine problem and propagates.
+            try:
+                connection.execute("ALTER TABLE lots ADD COLUMN product TEXT NOT NULL DEFAULT 'I'")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
 
     @staticmethod
     def _now() -> str:
@@ -133,9 +146,17 @@ class OrderEngineLedgerStore:
         trailing_gap: Optional[float] = None,
         target_rule_id: Optional[str] = None,
         stoploss_rule_id: Optional[str] = None,
+        product: str = "I",
     ) -> dict[str, Any]:
         """Insert-or-update by `lot_id` -- the client generates this id, so a resend (retry after
-        a dropped response, e.g.) upserts the same row rather than duplicating it."""
+        a dropped response, e.g.) upserts the same row rather than duplicating it.
+
+        [product] closes half of `order_engine_max_loss_watcher.flatten_open_lots`'s own
+        v1 scope note (`docs/ORDER_POSITION_OVERHAUL_DESIGN.md` §8.4 milestone 6): the ledger
+        previously had no per-lot product recorded at all, so an emergency flatten always placed
+        its exit at product `"I"` regardless of what the lot's own entry actually used. Defaults
+        `"I"` so every pre-existing caller (and every already-persisted row, via this table's own
+        `ALTER TABLE ... DEFAULT 'I'` migration) is unaffected."""
         now = self._now()
         with self._connect() as connection:
             existing = connection.execute(
@@ -147,8 +168,8 @@ class OrderEngineLedgerStore:
                 INSERT INTO lots (
                     id, instrument_key, transaction_type, entry_price, entry_quantity,
                     remaining_quantity, realized_pnl, state, target_price, stoploss_price,
-                    trailing_gap, target_rule_id, stoploss_rule_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    trailing_gap, target_rule_id, stoploss_rule_id, product, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     instrument_key = excluded.instrument_key,
                     transaction_type = excluded.transaction_type,
@@ -162,12 +183,13 @@ class OrderEngineLedgerStore:
                     trailing_gap = excluded.trailing_gap,
                     target_rule_id = excluded.target_rule_id,
                     stoploss_rule_id = excluded.stoploss_rule_id,
+                    product = excluded.product,
                     updated_at = excluded.updated_at
                 """,
                 (
                     lot_id, instrument_key, transaction_type, entry_price, entry_quantity,
                     remaining_quantity, realized_pnl, state, target_price, stoploss_price,
-                    trailing_gap, target_rule_id, stoploss_rule_id, created_at, now,
+                    trailing_gap, target_rule_id, stoploss_rule_id, product, created_at, now,
                 ),
             )
         return self.get_lot(lot_id)  # type: ignore[return-value]
@@ -251,6 +273,18 @@ class OrderEngineLedgerStore:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM trigger_rules WHERE state = 'ARMED' ORDER BY created_at",
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_trigger_rules_by_state(self, state: str) -> list[dict[str, Any]]:
+        """General-purpose sibling to [get_armed_trigger_rules] -- needed by
+        `_on_portfolio_update`'s exit-reconciliation wiring, which has to scan every currently
+        `PLACED` bracket leg to find the one whose derived Upstox tag matches an incoming
+        `order_update`'s `tag` (see `order_engine_order_service.derive_order_tag` -- the mapping
+        is one-way, so there's no direct tag -> rule_id lookup, only this kind of scan)."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM trigger_rules WHERE state = ? ORDER BY created_at", (state,),
             ).fetchall()
         return [dict(row) for row in rows]
 

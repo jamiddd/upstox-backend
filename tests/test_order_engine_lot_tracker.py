@@ -111,3 +111,36 @@ def test_instrument_keys_returns_every_open_lots_instrument(tmp_path) -> None:
     tracker = OrderEngineLotTracker(store)
 
     assert tracker.instrument_keys() == {"NSE_FO|1", "NSE_FO|2"}
+
+
+def test_open_lots_without_recent_tick_reports_only_the_un_ticked_ones(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    _open_lot(store, lot_id="lot-ticked", instrument_key="NSE_FO|1")
+    _open_lot(store, lot_id="lot-un-ticked", instrument_key="NSE_FO|2")
+    tracker = OrderEngineLotTracker(store)
+
+    tracker.apply_tick("NSE_FO|1", 110.0)
+
+    without_a_tick = tracker.open_lots_without_recent_tick()
+    assert [lot["id"] for lot in without_a_tick] == ["lot-un-ticked"]
+
+
+def test_open_lots_without_recent_tick_is_empty_once_every_open_lot_has_ticked(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    _open_lot(store, lot_id="lot-1", instrument_key="NSE_FO|1")
+    tracker = OrderEngineLotTracker(store)
+
+    tracker.apply_tick("NSE_FO|1", 110.0)
+
+    assert tracker.open_lots_without_recent_tick() == []
+
+
+def test_open_lots_without_recent_tick_excludes_closed_lots(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    store.upsert_lot(
+        lot_id="lot-closed", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=10, remaining_quantity=0, realized_pnl=10.0, state="CLOSED",
+    )
+    tracker = OrderEngineLotTracker(store)
+
+    assert tracker.open_lots_without_recent_tick() == []

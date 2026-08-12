@@ -66,6 +66,12 @@ class _FakeUpstox:
             ],
         }
 
+    async def get_quotes(self, access_token, instrument_key):
+        # No lot in this suite has ever ticked, so _current_equity's worst-case-pessimism pass
+        # calls this for every open lot -- an empty book resolves to None, i.e. the pre-existing
+        # zero-fallback for that lot, same as before this pass existed.
+        return {"status": "success", "data": {instrument_key: {"depth": {"buy": [], "sell": []}}}}
+
     async def place_order(self, access_token, **kwargs):
         self.place_order_calls.append(kwargs)
         return {"status": "success", "data": {"order_id": f"order-{len(self.place_order_calls)}"}}
@@ -172,6 +178,7 @@ async def test_a_max_loss_breach_is_caught_and_flattened_with_zero_client_involv
     # state at all -- every piece here is the real backend production wiring, driven purely by a
     # ledger write (standing in for "the client mirrored a lot at some point in the past") and a
     # single check_now call (standing in for "a live tick arrived").
+    watcher._worst_case_quote_cache.clear()  # see test_order_engine_max_loss_watcher.py's own note
     ledger = OrderEngineLedgerStore(_settings(tmp_path))
     tracker = OrderEngineLotTracker(ledger)
     upstox = _FakeUpstox(held_quantities={"NSE_FO|1": 50})

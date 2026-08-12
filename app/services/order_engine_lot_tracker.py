@@ -101,6 +101,18 @@ class OrderEngineLotTracker:
             total += _live_pnl(lot, ltp)
         return total
 
+    def open_lots_without_recent_tick(self) -> list[dict]:
+        """Every open lot on an instrument this tracker has never seen a live tick for since
+        process start -- exactly the population [total_live_pnl]'s own zero-fallback silently
+        under-covers (see that method's own doc comment: it falls back to `entry_price`, i.e.
+        zero live P&L, for these). `order_engine_max_loss_watcher._current_equity` uses this to
+        know which lots need a forced re-quote for §8.3's worst-case-first pessimism instead of a
+        flat zero -- see that module's own doc comment for the full mechanism."""
+        return [
+            lot for lot in self._ledger_store.get_open_lots()
+            if lot["instrument_key"] not in self._last_ltp
+        ]
+
     def instrument_keys(self) -> set[str]:
         """Every currently open lot's instrument -- what a subscription manager needs to keep
         subscribed on the shared market feed so [apply_tick] actually gets called for them,

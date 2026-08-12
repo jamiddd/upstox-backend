@@ -18,6 +18,7 @@ from app.api.routes import router as api_router
 from app.api.stream_routes import router as stream_router
 from app.api.order_engine_routes import router as order_engine_router
 from app.core.config import get_settings
+from app.core.exceptions import TokenStoreError, UpstoxAuthRequiredError
 from app.core.market_hours import is_market_open
 from app.services.auth_watchdog import run_auth_watchdog
 from app.services.auth_watchdog import run_auth_watchdog                                                      
@@ -28,8 +29,12 @@ from app.services.feed_subscription_manager import FeedSubscriptionManager
 from app.services.gtt_status_poller import run_gtt_status_poller
 from app.services.instrument_rules_service import InstrumentRulesService
 from app.services.journal_store import JournalStore
+from app.services.exit_reconciliation_checker import ExitReconciliationChecker
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
 from app.services.order_engine_lot_tracker import OrderEngineLotTracker
+from app.services.order_engine_max_loss_watcher import check_now as check_order_engine_max_loss_now
+from app.services.order_engine_max_loss_watcher import run_fallback_loop as run_order_engine_max_loss_watcher_fallback
+from app.services.order_engine_order_service import OrderEngineOrderService, derive_order_tag
 from app.services.journal_reconciler import JournalReconciler, run_journal_reconciler
 from app.services.live_candle_builder import LiveCandleBuilder, feed_candle_to_cache_row
 from app.services.max_loss_settings_store import MaxLossSettingsStore
@@ -144,6 +149,21 @@ class _MaxLossWatcherDeps:
     settings_store: MaxLossSettingsStore
     smart_order_service: SmartOrderService
     instrument_rules_service: InstrumentRulesService
+    notification_service: NotificationService
+    exit_all_lock: asyncio.Lock
+
+
+@dataclass
+class _OrderEngineMaxLossWatcherDeps:
+    """[_MaxLossWatcherDeps]'s sibling for the new engine's own server-side watcher (§8.4
+    milestone 6) -- kept separate rather than folded into that dataclass, same isolation-rule
+    posture as the rest of Part 4: a different ledger, a different lock, a different order
+    service, no shared state with the old engine's watcher at all."""
+
+    token_store: EncryptedTokenStore
+    ledger_store: OrderEngineLedgerStore
+    lot_tracker: OrderEngineLotTracker
+    order_service: OrderEngineOrderService
     notification_service: NotificationService
     exit_all_lock: asyncio.Lock
 
@@ -356,6 +376,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # local SQLite file, not a network call (see OrderEngineLotTracker's own doc comment).
     order_engine_ledger_store = OrderEngineLedgerStore(settings)
     order_engine_lot_tracker = OrderEngineLotTracker(order_engine_ledger_store)
+    # §8.4 milestones 5/6's live callers -- dedicated token store/UpstoxService instances, same
+    # posture as max_loss_token_store/max_loss_upstox above, and a dedicated exit_all_lock since
+    # this flattens against an entirely different ledger than the old engine's own
+    # exit_all_lock/position_tracker guard.
+    order_engine_token_store = EncryptedTokenStore(settings)
+    order_engine_upstox = UpstoxService(settings, client=upstox_http_client)
+    order_engine_order_service = OrderEngineOrderService(order_engine_upstox)
+    order_engine_exit_all_lock = asyncio.Lock()
+    exit_reconciliation_checker = ExitReconciliationChecker(order_engine_ledger_store, order_engine_upstox)
     trade_context_token_store = EncryptedTokenStore(settings)
     trade_context_upstox = UpstoxService(settings, client=upstox_http_client)
     trade_context_service = TradeContextService(
@@ -387,7 +416,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         token_store=market_feed_token_store,
         on_tick=lambda tick: _on_market_tick(
             candle_builder, stream_manager, position_tracker, max_loss_watcher_deps,
-            order_flow_service, order_engine_lot_tracker, tick,
+            order_flow_service, order_engine_lot_tracker, order_engine_max_loss_watcher_deps, tick,
         ),
         on_state_change=market_feed_notifier.handle,
     )
@@ -405,6 +434,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             trade_context_service,
             trade_context_token_store,
             journal_reconciler,
+            order_engine_ledger_store,
+            exit_reconciliation_checker,
+            order_engine_token_store,
             payload,
         ),
         on_state_change=portfolio_feed_notifier.handle,
@@ -430,6 +462,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         instrument_rules_service=max_loss_instrument_rules_service,
         notification_service=notification_service,
         exit_all_lock=exit_all_lock,
+    )
+    order_engine_max_loss_watcher_deps = _OrderEngineMaxLossWatcherDeps(
+        token_store=order_engine_token_store,
+        ledger_store=order_engine_ledger_store,
+        lot_tracker=order_engine_lot_tracker,
+        order_service=order_engine_order_service,
+        notification_service=notification_service,
+        exit_all_lock=order_engine_exit_all_lock,
     )
 
     app.state.market_feed_client = market_feed_client
@@ -484,6 +524,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             exit_all_lock=max_loss_watcher_deps.exit_all_lock,
         ),
     )
+    # §8.4 milestone 6's backstop -- check_now itself now also runs on every live tick that
+    # touches an open order-engine lot, see _on_market_tick; this loop only matters for stretches
+    # with no ticks, same "backstop, not primary" relationship the old engine's own
+    # max_loss_watcher_task has to check_max_loss_now.
+    order_engine_max_loss_watcher_task = asyncio.create_task(
+        run_order_engine_max_loss_watcher_fallback(
+            token_store=order_engine_max_loss_watcher_deps.token_store,
+            ledger_store=order_engine_max_loss_watcher_deps.ledger_store,
+            lot_tracker=order_engine_max_loss_watcher_deps.lot_tracker,
+            order_engine_order_service=order_engine_max_loss_watcher_deps.order_service,
+            notification_service=order_engine_max_loss_watcher_deps.notification_service,
+            exit_all_lock=order_engine_max_loss_watcher_deps.exit_all_lock,
+        ),
+    )
 
     await notification_service.record(
         category="system",
@@ -502,6 +556,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         notification_retention_task.cancel()
         gtt_status_poller_task.cancel()
         max_loss_watcher_task.cancel()
+        order_engine_max_loss_watcher_task.cancel()
         subscription_refresh_task.cancel()
         position_tracker_refresh_task.cancel()
         market_feed_staleness_task.cancel()
@@ -520,6 +575,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await gtt_status_poller_task
         with contextlib.suppress(asyncio.CancelledError):
             await max_loss_watcher_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await order_engine_max_loss_watcher_task
         with contextlib.suppress(asyncio.CancelledError):
             await subscription_refresh_task
         with contextlib.suppress(asyncio.CancelledError):
@@ -643,6 +700,7 @@ def _on_market_tick(
     max_loss_watcher_deps: _MaxLossWatcherDeps,
     order_flow_service: OrderFlowService,
     order_engine_lot_tracker: OrderEngineLotTracker,
+    order_engine_max_loss_watcher_deps: _OrderEngineMaxLossWatcherDeps,
     tick: FeedTick,
 ) -> None:
     live_candle = candle_builder.handle_tick(tick)
@@ -662,6 +720,22 @@ def _on_market_tick(
     lot_statuses = order_engine_lot_tracker.apply_tick(tick.instrument_key, tick.ltp)
     if lot_statuses:
         asyncio.create_task(stream_manager.dispatch_order_engine_lot_status(lot_statuses))
+
+    # §8.4 milestone 6, wired to a live caller: only worth checking on a tick that actually
+    # touches an open order-engine lot, same "gate on the relevant instrument set" posture the old
+    # engine's own check_max_loss_now call below already uses against position_tracker.
+    if tick.instrument_key in order_engine_lot_tracker.instrument_keys():
+        asyncio.create_task(
+            check_order_engine_max_loss_now(
+                now=datetime.now(timezone.utc),
+                token_store=order_engine_max_loss_watcher_deps.token_store,
+                ledger_store=order_engine_max_loss_watcher_deps.ledger_store,
+                lot_tracker=order_engine_max_loss_watcher_deps.lot_tracker,
+                order_engine_order_service=order_engine_max_loss_watcher_deps.order_service,
+                notification_service=order_engine_max_loss_watcher_deps.notification_service,
+                exit_all_lock=order_engine_max_loss_watcher_deps.exit_all_lock,
+            ),
+        )
 
     position_tracker.apply_tick(tick.instrument_key, tick.ltp)
     if tick.instrument_key in position_tracker.instrument_keys():
@@ -688,6 +762,9 @@ def _on_portfolio_update(
     trade_context_service: TradeContextService,
     trade_context_token_store: EncryptedTokenStore,
     journal_reconciler: JournalReconciler,
+    order_engine_ledger_store: OrderEngineLedgerStore,
+    exit_reconciliation_checker: ExitReconciliationChecker,
+    order_engine_token_store: EncryptedTokenStore,
     payload: dict[str, Any],
 ) -> None:
     async def _refresh_position_tracker() -> None:
@@ -749,6 +826,66 @@ def _on_portfolio_update(
     # OrderFillDetector's own edge-detection is specifically about when to play the fill sound,
     # a client-side concern, not a filter on what state changes reach the app at all.
     asyncio.create_task(stream_manager.dispatch_order_update(payload))
+
+    # §8.4 milestone 5, wired to a live caller: a "complete" update whose tag matches one of the
+    # new engine's own currently-PLACED bracket legs is an exit fill worth reconciling against
+    # broker truth. Fire-and-forget, same posture as every other side-effect in this handler --
+    # check_lot itself records the MATCHED/MISMATCH event, nothing here needs the result.
+    if is_new_fill:
+        asyncio.create_task(
+            _reconcile_order_engine_exit(
+                order_engine_ledger_store, exit_reconciliation_checker, order_engine_token_store, payload,
+            ),
+        )
+
+
+async def _reconcile_order_engine_exit(
+    ledger_store: OrderEngineLedgerStore,
+    checker: ExitReconciliationChecker,
+    token_store: EncryptedTokenStore,
+    payload: dict[str, Any],
+) -> None:
+    """§8.4 milestone 5's live-wiring: matches a newly-`complete` portfolio-feed order update
+    against one of the new engine's own `PLACED` bracket legs and, on a match, reconciles that
+    lot's realized P&L against broker truth (see `ExitReconciliationChecker.check_lot`'s own doc
+    comment for the actual formula/mismatch classification).
+
+    The match itself has to be a scan, not a lookup: Upstox's `tag` field on the payload is
+    [derive_order_tag]'s one-way hash-truncation of a `TriggerRule.id`, not the id itself, so the
+    only way back from a tag to a rule is recomputing the derived tag for every currently-`PLACED`
+    rule and comparing (`ExitFillListener`, client-side, does the analogous work against its own
+    much smaller local Room table -- this is the server-side equivalent, scoped to `PLACED` rows
+    for the same reason). An update with no tag, or a tag that matches nothing (a manual
+    broker-side order, or the old GTT-based path), is silently ignored -- same posture
+    `ExitFillListener`/`EntryFillListener` already use for an unrelated update."""
+    tag = payload.get("tag")
+    order_id = payload.get("order_id") or payload.get("exchange_order_id")
+    if not isinstance(tag, str) or not tag or not isinstance(order_id, str) or not order_id:
+        return
+
+    lot_id: Optional[str] = None
+    for rule in ledger_store.get_trigger_rules_by_state("PLACED"):
+        rule_id = rule.get("id")
+        if isinstance(rule_id, str) and derive_order_tag(rule_id) == tag:
+            lot_id = rule.get("lot_id")
+            break
+    if not lot_id:
+        return
+
+    if not token_store.has_token():
+        return
+    try:
+        access_token = token_store.load_access_token()
+    except (TokenStoreError, UpstoxAuthRequiredError):
+        return
+
+    try:
+        await checker.check_lot(access_token, lot_id, order_id)
+    except Exception:
+        logger.warning(
+            "Order-engine exit reconciliation failed for lot %s / order %s", lot_id, order_id,
+            exc_info=True,
+        )
 
 
 def _payload_price(payload: dict[str, Any]) -> Optional[float]:

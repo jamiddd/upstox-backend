@@ -13,15 +13,19 @@ class FakeUpstox:
     service method's *second* find_existing_order call (the post-mutation confirm) sees the
     updated state, not a frozen snapshot."""
 
-    def __init__(self, order_book_data=None, positions_data=None) -> None:
+    def __init__(self, order_book_data=None, positions_data=None, quotes_data=None) -> None:
         self.place_order_calls: list[dict] = []
         self.cancel_order_calls: list[str] = []
         self.modify_order_calls: list[dict] = []
         self.order_book_data = order_book_data if order_book_data is not None else []
         self.positions_data = positions_data if positions_data is not None else []
+        self.quotes_data = quotes_data if quotes_data is not None else {}
 
     async def get_positions(self, access_token):
         return {"status": "success", "data": self.positions_data}
+
+    async def get_quotes(self, access_token, instrument_key):
+        return {"status": "success", "data": self.quotes_data}
 
     async def get_order_book(self, access_token):
         return {"status": "success", "data": self.order_book_data}
@@ -356,3 +360,51 @@ async def test_resolve_closeable_quantity_is_zero_when_nothing_is_held_at_all():
 
     assert await service.resolve_closeable_quantity("token", "NSE_FO|1", "BUY") == 0.0
     assert await service.resolve_closeable_quantity("token", "NSE_FO|1", "SELL") == 0.0
+
+
+@pytest.mark.anyio
+async def test_resolve_worst_case_exit_price_uses_the_best_bid_for_closing_a_long():
+    fake = FakeUpstox(quotes_data={"NSE_FO|1": {"depth": {"buy": [{"price": 98.5}, {"price": 98.0}], "sell": [{"price": 99.0}]}}})
+    service = OrderEngineOrderService(fake)
+
+    price = await service.resolve_worst_case_exit_price("token", "NSE_FO|1", "BUY")
+
+    assert price == 98.5
+
+
+@pytest.mark.anyio
+async def test_resolve_worst_case_exit_price_uses_the_best_ask_for_closing_a_short():
+    fake = FakeUpstox(quotes_data={"NSE_FO|1": {"depth": {"buy": [{"price": 98.5}], "sell": [{"price": 99.0}, {"price": 99.5}]}}})
+    service = OrderEngineOrderService(fake)
+
+    price = await service.resolve_worst_case_exit_price("token", "NSE_FO|1", "SELL")
+
+    assert price == 99.0
+
+
+@pytest.mark.anyio
+async def test_resolve_worst_case_exit_price_is_none_when_the_needed_side_is_empty():
+    fake = FakeUpstox(quotes_data={"NSE_FO|1": {"depth": {"buy": [], "sell": [{"price": 99.0}]}}})
+    service = OrderEngineOrderService(fake)
+
+    assert await service.resolve_worst_case_exit_price("token", "NSE_FO|1", "BUY") is None
+
+
+@pytest.mark.anyio
+async def test_resolve_worst_case_exit_price_is_none_when_the_instrument_is_entirely_missing():
+    fake = FakeUpstox(quotes_data={})
+    service = OrderEngineOrderService(fake)
+
+    assert await service.resolve_worst_case_exit_price("token", "NSE_FO|1", "BUY") is None
+
+
+@pytest.mark.anyio
+async def test_resolve_worst_case_exit_price_falls_back_to_matching_by_instrument_token():
+    # Upstox keys the quotes response by trading symbol, not the instrument_key -- same lookup
+    # shape _find_quote (main_screen_service.py) already has to handle.
+    fake = FakeUpstox(quotes_data={"NIFTY24AUG25000CE": {"instrument_token": "NSE_FO|1", "depth": {"buy": [{"price": 98.5}], "sell": []}}})
+    service = OrderEngineOrderService(fake)
+
+    price = await service.resolve_worst_case_exit_price("token", "NSE_FO|1", "BUY")
+
+    assert price == 98.5

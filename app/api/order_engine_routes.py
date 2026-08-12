@@ -290,6 +290,7 @@ class OrderEngineLotUpsertRequest(BaseModel):
     trailing_gap: Optional[float] = None
     target_rule_id: Optional[str] = None
     stoploss_rule_id: Optional[str] = None
+    product: str = "I"
 
 
 class OrderEngineLotResponse(BaseModel):
@@ -339,6 +340,7 @@ async def upsert_ledger_lot(
         trailing_gap=body.trailing_gap,
         target_rule_id=body.target_rule_id,
         stoploss_rule_id=body.stoploss_rule_id,
+        product=body.product,
     )
     ledger.record_event(event_type="LOT_UPSERTED", lot_id=body.lot_id, payload={"state": body.state})
     return OrderEngineLotResponse(lot=lot)

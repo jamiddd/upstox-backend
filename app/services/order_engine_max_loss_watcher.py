@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 from zoneinfo import ZoneInfo
 
 from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequiredError
 from app.core.market_hours import is_market_open
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
-from app.services.order_engine_lot_tracker import OrderEngineLotTracker
+from app.services.order_engine_lot_tracker import OrderEngineLotTracker, _live_pnl
 from app.services.order_engine_order_service import OrderEngineOrderService
 
 logger = logging.getLogger(__name__)
@@ -32,18 +33,10 @@ currentEquity <= peakEquity - X else breach when currentEquity <= openingBalance
 duplicated here deliberately (not imported, this is a different language) rather than left
 undefined; keep the two in sync by hand if the formula itself ever changes.
 
-**Honest scope note, v1** -- two named limitations, not hidden:
-1. `_current_equity`'s unrealized component uses `OrderEngineLotTracker.total_live_pnl()`, which
-   falls back to zero live P&L for any open lot whose instrument hasn't ticked yet (see that
-   method's own doc comment). That is *not* the worst-case-first pessimism §8.3's own principle
-   calls for -- a genuinely pessimistic version would need to assume every un-ticked open lot at
-   its worst plausible price (a forced re-quote, or a conservative bound), not a flat zero. This is
-   a real, named gap, not something already solved by this milestone.
-2. [flatten_open_lots] has no per-lot `product`/`order_type` recorded in the ledger to place an
-   exactly-matching exit with (the ledger schema doesn't carry those fields yet) -- it always
-   places a plain `MARKET` exit at product `"I"` (intraday), regardless of what the lot's own
-   entry/bracket was actually configured with. Broadening the ledger schema to carry that through
-   is a follow-up, not this milestone's.
+**v1 scope note, both named limitations now closed** (the `product` one on 2026-08-12, see
+[flatten_open_lots]'s own doc comment; the pessimism one the same day, see [_current_equity]'s own
+doc comment for the mechanism) -- kept here as a pointer for anyone still holding an older mental
+model of this module's scope, not because either is still open.
 """
 
 
@@ -63,12 +56,68 @@ class _NotificationServiceProtocol(Protocol):
     async def record(self, *, category: str, severity: str, title: str, message: str, details: Any = None) -> None: ...
 
 
-def _current_equity(ledger_store: OrderEngineLedgerStore, lot_tracker: OrderEngineLotTracker, opening_balance: float) -> float:
+# §8.3 worst-case-exit-price cache, keyed by (instrument_key, entry_transaction_type) -- a forced
+# re-quote per un-ticked lot on every single tick that reaches check_now would multiply this
+# watcher's own Upstox call volume by however many open lots have no recent price, which is
+# wasteful for a quote that realistically doesn't move meaningfully within a few seconds. Short
+# TTL, same short-lived-cache posture `main_screen_service.py`'s own `_quotes` uses (0.75s there;
+# a few seconds here, since this is a pessimism floor for risk detection, not a tradable price).
+# Keyed by direction too, not just instrument -- a long lot and a short lot on the *same*
+# instrument (unusual, not impossible) need opposite sides of the book, and conflating them would
+# silently use the wrong worst case for one of the two.
+_WORST_CASE_QUOTE_CACHE_TTL_SECONDS = 5.0
+_worst_case_quote_cache: dict[tuple[str, str], tuple[float, float]] = {}
+
+
+async def _worst_case_exit_price_cached(
+    access_token: str, order_engine_order_service: OrderEngineOrderService, lot: dict,
+) -> Optional[float]:
+    instrument_key = lot["instrument_key"]
+    entry_transaction_type = str(lot.get("transaction_type")).upper()
+    cache_key = (instrument_key, entry_transaction_type)
+    cached = _worst_case_quote_cache.get(cache_key)
+    now_monotonic = time.monotonic()
+    if cached is not None and now_monotonic - cached[0] < _WORST_CASE_QUOTE_CACHE_TTL_SECONDS:
+        return cached[1]
+    price = await order_engine_order_service.resolve_worst_case_exit_price(
+        access_token, instrument_key, entry_transaction_type,
+    )
+    if price is not None:
+        _worst_case_quote_cache[cache_key] = (now_monotonic, price)
+    return price
+
+
+async def _current_equity(
+    access_token: Optional[str],
+    order_engine_order_service: OrderEngineOrderService,
+    ledger_store: OrderEngineLedgerStore,
+    lot_tracker: OrderEngineLotTracker,
+    opening_balance: float,
+) -> float:
     """`currentEquity = epoch.openingBalance + realizedPnl(all lots) + unrealizedPnl(open lots)`,
     the literal §7.10 formula (`PnLCalculator.snapshot`'s own equivalent), applied against the new
-    engine's own ledger instead of the client's local Room DB."""
+    engine's own ledger instead of the client's local Room DB.
+
+    The unrealized component starts from `OrderEngineLotTracker.total_live_pnl()` -- which
+    contributes exactly `0.0` for any open lot whose instrument hasn't ticked on the live feed yet
+    (that method's own zero-fallback) -- then, per §8.3's "the server cannot default"/worst-case-
+    first principle, replaces each such lot's `0.0` with a real pessimistic figure: a forced quote
+    re-fetch (via [_worst_case_exit_price_cached]) reduced to the price a genuinely urgent exit
+    would realistically get right now (best bid closing a long, best ask closing a short -- see
+    `OrderEngineOrderService.resolve_worst_case_exit_price`'s own doc comment). [access_token]
+    being `None` (no stored token, or an unloadable one -- [check_now] passes exactly what it
+    already resolved) skips this pessimism pass entirely and keeps the old zero-fallback for every
+    un-ticked lot, same "can't fetch quotes without a token, and can't flatten without one either"
+    posture [check_now] already has for its own token-gated flatten path -- a real quote failure
+    for one specific lot degrades the same way, leaving only that lot's contribution at zero
+    rather than aborting the whole equity computation."""
     total_realized = sum(_number(lot.get("realized_pnl")) for lot in ledger_store.get_all_lots())
     total_unrealized = lot_tracker.total_live_pnl()
+    if access_token is not None:
+        for lot in lot_tracker.open_lots_without_recent_tick():
+            worst_case_price = await _worst_case_exit_price_cached(access_token, order_engine_order_service, lot)
+            if worst_case_price is not None:
+                total_unrealized += _live_pnl(lot, worst_case_price)
     return opening_balance + total_realized + total_unrealized
 
 
@@ -118,8 +167,10 @@ async def flatten_open_lots(
     ledger_store: OrderEngineLedgerStore,
     order_engine_order_service: OrderEngineOrderService,
 ) -> list[str]:
-    """Places a fresh-idempotency-key `MARKET` exit for every open lot's `remaining_quantity`,
-    same "flatten only, never blocks new entries" posture §7.10 specifies -- **except**:
+    """Places a fresh-idempotency-key `MARKET` exit, at the lot's own recorded `product` (see
+    `OrderEngineLedgerStore.upsert_lot`'s own doc comment -- defaults `"I"` for any lot that
+    predates this field), for every open lot's `remaining_quantity`, same "flatten only, never
+    blocks new entries" posture §7.10 specifies -- **except**:
     - a lot that already has an exit in flight via its own armed bracket (see
       [_lot_has_exit_in_flight]'s own doc comment), which is skipped rather than double-exited;
     - the *quantity itself* is capped at [OrderEngineOrderService.resolve_closeable_quantity]'s
@@ -131,6 +182,15 @@ async def flatten_open_lots(
       "residual risk" doc comment). A lot with nothing genuinely closeable at the broker (already
       closed by something else, or the ledger was simply wrong) is skipped entirely, never sent as
       a zero/negative-quantity order.
+
+    The exit's *order type* stays `MARKET` unconditionally, deliberately, regardless of what the
+    lot's own entry/bracket used -- an emergency, server-initiated flatten's whole purpose is
+    immediate execution, so a resting `LIMIT` exit here would work against §8.3's "the server
+    cannot default" urgency rather than for it. This is a considered choice, not the same kind of
+    gap `product` was: `product` (`"I"`/`"D"`/`"MTF"`) has to match the entry's own product or
+    Upstox can reject/mishandle the exit outright (a real correctness risk this milestone's
+    original v1 carried); order type does not have that failure mode, so there is nothing left to
+    broaden here.
 
     One lot's placement failure doesn't abort the rest -- §8.3's "the server cannot default"
     applies here too: a partial flatten is still far better than none. Returns the lot ids that
@@ -178,7 +238,7 @@ async def flatten_open_lots(
                 instrument_key=lot["instrument_key"],
                 transaction_type=exit_transaction_type,
                 quantity=int(exit_quantity),
-                product="I",
+                product=str(lot.get("product") or "I"),
                 order_type="MARKET",
             )
             placed_lot_ids.append(lot["id"])
@@ -212,7 +272,19 @@ async def check_now(
     if epoch is None:
         return
 
-    current_equity = _current_equity(ledger_store, lot_tracker, epoch["opening_balance"])
+    # Resolved once, up front -- [_current_equity] needs it (when available) for its own
+    # worst-case-first re-quote pass on any un-ticked open lot, per §8.3; `None` here (no stored
+    # token, or an unloadable one) is a legitimate, handled state, not an early return, since
+    # equity can still be computed (just without that pessimism pass) and a genuine breach is
+    # still worth ratcheting/detecting even if this watcher can't act on it without a token.
+    access_token: Optional[str] = None
+    if token_store.has_token():
+        try:
+            access_token = token_store.load_access_token()
+        except (TokenStoreError, UpstoxAuthRequiredError):
+            access_token = None
+
+    current_equity = await _current_equity(access_token, order_engine_order_service, ledger_store, lot_tracker, epoch["opening_balance"])
     ratcheted_peak = max(current_equity, epoch["peak_equity"])
     if ratcheted_peak != epoch["peak_equity"]:
         epoch = ledger_store.upsert_max_loss_epoch(
@@ -228,11 +300,7 @@ async def check_now(
     ):
         return
 
-    if not token_store.has_token():
-        return
-    try:
-        access_token = token_store.load_access_token()
-    except (TokenStoreError, UpstoxAuthRequiredError):
+    if access_token is None:
         return
 
     async with exit_all_lock:
@@ -242,7 +310,9 @@ async def check_now(
         current_epoch = ledger_store.get_max_loss_epoch()
         if current_epoch is None:
             return
-        current_equity = _current_equity(ledger_store, lot_tracker, current_epoch["opening_balance"])
+        current_equity = await _current_equity(
+            access_token, order_engine_order_service, ledger_store, lot_tracker, current_epoch["opening_balance"],
+        )
         if not _is_breached(
             current_equity, current_epoch["opening_balance"], current_epoch["peak_equity"],
             current_epoch["threshold_x"], current_epoch["threshold_mode"],

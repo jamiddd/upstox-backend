@@ -58,10 +58,19 @@ class _FakeUpstox:
     no such thing either (an instrument missing from the response is just flat/zero, exactly what
     [resolve_closeable_quantity] would derive from an empty match)."""
 
-    def __init__(self, fail_instrument_keys: set[str] | None = None, held_quantities: dict[str, float] | None = None) -> None:
+    def __init__(
+        self,
+        fail_instrument_keys: set[str] | None = None,
+        held_quantities: dict[str, float] | None = None,
+        quote_depth: dict[str, dict] | None = None,
+    ) -> None:
         self.place_order_calls: list[dict] = []
         self._fail_instrument_keys = fail_instrument_keys or set()
         self._held_quantities = held_quantities or {}
+        # {instrument_key: {"buy": [{"price": ...}], "sell": [{"price": ...}]}} -- what
+        # `resolve_worst_case_exit_price` reads. Empty/absent means "no book," the default for
+        # every test not specifically exercising the worst-case-pessimism pass.
+        self._quote_depth = quote_depth or {}
 
     async def get_order_book(self, access_token):
         return {"status": "success", "data": []}
@@ -75,6 +84,16 @@ class _FakeUpstox:
             ],
         }
 
+    async def get_quotes(self, access_token, instrument_key):
+        # No open lot in this test file's fixtures has ever ticked (OrderEngineLotTracker's
+        # in-memory _last_ltp starts empty every test), so `_current_equity`'s worst-case-pessimism
+        # pass calls this for every open lot on every check_now -- an unscripted (empty) book
+        # reduces resolve_worst_case_exit_price to `None`, exactly the "no data, leave that lot's
+        # contribution at zero" fallback every pre-existing test here already implicitly assumed
+        # before this pass existed.
+        depth = self._quote_depth.get(instrument_key, {"buy": [], "sell": []})
+        return {"status": "success", "data": {instrument_key: {"depth": depth}}}
+
     async def place_order(self, access_token, **kwargs):
         if kwargs.get("instrument_key") in self._fail_instrument_keys:
             raise RuntimeError("simulated broker failure")
@@ -82,18 +101,23 @@ class _FakeUpstox:
         return {"status": "success", "data": {"order_id": f"order-{len(self.place_order_calls)}"}}
 
 
-def _open_lot(store, lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY", entry_price=100.0, remaining_quantity=50, realized_pnl=0.0):
+def _open_lot(store, lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY", entry_price=100.0, remaining_quantity=50, realized_pnl=0.0, product="I"):
     store.upsert_lot(
         lot_id=lot_id, instrument_key=instrument_key, transaction_type=transaction_type,
         entry_price=entry_price, entry_quantity=remaining_quantity, remaining_quantity=remaining_quantity,
-        realized_pnl=realized_pnl, state="OPEN",
+        realized_pnl=realized_pnl, state="OPEN", product=product,
     )
 
 
-def _watcher_deps(tmp_path, *, fail_instrument_keys=None, has_token=True, held_quantities=None):
+def _watcher_deps(tmp_path, *, fail_instrument_keys=None, has_token=True, held_quantities=None, quote_depth=None):
+    # The real cache is a module-level dict (deliberately -- see its own doc comment for why: a
+    # per-process TTL cache needs to survive across check_now calls, not be reconstructed each
+    # time). Cleared per test here so one test's scripted quote never leaks into the next test's
+    # otherwise-identical instrument key within the same TTL window.
+    watcher._worst_case_quote_cache.clear()
     store = OrderEngineLedgerStore(_settings(tmp_path))
     tracker = OrderEngineLotTracker(store)
-    upstox = _FakeUpstox(fail_instrument_keys=fail_instrument_keys, held_quantities=held_quantities)
+    upstox = _FakeUpstox(fail_instrument_keys=fail_instrument_keys, held_quantities=held_quantities, quote_depth=quote_depth)
     order_service = OrderEngineOrderService(upstox)
     token_store = _FakeTokenStore(has_token=has_token)
     notifications = _FakeNotificationService()
@@ -170,6 +194,49 @@ async def test_check_now_flattens_and_re_arms_on_a_genuine_breach(tmp_path) -> N
 
     assert len(notifications.records) == 1
     assert notifications.records[0]["severity"] == "critical"
+
+
+@pytest.mark.anyio
+async def test_check_now_flattens_at_the_lots_own_recorded_product_not_a_hardcoded_intraday(tmp_path) -> None:
+    store, tracker, upstox, order_service, token_store, notifications, lock = _watcher_deps(
+        tmp_path, held_quantities={"NSE_FO|1": 50},
+    )
+    store.upsert_max_loss_epoch(opening_balance=100000.0, peak_equity=100000.0, threshold_x=1000.0, epoch_started_at="2026-07-21T00:00:00+00:00")
+    _open_lot(store, remaining_quantity=50, realized_pnl=-2000.0, product="D")  # delivery, not intraday
+
+    await watcher.check_now(
+        now=_MARKET_OPEN_NOW, token_store=token_store, ledger_store=store, lot_tracker=tracker,
+        order_engine_order_service=order_service, notification_service=notifications, exit_all_lock=lock,
+    )
+
+    assert len(upstox.place_order_calls) == 1
+    assert upstox.place_order_calls[0]["product"] == "D"
+
+
+@pytest.mark.anyio
+async def test_check_now_catches_a_breach_hidden_behind_an_un_ticked_lots_zero_fallback(tmp_path) -> None:
+    """§8.3's worst-case-first pessimism, proven end to end: a lot that has never ticked on the
+    live feed would otherwise contribute a flat 0.0 to current equity (the old gap) -- with a
+    genuinely bad book scripted for it, check_now must catch the real breach a naive zero-fallback
+    would have hidden."""
+    store, tracker, upstox, order_service, token_store, notifications, lock = _watcher_deps(
+        tmp_path, held_quantities={"NSE_FO|1": 50},
+        quote_depth={"NSE_FO|1": {"buy": [{"price": 60.0}], "sell": [{"price": 61.0}]}},
+    )
+    store.upsert_max_loss_epoch(opening_balance=100000.0, peak_equity=100000.0, threshold_x=1000.0, epoch_started_at="2026-07-21T00:00:00+00:00")
+    # realized_pnl 0, never ticked -- a naive zero-fallback equity would be exactly 100000, no
+    # breach. The scripted worst-case bid (60, vs. entry 100) on 50 units is -2000 unrealized,
+    # dropping real equity to 98000, below opening - X = 99000 -> genuinely breached.
+    _open_lot(store, lot_id="lot-1", instrument_key="NSE_FO|1", entry_price=100.0, remaining_quantity=50, realized_pnl=0.0)
+
+    await watcher.check_now(
+        now=_MARKET_OPEN_NOW, token_store=token_store, ledger_store=store, lot_tracker=tracker,
+        order_engine_order_service=order_service, notification_service=notifications, exit_all_lock=lock,
+    )
+
+    assert len(upstox.place_order_calls) == 1
+    epoch = store.get_max_loss_epoch()
+    assert epoch["opening_balance"] == 98000.0  # re-armed at the genuine, pessimistic post-flatten equity
 
 
 @pytest.mark.anyio

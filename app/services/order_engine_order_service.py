@@ -122,6 +122,51 @@ class OrderEngineOrderService:
             return max(-signed, 0.0)
         return max(signed, 0.0)
 
+    async def resolve_worst_case_exit_price(
+        self, access_token: str, instrument_key: str, entry_transaction_type: str,
+    ) -> Optional[float]:
+        """§8.3's worst-case-first pessimism for `order_engine_max_loss_watcher._current_equity`
+        (§8.4 milestone 6's own named v1 gap): a forced, fresh Upstox quote for [instrument_key],
+        reduced to the price a genuinely urgent exit would realistically get *right now* -- the
+        best bid for closing a long (`entry_transaction_type="BUY"`, exit `SELL`), the best ask
+        for closing a short (`entry_transaction_type="SELL"`, exit `BUY`-to-cover). Same
+        margin-always-unfavorable-direction reasoning the Android client's own
+        `DynamicSpreadExitPricer` uses for its live exit shaping -- this is that same idea, at
+        check time rather than fire time, for a lot the market-feed side hasn't priced yet at all.
+
+        Returns `None` (never raises) on a missing/malformed quote or an empty depth book on the
+        needed side -- the caller falls back to the pre-existing zero-live-pnl posture for that
+        one lot rather than fabricating a number from data that genuinely isn't there."""
+        payload = await self.upstox.get_quotes(access_token, instrument_key)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return None
+        quote = data.get(instrument_key)
+        if not isinstance(quote, dict):
+            quote = next(
+                (
+                    candidate for candidate in data.values()
+                    if isinstance(candidate, dict) and candidate.get("instrument_token") == instrument_key
+                ),
+                None,
+            )
+        if not isinstance(quote, dict):
+            return None
+        depth = quote.get("depth")
+        if not isinstance(depth, dict):
+            return None
+        side = "buy" if entry_transaction_type.upper() == "BUY" else "sell"
+        levels = depth.get(side)
+        if not isinstance(levels, list) or not levels:
+            return None
+        best = levels[0]
+        if not isinstance(best, dict):
+            return None
+        price = best.get("price")
+        if not isinstance(price, (int, float)) or isinstance(price, bool):
+            return None
+        return float(price)
+
     async def place_order(
         self,
         access_token: str,
