@@ -100,6 +100,35 @@ def test_total_live_pnl_is_zero_for_an_instrument_with_no_tick_seen_yet(tmp_path
     assert tracker.total_live_pnl() == 0.0
 
 
+def test_per_lot_live_pnl_returns_one_status_per_open_lot(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    _open_lot(store, lot_id="lot-1", instrument_key="NSE_FO|1", entry_price=100.0, remaining_quantity=50)
+    _open_lot(store, lot_id="lot-2", instrument_key="NSE_FO|2", entry_price=200.0, remaining_quantity=10)
+    tracker = OrderEngineLotTracker(store)
+    tracker.apply_tick("NSE_FO|1", 110.0)
+    tracker.apply_tick("NSE_FO|2", 190.0)
+
+    statuses = {status.lot_id: status for status in tracker.per_lot_live_pnl()}
+
+    assert len(statuses) == 2
+    assert statuses["lot-1"].live_pnl == 500.0
+    assert statuses["lot-1"].ltp == 110.0
+    assert statuses["lot-2"].live_pnl == -100.0
+    assert statuses["lot-2"].ltp == 190.0
+
+
+def test_per_lot_live_pnl_falls_back_to_entry_price_with_no_tick_yet(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    _open_lot(store, entry_price=100.0, remaining_quantity=50)
+    tracker = OrderEngineLotTracker(store)
+
+    statuses = tracker.per_lot_live_pnl()
+
+    assert len(statuses) == 1
+    assert statuses[0].ltp == 100.0
+    assert statuses[0].live_pnl == 0.0
+
+
 def test_instrument_keys_returns_every_open_lots_instrument(tmp_path) -> None:
     store = OrderEngineLedgerStore(_settings(tmp_path))
     _open_lot(store, lot_id="lot-1", instrument_key="NSE_FO|1")

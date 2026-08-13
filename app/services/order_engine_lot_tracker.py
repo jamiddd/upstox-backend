@@ -101,6 +101,23 @@ class OrderEngineLotTracker:
             total += _live_pnl(lot, ltp)
         return total
 
+    def per_lot_live_pnl(self) -> list[LotPnlStatus]:
+        """One [LotPnlStatus] per open lot -- the per-lot counterpart to [total_live_pnl], added
+        2026-08-13 after a real gap found live: the order-engine home screen's own per-lot row only
+        ever showed `Lot.realizedPnl` (permanently `0.0` while a lot is still open), never a live
+        unrealized number, because no per-lot breakdown existed anywhere in this REST surface --
+        only the aggregate total from [total_live_pnl]. Same zero-fallback-to-entry-price posture
+        as [total_live_pnl] for a lot whose instrument has no tick yet (never a stale foreign
+        price, never an exception)."""
+        statuses = []
+        for lot in self._ledger_store.get_open_lots():
+            entry_price = lot.get("entry_price")
+            ltp = self._last_ltp.get(lot["instrument_key"], entry_price)
+            if ltp is None:
+                continue
+            statuses.append(_status_for(lot, ltp))
+        return statuses
+
     def open_lots_without_recent_tick(self) -> list[dict]:
         """Every open lot on an instrument this tracker has never seen a live tick for since
         process start -- exactly the population [total_live_pnl]'s own zero-fallback silently

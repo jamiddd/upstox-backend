@@ -478,15 +478,32 @@ async def get_ledger_max_loss_epoch(
     return OrderEngineMaxLossEpochResponse(epoch=epoch)
 
 
+class OrderEngineLotPnlResponse(BaseModel):
+    """One open lot's own live P&L, added 2026-08-13 as the per-lot breakdown
+    [OrderEnginePnlSummaryResponse] never had -- see that model's own doc comment for why the gap
+    mattered (the home screen's per-lot row silently showed a permanent `0.0` while a lot stayed
+    open, only ever the whole-portfolio total was ever live)."""
+
+    lot_id: str
+    instrument_key: str
+    ltp: float
+    unrealized_pnl: float
+
+
 class OrderEnginePnlSummaryResponse(BaseModel):
     """§8.2's live-PnL formula, summarized -- the REST counterpart to the WS-pushed
     `dispatch_order_engine_lot_status` (per-lot, not a total). Built for a feed-less screen (the
     new engine's own home screen has no `BackendFeedClient` by design) that still wants a genuine
-    live open-position number rather than nothing, or a stale local-only one."""
+    live open-position number rather than nothing, or a stale local-only one.
+
+    [per_lot] added 2026-08-13, same session as [OrderEngineLotPnlResponse] -- found live, the
+    home screen never had anywhere to source a per-lot live number from at all, so every open
+    lot's row rendered its permanently-zero `realizedPnl` instead."""
 
     realized_pnl: float
     unrealized_pnl: float
     open_lot_count: int
+    per_lot: list[OrderEngineLotPnlResponse] = Field(default_factory=list)
 
 
 @router.get("/ledger/pnl-summary", response_model=OrderEnginePnlSummaryResponse)
@@ -500,13 +517,26 @@ async def get_ledger_pnl_summary(
     tick path/`order_engine_max_loss_watcher.py` already use (see
     `get_order_engine_lot_tracker`'s own doc comment for why this must be the singleton, not a
     fresh instance), so this number is only ever as stale as the tracker's own last-seen-tick
-    cache, never fabricated from a fresh, empty one. No auth/scope beyond the router's own
-    `require_mobile_api_key` -- there's nothing lot-specific or mutating here."""
+    cache, never fabricated from a fresh, empty one. `per_lot` is the same tracker's
+    [OrderEngineLotTracker.per_lot_live_pnl], one row per currently-open lot -- both numbers derive
+    from the identical in-memory `_last_ltp` cache, so the sum of `per_lot`'s own `unrealized_pnl`
+    values always matches this response's own `unrealized_pnl` field exactly, never a separately-
+    computed approximation of it. No auth/scope beyond the router's own `require_mobile_api_key`
+    -- there's nothing lot-specific-secret or mutating here."""
     total_realized = sum(_pnl_number(lot.get("realized_pnl")) for lot in ledger.get_all_lots())
     return OrderEnginePnlSummaryResponse(
         realized_pnl=total_realized,
         unrealized_pnl=lot_tracker.total_live_pnl(),
         open_lot_count=len(ledger.get_open_lots()),
+        per_lot=[
+            OrderEngineLotPnlResponse(
+                lot_id=status.lot_id,
+                instrument_key=status.instrument_key,
+                ltp=status.ltp,
+                unrealized_pnl=status.live_pnl,
+            )
+            for status in lot_tracker.per_lot_live_pnl()
+        ],
     )
 
 

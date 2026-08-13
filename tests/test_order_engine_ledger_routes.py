@@ -271,6 +271,43 @@ def test_pnl_summary_sums_realized_across_open_and_closed_lots(tmp_path) -> None
         assert body["realized_pnl"] == 220.0  # 250 + (-30), both open and closed count
         assert body["unrealized_pnl"] == 0.0  # no ticks seen by this fresh tracker
         assert body["open_lot_count"] == 1  # only lot-open
+        # per_lot mirrors open_lot_count -- one row, falling back to entry_price (0 live pnl)
+        # since no tick has reached this fresh tracker yet, same fallback total_live_pnl uses.
+        assert body["per_lot"] == [
+            {"lot_id": "lot-open", "instrument_key": "NSE_FO|1", "ltp": 100.0, "unrealized_pnl": 0.0},
+        ]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_pnl_summary_per_lot_reflects_a_live_tick(tmp_path) -> None:
+    """Regression, 2026-08-13: found live -- the home screen's per-lot row had nowhere to source a
+    live number from, only ever the permanently-zero realized_pnl of a still-open lot. Confirms
+    per_lot actually moves once a real tick reaches the tracker, not just the aggregate total."""
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    ledger.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN",
+    )
+    tracker = OrderEngineLotTracker(ledger)
+    tracker.apply_tick("NSE_FO|1", 106.0)
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: tracker
+    try:
+        response = TestClient(app).get("/api/order-engine/ledger/pnl-summary", headers=_HEADERS)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["unrealized_pnl"] == 300.0  # (106 - 100) * 50
+        assert body["per_lot"] == [
+            {"lot_id": "lot-1", "instrument_key": "NSE_FO|1", "ltp": 106.0, "unrealized_pnl": 300.0},
+        ]
     finally:
         app.dependency_overrides.clear()
 
@@ -281,6 +318,8 @@ def test_pnl_summary_is_all_zero_with_no_lots_at_all(tmp_path) -> None:
         response = client.get("/api/order-engine/ledger/pnl-summary", headers=_HEADERS)
 
         assert response.status_code == 200, response.text
-        assert response.json() == {"realized_pnl": 0.0, "unrealized_pnl": 0.0, "open_lot_count": 0}
+        assert response.json() == {
+            "realized_pnl": 0.0, "unrealized_pnl": 0.0, "open_lot_count": 0, "per_lot": [],
+        }
     finally:
         app.dependency_overrides.clear()
