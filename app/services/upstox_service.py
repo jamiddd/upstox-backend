@@ -323,6 +323,7 @@ class UpstoxService:
         response = await self._request(
             "POST",
             f"{self.settings.upstox_api_hft_base_url}/order/place",
+            strict_status=True,
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/json",
@@ -366,6 +367,7 @@ class UpstoxService:
         response = await self._request(
             "PUT",
             f"{self.settings.upstox_api_v3_base_url}/order/modify",
+            strict_status=True,
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/json",
@@ -386,6 +388,7 @@ class UpstoxService:
         response = await self._request(
             "DELETE",
             f"{self.settings.upstox_api_hft_base_url}/order/cancel",
+            strict_status=True,
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {access_token}",
@@ -672,8 +675,31 @@ class UpstoxService:
             raise UpstoxApiError("Unexpected Upstox API response")
         return payload
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        """Send an HTTP request and convert Upstox failures into service errors."""
+    async def _request(
+        self, method: str, url: str, *, strict_status: bool = False, **kwargs: Any
+    ) -> httpx.Response:
+        """Send an HTTP request and convert Upstox failures into service errors.
+
+        FIX, 2026-08-13: found live via the order engine -- a real place-order call this codebase
+        already knew Upstox could do once (`upstox_totp_login.py`'s own `data.get("status") ==
+        "error"` check, for login) returned HTTP 200 with a body of `{"status": "error", ...}` for
+        a quantity/margin rejection, not a 4xx. This method only ever checked the HTTP status code,
+        so `place_order` (`UpstoxService.place_order`) returned that error body as if it were a
+        successful placement, and `extract_order_ids`'s own recursive scan of the response then
+        surfaced something that looked enough like an order id for the order-engine route to report
+        `Placed` back to Android -- the order never actually reached Upstox's real order book, only
+        this backend and the app believed it had.
+
+        [strict_status] opts a caller into treating that same 2xx-but-`status:"error"` shape as a
+        real failure (raises exactly like a 4xx would). Deliberately **not** the default: an
+        existing, deliberate case (`get_brokerage`, see `test_get_brokerage_leaves_malformed_
+        charges_payload_untouched`) already relies on an error envelope passing through untouched
+        -- a brokerage estimate failing shouldn't block anything, it's display-only. Only
+        order-mutating calls (`place_order`/`modify_order`/`cancel_order`) pass `strict_status=
+        True`, since those are exactly the calls where "the HTTP layer said success" silently
+        masking a real broker-side rejection is genuinely dangerous (a caller believing an order
+        landed when it didn't).
+        """
         client = self._client
         if client is not None:
             response = await client.request(method, url, **kwargs)
@@ -683,7 +709,21 @@ class UpstoxService:
 
         if response.status_code >= 400:
             raise self._build_api_error(response)
+        if strict_status and self._is_error_envelope(response):
+            raise self._build_api_error(response)
         return response
+
+    @staticmethod
+    def _is_error_envelope(response: httpx.Response) -> bool:
+        """True for a 2xx response whose own JSON body says `status: "error"` -- Upstox's known
+        "success at the HTTP layer, error in the body" shape (see [_request]'s own doc comment).
+        Never throws on a non-JSON or non-dict body -- those are left to whatever the caller's own
+        `response.json()` call does next, same as before this check existed."""
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        return isinstance(payload, dict) and payload.get("status") == "error"
 
     @staticmethod
     def _build_api_error(response: httpx.Response) -> UpstoxApiError:

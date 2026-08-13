@@ -251,6 +251,57 @@ def test_get_historical_trades_sends_pagination_and_date_range() -> None:
     assert payload == {"status": "success", "data": []}
 
 
+def test_place_order_raises_on_a_200_response_whose_body_says_error() -> None:
+    """Regression, 2026-08-13: found live via the order engine -- Upstox can return HTTP 200 for
+    place_order with a body of {"status": "error", ...} (a real rejection, e.g. margin/quantity),
+    the same shape upstox_totp_login.py already special-cased for login. Before this fix,
+    place_order returned that body as if it had succeeded."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"status": "error", "errors": [{"message": "Not enough margin"}]},
+        )
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.place_order(
+                "upstox-token",
+                instrument_key="NSE_FO|111",
+                transaction_type="BUY",
+                quantity=75,
+                product="I",
+                order_type="MARKET",
+            )
+
+    with pytest.raises(UpstoxApiError, match="Not enough margin"):
+        anyio.run(run)
+
+
+def test_get_brokerage_still_swallows_a_200_error_envelope() -> None:
+    """strict_status is opt-in, not universal -- get_brokerage (a display-only estimate, never an
+    order mutation) must keep passing an error envelope through untouched, unlike place_order
+    above. Same fixture/assertion as test_get_brokerage_leaves_malformed_charges_payload_untouched,
+    kept as its own test here specifically to pin the place_order-vs-get_brokerage contrast."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "error", "errors": [{"message": "no funds"}]})
+
+    async def run() -> dict[str, object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = UpstoxService(_settings(), client=client)
+            return await service.get_brokerage(
+                "upstox-token",
+                instrument_key="NSE_FO|35271",
+                quantity=75,
+                product="I",
+                transaction_type="BUY",
+                price=125.5,
+            )
+
+    payload = anyio.run(run)
+    assert payload == {"status": "error", "errors": [{"message": "no funds"}]}
+
+
 def test_place_gtt_order_posts_to_v3_gtt_endpoint() -> None:
     """Place a GTT order through the V3 endpoint."""
     order = {
