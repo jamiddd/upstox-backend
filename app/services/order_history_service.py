@@ -96,6 +96,13 @@ def _shape_today_order(order: dict[str, Any]) -> dict[str, Any]:
         "timestamp": _string_value(order, "order_timestamp"),
         "exchange_timestamp": _string_value(order, "exchange_timestamp"),
         "status_message": _string_value(order, "status_message"),
+        # FIX, 2026-08-13: found live via the order engine -- this was silently dropping Upstox's
+        # own "tag" field (already used server-side, e.g. OrderEngineOrderService.find_existing_order's
+        # order.get("tag")), so the client had no way to match a broker order back to one of its
+        # own TriggerRules from order-history data at all, only from a live order_update push. A
+        # fill that happened entirely while the client was disconnected (no push to catch on
+        # reconnect) left a lot stuck OPEN forever with no way to reconcile it.
+        "tag": _string_value(order, "tag"),
     }
 
 
