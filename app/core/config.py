@@ -37,6 +37,7 @@ class Settings:
     account_snapshot_path: Path = Path("/data/account_snapshot.json")
     auto_login_state_path: Path = Path("/data/auto_login_state.json")
     oi_database_path: Path = Path("/data/oi_snapshots.sqlite3")
+    atm_iv_database_path: Path = Path("/data/atm_iv_snapshots.sqlite3")
     notification_database_path: Path = Path("/data/notifications.sqlite3")
     journal_database_path: Path = Path("/data/journal.sqlite3")
     order_engine_ledger_database_path: Path = Path("/data/order_engine_ledger.sqlite3")
@@ -104,6 +105,9 @@ class Settings:
             ),
             oi_database_path=Path(
                 os.getenv("OI_DATABASE_PATH", "/data/oi_snapshots.sqlite3"),
+            ),
+            atm_iv_database_path=Path(
+                os.getenv("ATM_IV_DATABASE_PATH", "/data/atm_iv_snapshots.sqlite3"),
             ),
             notification_database_path=Path(
                 os.getenv("NOTIFICATION_DATABASE_PATH", "/data/notifications.sqlite3"),

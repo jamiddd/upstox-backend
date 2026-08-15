@@ -14,6 +14,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import (
+    get_atm_iv_snapshot_store,
     get_candle_cache_store,
     get_device_token_store,
     get_exit_all_lock,
@@ -69,6 +70,7 @@ from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
 from app.services.account_snapshot_store import AccountSnapshotStore
 from app.services.oi_analysis_service import OIAnalysisService
+from app.services.atm_iv_snapshot_store import AtmIvSnapshotStore
 from app.services.oi_snapshot_store import OISnapshotStore, SnapshotNotFoundError
 from app.services.search_screen_service import SearchScreenService
 from app.services.signal_snapshot_store import SignalSnapshotStore
@@ -903,6 +905,39 @@ def _snapshot_diff_validation_error(message: str) -> HTTPException:
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         detail={"status": "error", "message": message},
     )
+
+
+@protected_router.get("/main/atm-iv-snapshots/history")
+async def main_atm_iv_snapshots_history(
+    underlying_key: str = Query(min_length=1),
+    limit: int = Query(default=3000, ge=1, le=5000),
+    snapshot_store: AtmIvSnapshotStore = Depends(get_atm_iv_snapshot_store),
+) -> dict[str, Any]:
+    """Return the rolling ~1-month five-minute ATM IV history for one underlying, newest-first --
+    powers the Terminal IV tab's time chart. Requires no live Upstox token, same as
+    `/main/oi-snapshots/history`."""
+    return {
+        "underlying_key": underlying_key,
+        "snapshots": snapshot_store.list_snapshots(underlying_key=underlying_key, limit=limit),
+    }
+
+
+@protected_router.get("/main/atm-iv-snapshots/percentile")
+async def main_atm_iv_snapshots_percentile(
+    underlying_key: str = Query(min_length=1),
+    current_atm_iv: float = Query(...),
+    snapshot_store: AtmIvSnapshotStore = Depends(get_atm_iv_snapshot_store),
+) -> dict[str, Any]:
+    """Rank `current_atm_iv` (the value the client is showing live right now, not necessarily the
+    latest stored slot) against the rolling window's own stored history for `underlying_key`.
+    404 if nothing has been captured for this underlying yet."""
+    result = snapshot_store.percentile(underlying_key=underlying_key, current_atm_iv=current_atm_iv)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"status": "error", "message": f"No ATM IV history stored yet for {underlying_key}"},
+        )
+    return asdict(result)
 
 
 @protected_router.get("/user/tracked-instruments")

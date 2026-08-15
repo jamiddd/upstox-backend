@@ -14,6 +14,7 @@ from app.services.order_engine_ledger_store import OrderEngineLedgerStore
 from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 from app.services.notification_service import NotificationService
 from app.services.notification_store import NotificationStore
+from app.services.atm_iv_snapshot_store import AtmIvSnapshotStore
 from app.services.oi_snapshot_store import OISnapshotStore
 from app.services.signal_snapshot_store import SignalSnapshotStore
 from app.services.token_store import EncryptedTokenStore
@@ -52,6 +53,11 @@ def get_signal_snapshot_store(settings: Settings = Depends(get_settings)) -> Sig
 def get_oi_snapshot_store(settings: Settings = Depends(get_settings)) -> OISnapshotStore:
     """Create the SQLite-backed per-strike OI snapshot store for a request."""
     return OISnapshotStore(settings)
+
+
+def get_atm_iv_snapshot_store(settings: Settings = Depends(get_settings)) -> AtmIvSnapshotStore:
+    """Create the SQLite-backed ATM IV snapshot store for a request."""
+    return AtmIvSnapshotStore(settings)
 
 
 def get_candle_cache_store(settings: Settings = Depends(get_settings)) -> CandleCacheStore:
