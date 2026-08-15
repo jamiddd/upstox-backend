@@ -6,7 +6,7 @@ from pathlib import Path
 from app.core.config import Settings
 from app.core.exceptions import WatchlistStoreError
 
-WATCHLIST_IDS = ("india", "global")
+WATCHLIST_IDS = ("india", "global", "home")
 
 
 class WatchlistStore:

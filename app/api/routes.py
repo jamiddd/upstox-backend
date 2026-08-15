@@ -188,11 +188,12 @@ class WatchlistInstrumentModel(BaseModel):
     symbol: str
     lot_size: Optional[float] = None
     is_underlying: bool = False
+    is_tradeable: bool = True
 
 
 class WatchlistRequest(BaseModel):
-    """Replaces the whole persisted watchlist for one list_id ("india" or "global") -- see
-    WatchlistStore. Always the client's full current list, not an incremental add/remove, same
+    """Replaces the whole persisted watchlist for one list_id ("india", "global", or "home") --
+    see WatchlistStore. Always the client's full current list, not an incremental add/remove, same
     contract as TrackedInstrumentsRequest.
     """
 
@@ -936,10 +937,10 @@ async def set_tracked_instruments(
 
 @dual_router.get("/user/watchlist/{list_id}")
 async def get_watchlist(
-    list_id: Literal["india", "global"],
+    list_id: Literal["india", "global", "home"],
     store: WatchlistStore = Depends(get_watchlist_store),
 ) -> dict[str, Any]:
-    """Return the persisted watchlist ("india" or "global") -- shared by both Android's Main
+    """Return the persisted watchlist ("india", "global", or "home") -- shared by both Android's Main
     screen ticker and the web client's TickerBar/WatchlistScreen. On dual_router
     (require_mobile_or_web) since both clients need this."""
     return {"items": store.load(list_id)}
@@ -947,7 +948,7 @@ async def get_watchlist(
 
 @dual_router.put("/user/watchlist/{list_id}")
 async def set_watchlist(
-    list_id: Literal["india", "global"],
+    list_id: Literal["india", "global", "home"],
     body: WatchlistRequest,
     store: WatchlistStore = Depends(get_watchlist_store),
 ) -> dict[str, Any]:
