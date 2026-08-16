@@ -8,6 +8,11 @@ from typing import Any, Optional
 
 from app.core.config import Settings
 
+# Same rationale as `journal_store._WEEKDAY_LABELS`: markets are closed Sat/Sun so those two
+# will always come back zero, but they're kept in the list so `journal_analytics_summary`'s
+# weekday_breakdown always renders a full, consistently-ordered 7-bar week.
+_WEEKDAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
 """Durable, server-side mirror of the new order engine's (`docs/ORDER_POSITION_OVERHAUL_DESIGN.md`
 §8) `Lot`/`TriggerRule` ledger -- Part 4's own decision that the on-device Room DB stops being the
 *only* record of an armed bracket's existence. Deliberately its own SQLite file/module, same
@@ -65,7 +70,13 @@ class OrderEngineLedgerStore:
                     stoploss_rule_id TEXT,
                     product TEXT NOT NULL DEFAULT 'I',
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    strategy_tag TEXT,
+                    followed_plan INTEGER,
+                    mistake_reason TEXT,
+                    remarks TEXT,
+                    confidence_score REAL,
+                    setup_type TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS ix_lots_instrument
@@ -141,7 +152,8 @@ class OrderEngineLedgerStore:
                     mistake_reason TEXT,
                     remarks TEXT,
                     confidence_score REAL,
-                    setup_type TEXT
+                    setup_type TEXT,
+                    charges REAL
                 );
 
                 CREATE INDEX IF NOT EXISTS ix_order_history_idempotency_key
@@ -166,6 +178,26 @@ class OrderEngineLedgerStore:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc):
                     raise
+            # Journal v2 (docs/JOURNAL_V2 design session, 2026-08-16): a "trade" is a closed
+            # `lots` row, so journaling annotations belong on `lots`, not `order_history` --
+            # `order_history`'s own journaling columns (added in Part 5) stay reserved for the
+            # rare `role='MANUAL'` row that has no lot at all. Same idempotent-ALTER pattern as
+            # `product` above, one statement per column since SQLite's `ADD COLUMN` is
+            # single-column-only.
+            for column_sql in (
+                "ALTER TABLE lots ADD COLUMN strategy_tag TEXT",
+                "ALTER TABLE lots ADD COLUMN followed_plan INTEGER",
+                "ALTER TABLE lots ADD COLUMN mistake_reason TEXT",
+                "ALTER TABLE lots ADD COLUMN remarks TEXT",
+                "ALTER TABLE lots ADD COLUMN confidence_score REAL",
+                "ALTER TABLE lots ADD COLUMN setup_type TEXT",
+                "ALTER TABLE order_history ADD COLUMN charges REAL",
+            ):
+                try:
+                    connection.execute(column_sql)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc):
+                        raise
 
     @staticmethod
     def _now() -> str:
@@ -547,3 +579,214 @@ class OrderEngineLedgerStore:
                 (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # -- journal v2 (design session 2026-08-16) --------------------------------------------
+    #
+    # A "trade" here is a closed `lots` row -- entry/exit averaging and realized P&L are already
+    # computed by `OrderHistoryRecorder`/`compute_realized_pnl`, so this layer is pure read-side
+    # aggregation, not a fill-matcher (unlike v1's `JournalStore.rebuild_session`). Manual trades
+    # (no lot workflow) are `order_history` rows with `role='MANUAL'` and no `lot_id`.
+
+    _NOTES_COLUMNS = (
+        "strategy_tag", "followed_plan", "mistake_reason", "remarks", "confidence_score",
+        "setup_type",
+    )
+
+    def list_closed_lots(
+        self, *, limit: int = 50, before: Optional[str] = None,
+        instrument_key: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Cursor-paginated (`updated_at DESC, id DESC`) closed lots -- a lot's `updated_at` is
+        only bumped again once, at close, since `OrderHistoryRecorder` never re-upserts a
+        `CLOSED` lot, so it doubles as "closed_at" without a dedicated column."""
+        clauses = ["state = 'CLOSED'"]
+        params: list[Any] = []
+        if before is not None:
+            with self._connect() as connection:
+                anchor = connection.execute(
+                    "SELECT updated_at, id FROM lots WHERE id = ?", (before,),
+                ).fetchone()
+            if anchor is not None:
+                clauses.append("(updated_at, id) < (?, ?)")
+                params.extend([anchor["updated_at"], anchor["id"]])
+        if instrument_key is not None:
+            clauses.append("instrument_key = ?")
+            params.append(instrument_key)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM lots WHERE {' AND '.join(clauses)}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_orders_for_lot(self, lot_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM order_history WHERE lot_id = ? ORDER BY created_at, id",
+                (lot_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_lot_notes(self, lot_id: str, **fields: Any) -> Optional[dict[str, Any]]:
+        """Journaling-only update -- never touches any position/P&L column. `fields` keys must
+        be a subset of `_NOTES_COLUMNS`; unset keys are left as-is (partial update)."""
+        updates = {key: value for key, value in fields.items() if key in self._NOTES_COLUMNS}
+        if not updates:
+            return self.get_lot(lot_id)
+        set_clause = ", ".join(f"{key} = ?" for key in updates)
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE lots SET {set_clause}, updated_at = ? WHERE id = ?",
+                (*updates.values(), self._now(), lot_id),
+            )
+        return self.get_lot(lot_id)
+
+    def update_order_notes(self, order_id: str, **fields: Any) -> Optional[dict[str, Any]]:
+        """Same as [update_lot_notes] but for a `role='MANUAL'` `order_history` row that has no
+        lot at all -- `order_id` is `order_history.id` (the app's own UUID), not
+        `broker_order_id`."""
+        updates = {key: value for key, value in fields.items() if key in self._NOTES_COLUMNS}
+        if not updates:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM order_history WHERE id = ?", (order_id,),
+                ).fetchone()
+            return dict(row) if row is not None else None
+        set_clause = ", ".join(f"{key} = ?" for key in updates)
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE order_history SET {set_clause}, updated_at = ? WHERE id = ?",
+                (*updates.values(), self._now(), order_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM order_history WHERE id = ?", (order_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def create_manual_order(
+        self,
+        *,
+        order_id: str,
+        instrument_key: str,
+        trading_symbol: Optional[str],
+        transaction_type: str,
+        product: str,
+        quantity: int,
+        average_price: Optional[float],
+        placed_at: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """A manually-entered trade with no real broker order behind it -- same `role='MANUAL'`
+        convention `OrderHistoryRecorder` already uses for unmatched real orders, so both kinds
+        of "no lot workflow" row share one code path everywhere downstream (list/detail/notes).
+        `broker_order_id` gets a synthetic `manual:{order_id}` value since the column is
+        `NOT NULL UNIQUE` and a manual entry has no real one."""
+        now = self._now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO order_history (
+                    id, broker_order_id, instrument_key, trading_symbol, transaction_type,
+                    product, order_type, requested_quantity, status, average_price,
+                    filled_quantity, role, placed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'MARKET', ?, 'complete', ?, ?, 'MANUAL', ?, ?, ?)
+                """,
+                (
+                    order_id, f"manual:{order_id}", instrument_key, trading_symbol,
+                    transaction_type, product, quantity, average_price, quantity,
+                    placed_at or now, now, now,
+                ),
+            )
+        return self.get_order_by_broker_order_id(f"manual:{order_id}")  # type: ignore[return-value]
+
+    def journal_filter_options(self) -> dict[str, list[str]]:
+        with self._connect() as connection:
+            symbols = [
+                row[0] for row in connection.execute(
+                    "SELECT DISTINCT trading_symbol FROM order_history "
+                    "WHERE trading_symbol IS NOT NULL ORDER BY trading_symbol",
+                ) if row[0]
+            ]
+            setups = [
+                row[0] for row in connection.execute(
+                    "SELECT DISTINCT setup_type FROM lots WHERE setup_type IS NOT NULL "
+                    "UNION SELECT DISTINCT setup_type FROM order_history "
+                    "WHERE setup_type IS NOT NULL ORDER BY 1",
+                ) if row[0]
+            ]
+            strategy_tags = [
+                row[0] for row in connection.execute(
+                    "SELECT DISTINCT strategy_tag FROM lots WHERE strategy_tag IS NOT NULL "
+                    "UNION SELECT DISTINCT strategy_tag FROM order_history "
+                    "WHERE strategy_tag IS NOT NULL ORDER BY 1",
+                ) if row[0]
+            ]
+        return {
+            "trading_symbols": symbols, "setups": setups, "strategy_tags": strategy_tags,
+        }
+
+    def journal_analytics_summary(
+        self, *, start_date: Optional[str] = None, end_date: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Same MVP scope/shape as v1's `JournalStore.analytics_summary` (summary KPIs + equity
+        curve + weekday breakdown, always-7-days, `n<30` low-sample flag), computed off closed
+        `lots.realized_pnl` instead of `journal_trades`. **`net_pnl` is intentionally `None`
+        here** -- per-order/day-level charges aren't computed yet (design session 2026-08-16
+        decision: reserve the `order_history.charges` column, don't build the opening-balance-
+        diff mechanism until the exact Upstox charge formula is confirmed). Every figure below is
+        gross, not net, until that lands."""
+        filters = ["state = 'CLOSED'"]
+        values: list[Any] = []
+        if start_date:
+            filters.append("date(updated_at) >= ?")
+            values.append(start_date)
+        if end_date:
+            filters.append("date(updated_at) <= ?")
+            values.append(end_date)
+        where = " AND ".join(filters)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT realized_pnl, updated_at FROM lots WHERE {where} ORDER BY updated_at, id",
+                values,
+            ).fetchall()
+        pnls = [float(row["realized_pnl"]) for row in rows]
+        wins = [value for value in pnls if value > 0]
+        losses = [value for value in pnls if value < 0]
+        equity: list[float] = []
+        running = 0.0
+        for value in pnls:
+            running += value
+            equity.append(running)
+        weekday: dict[str, list[float]] = {day: [] for day in _WEEKDAY_LABELS}
+        for row in rows:
+            label = datetime.fromisoformat(row["updated_at"]).strftime("%A")
+            weekday.setdefault(label, []).append(float(row["realized_pnl"]))
+        return {
+            "trade_count": len(pnls),
+            "gross_pnl": sum(pnls),
+            "net_pnl": None,
+            "win_rate": len(wins) / len(pnls) * 100 if pnls else 0.0,
+            "average_win": sum(wins) / len(wins) if wins else 0.0,
+            "average_loss": sum(losses) / len(losses) if losses else 0.0,
+            "best_trade": max(pnls) if pnls else 0.0,
+            "worst_trade": min(pnls) if pnls else 0.0,
+            "equity_curve": equity,
+            "low_sample": len(pnls) < 30,
+            "weekday_breakdown": [
+                {
+                    "label": label,
+                    "trade_count": len(day_values),
+                    "net_pnl": sum(day_values),
+                    "win_rate": (
+                        sum(1 for value in day_values if value > 0) / len(day_values) * 100
+                        if day_values else 0.0
+                    ),
+                    "low_sample": len(day_values) < 30,
+                }
+                for label in _WEEKDAY_LABELS
+                for day_values in [weekday[label]]
+            ],
+        }

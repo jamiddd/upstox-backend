@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from app.api.routes import router as api_router
 from app.api.stream_routes import router as stream_router
 from app.api.order_engine_routes import router as order_engine_router
+from app.api.journal_v2_routes import router as journal_v2_router
 from app.core.config import get_settings
 from app.core.exceptions import TokenStoreError, UpstoxAuthRequiredError
 from app.core.market_hours import is_market_open
@@ -1031,6 +1032,7 @@ if _cors_origin:
 app.include_router(api_router, prefix="/api")
 app.include_router(stream_router, prefix="/api")
 app.include_router(order_engine_router, prefix="/api")
+app.include_router(journal_v2_router, prefix="/api")
 
 
 @app.get("/health")
