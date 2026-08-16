@@ -4,7 +4,7 @@ import logging
 from typing import Any, Literal, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import (
@@ -17,7 +17,12 @@ from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequi
 from app.core.security import require_mobile_api_key
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
 from app.services.order_engine_lot_tracker import OrderEngineLotTracker
-from app.services.order_engine_order_service import OrderEngineOrderService, UnintendedShortGuardError
+from app.services.order_engine_order_service import (
+    OrderEngineOrderService,
+    UnintendedShortGuardError,
+    derive_order_tag,
+)
+from app.services.order_history_recorder import OrderHistoryRecorder
 from app.services.token_store import EncryptedTokenStore
 from app.services.trade_context_service import extract_order_ids
 from app.services.upstox_service import UpstoxService
@@ -50,6 +55,13 @@ class OrderEnginePlaceOrderRequest(BaseModel):
     # pre-existing caller (trigger-fired exits, max-loss flatten) is unaffected; only the manual
     # entry-order screen (Android's EntryOrderPlacer) sets this True.
     guard_against_unintended_short: bool = False
+    # Part 5's entry-correlation fix (docs/ORDER_HISTORY_V2_DESIGN.md): optional, defaults None so
+    # every pre-existing caller is unaffected. A caller that knows what this placement *is* (an
+    # `EntryOrderPlacer`-style manual entry vs a `TriggerExecutor`-fired exit) should set this --
+    # it's the one signal the server has no other way to recover once [idempotency_key]'s tag has
+    # been derived (a one-way hash), needed so a later fill can correctly auto-create/update
+    # `lots` instead of sitting unresolved in `order_history` forever.
+    role: Optional[Literal["ENTRY", "EXIT", "MANUAL"]] = None
 
 
 class OrderEnginePlaceOrderResponse(BaseModel):
@@ -121,6 +133,7 @@ async def place_order_engine_order(
     order: OrderEnginePlaceOrderRequest,
     service: UpstoxService = Depends(get_upstox_service),
     token_store: EncryptedTokenStore = Depends(get_token_store),
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
 ) -> OrderEnginePlaceOrderResponse:
     """The real `BrokerOrderGateway.placeOrder` backing per §6.3 -- idempotency-keyed by
     [OrderEnginePlaceOrderRequest.idempotency_key] (always a `TriggerRule.id`/
@@ -166,6 +179,31 @@ async def place_order_engine_order(
         raise _http_error(status.HTTP_502_BAD_GATEWAY, "Could not reach Upstox") from exc
 
     broker_order_id = next(iter(extract_order_ids(result.order)), None)
+
+    if order.role is not None and broker_order_id:
+        # Best-effort bookkeeping -- the broker placement already succeeded above; a failure here
+        # must never surface as a placement failure, only a lost opportunity to auto-correlate
+        # this order's eventual fill (same posture the WS-push recorder's own try/except uses).
+        try:
+            OrderHistoryRecorder(ledger).record_placement(
+                broker_order_id=broker_order_id,
+                order_tag=derive_order_tag(order.idempotency_key),
+                idempotency_key=order.idempotency_key,
+                role=order.role,
+                instrument_key=order.instrument_key,
+                transaction_type=order.transaction_type,
+                product=order.product,
+                order_type=order.order_type,
+                requested_quantity=order.quantity,
+                requested_price=order.price,
+                trigger_price=order.trigger_price,
+            )
+        except Exception:
+            logger.warning(
+                "order-engine placement-time order_history correlation write failed for %s",
+                broker_order_id, exc_info=True,
+            )
+
     return OrderEnginePlaceOrderResponse(
         broker_order_id=broker_order_id,
         already_existed=result.already_existed,
@@ -258,41 +296,98 @@ async def modify_order_engine_order_quantity(
     return OrderEngineModifyQuantityResponse(status=confirmed.get("status"), raw=confirmed)
 
 
+class OrderHistoryEntryResponse(BaseModel):
+    """One `order_history` row -- see `docs/ORDER_HISTORY_V2_DESIGN.md` for the full column list
+    and why each exists. Journaling columns are always `None` from this route today -- populated
+    later by a future journal v2 UI/endpoint, not by anything in this backend yet."""
+
+    id: str
+    broker_order_id: str
+    exchange_order_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    order_tag: Optional[str] = None
+    instrument_key: str
+    trading_symbol: Optional[str] = None
+    transaction_type: str
+    product: str
+    order_type: str
+    requested_quantity: int
+    requested_price: Optional[float] = None
+    trigger_price: Optional[float] = None
+    status: str
+    status_message: Optional[str] = None
+    average_price: Optional[float] = None
+    filled_quantity: int
+    lot_id: Optional[str] = None
+    rule_id: Optional[str] = None
+    role: Optional[str] = None
+    placed_at: Optional[str] = None
+    last_broker_update_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+    strategy_tag: Optional[str] = None
+    followed_plan: Optional[bool] = None
+    mistake_reason: Optional[str] = None
+    remarks: Optional[str] = None
+    confidence_score: Optional[float] = None
+    setup_type: Optional[str] = None
+
+
+class OrderHistoryListResponse(BaseModel):
+    orders: list[OrderHistoryEntryResponse]
+    next_cursor: Optional[str] = None
+
+
+@router.get("/orders", response_model=OrderHistoryListResponse)
+async def list_order_history(
+    limit: int = 50,
+    before: Optional[str] = None,
+    instrument_key: Optional[str] = None,
+    order_status: Optional[str] = Query(default=None, alias="status"),
+    lot_id: Optional[str] = None,
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderHistoryListResponse:
+    """Part 5's (`docs/ORDER_HISTORY_V2_DESIGN.md`) own paginated, server-owned order history --
+    replaces the client's need to query broker order history directly (Upstox has no
+    historical-orders endpoint at all). Cursor-based (`before` = a previous page's last row `id`),
+    newest first, to avoid offset drift on this append-heavy, unbounded table.
+
+    Unlike `GET /orders/{idempotency_key}` above (a synchronous, broker-live single-order lookup
+    backing the placement-confirmation contract), this route never calls Upstox -- it only reads
+    what `OrderHistoryRecorder` has already durably recorded, which may lag a live broker order by
+    however long the reactive WS-push-then-re-fetch pipeline takes (typically near-instant, but
+    never guaranteed synchronous)."""
+    capped_limit = max(1, min(limit, 200))
+    orders = ledger.list_orders(
+        limit=capped_limit, before=before, instrument_key=instrument_key,
+        status=order_status, lot_id=lot_id,
+    )
+    next_cursor = orders[-1]["id"] if len(orders) == capped_limit else None
+    return OrderHistoryListResponse(
+        orders=[OrderHistoryEntryResponse(**order) for order in orders],
+        next_cursor=next_cursor,
+    )
+
+
 # -- §8's server-authoritative ledger -----------------------------------------------------------
 #
-# These four routes are the ledger half of Part 4 (`docs/ORDER_POSITION_OVERHAUL_DESIGN.md` §8.1),
+# These routes are the ledger half of Part 4 (`docs/ORDER_POSITION_OVERHAUL_DESIGN.md` §8.1),
 # distinct from everything above: the routes above place/cancel/modify a *real broker order*, these
-# four just record durable server-side state about a `Lot`/`TriggerRule` the client already has.
-# The server becomes authoritative for this record (§8.1's own framing: the client's local Room DB
-# becomes a synced cache, not the primary record) -- but the client-side `TriggerEvaluator` still
-# makes the actual fire decision locally, fast, off its own tick stream; nothing here evaluates or
-# fires anything, it only remembers what the client has already decided.
+# just record/read durable server-side state about a `Lot`/`TriggerRule`. The client-side
+# `TriggerEvaluator` still makes the actual fire decision locally, fast, off its own tick stream;
+# nothing here evaluates or fires anything, it only remembers what's happened.
 #
-# All four are simple upsert-by-id calls -- the client generates every id (`Lot.id`/
-# `TriggerRule.id`), so a resend (retry after a dropped response) always lands on the same row
-# rather than duplicating it, matching `OrderEngineLedgerStore.upsert_lot`/`upsert_trigger_rule`'s
-# own idempotent-by-construction behavior.
-
-
-class OrderEngineLotUpsertRequest(BaseModel):
-    """Mirrors the Android `Lot`/`LotBracket` shape closely enough for a durable server-side
-    record -- not a 1:1 field copy, just what §8's exit-reconciliation/live-PnL/max-loss watcher
-    machinery actually needs to know."""
-
-    lot_id: str = Field(min_length=1)
-    instrument_key: str = Field(min_length=1)
-    transaction_type: Literal["BUY", "SELL"]
-    entry_price: Optional[float] = None
-    entry_quantity: int = Field(gt=0)
-    remaining_quantity: int = Field(ge=0)
-    realized_pnl: float = 0.0
-    state: str = Field(min_length=1)
-    target_price: Optional[float] = None
-    stoploss_price: Optional[float] = None
-    trailing_gap: Optional[float] = None
-    target_rule_id: Optional[str] = None
-    stoploss_rule_id: Optional[str] = None
-    product: str = "I"
+# `PUT /ledger/lots` (the client-driven `Lot` upsert this section used to expose) was removed in
+# Part 5 (`docs/ORDER_HISTORY_V2_DESIGN.md`): the server is now the sole writer of `lots`, deriving
+# it itself from confirmed broker fills via `OrderHistoryRecorder` (see `app/main.py`'s
+# `_record_order_history_from_push`), not from a client-computed mirror. `GET /ledger/lots/{id}`
+# stays -- the read path is unaffected by who writes. Trigger-rule upsert routes below are
+# untouched, still client-driven, out of Part 5's scope.
+#
+# Remaining upsert routes are simple upsert-by-id calls -- the client generates every id
+# (`TriggerRule.id`), so a resend (retry after a dropped response) always lands on the same row
+# rather than duplicating it, matching `OrderEngineLedgerStore.upsert_trigger_rule`'s own
+# idempotent-by-construction behavior.
 
 
 class OrderEngineLotResponse(BaseModel):
@@ -319,33 +414,6 @@ class OrderEngineTightenStopLossRequest(BaseModel):
     trailing tighten never changes anything about a rule except its `condition_value`."""
 
     condition_value: float
-
-
-@router.put("/ledger/lots", response_model=OrderEngineLotResponse)
-async def upsert_ledger_lot(
-    body: OrderEngineLotUpsertRequest,
-    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
-) -> OrderEngineLotResponse:
-    """Records/updates one `Lot` durably server-side -- called after every local
-    `LotRepository` mutation (create, exit, transition) per §8.1. Idempotent by `lot_id`."""
-    lot = ledger.upsert_lot(
-        lot_id=body.lot_id,
-        instrument_key=body.instrument_key,
-        transaction_type=body.transaction_type,
-        entry_price=body.entry_price,
-        entry_quantity=body.entry_quantity,
-        remaining_quantity=body.remaining_quantity,
-        realized_pnl=body.realized_pnl,
-        state=body.state,
-        target_price=body.target_price,
-        stoploss_price=body.stoploss_price,
-        trailing_gap=body.trailing_gap,
-        target_rule_id=body.target_rule_id,
-        stoploss_rule_id=body.stoploss_rule_id,
-        product=body.product,
-    )
-    ledger.record_event(event_type="LOT_UPSERTED", lot_id=body.lot_id, payload={"state": body.state})
-    return OrderEngineLotResponse(lot=lot)
 
 
 @router.get("/ledger/lots/{lot_id}", response_model=OrderEngineLotResponse)

@@ -35,6 +35,8 @@ from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 from app.services.order_engine_max_loss_watcher import check_now as check_order_engine_max_loss_now
 from app.services.order_engine_max_loss_watcher import run_fallback_loop as run_order_engine_max_loss_watcher_fallback
 from app.services.order_engine_order_service import OrderEngineOrderService, derive_order_tag
+from app.services.broker_order_lookup import find_order_by_id
+from app.services.order_history_recorder import OrderHistoryRecorder
 from app.services.journal_reconciler import JournalReconciler, run_journal_reconciler
 from app.services.live_candle_builder import LiveCandleBuilder, feed_candle_to_cache_row
 from app.services.max_loss_settings_store import MaxLossSettingsStore
@@ -387,6 +389,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     order_engine_order_service = OrderEngineOrderService(order_engine_upstox)
     order_engine_exit_all_lock = asyncio.Lock()
     exit_reconciliation_checker = ExitReconciliationChecker(order_engine_ledger_store, order_engine_upstox)
+    # Part 5 (docs/ORDER_HISTORY_V2_DESIGN.md) -- the server-derived `order_history`/`lots`
+    # writer, replacing the client's `PUT /order-engine/ledger/lots` mirror as the sole authority.
+    order_history_recorder = OrderHistoryRecorder(order_engine_ledger_store)
     trade_context_token_store = EncryptedTokenStore(settings)
     trade_context_upstox = UpstoxService(settings, client=upstox_http_client)
     trade_context_service = TradeContextService(
@@ -438,6 +443,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             journal_reconciler,
             order_engine_ledger_store,
             exit_reconciliation_checker,
+            order_history_recorder,
+            order_engine_upstox,
             order_engine_token_store,
             payload,
         ),
@@ -770,6 +777,8 @@ def _on_portfolio_update(
     journal_reconciler: JournalReconciler,
     order_engine_ledger_store: OrderEngineLedgerStore,
     exit_reconciliation_checker: ExitReconciliationChecker,
+    order_history_recorder: OrderHistoryRecorder,
+    order_engine_upstox: UpstoxService,
     order_engine_token_store: EncryptedTokenStore,
     payload: dict[str, Any],
 ) -> None:
@@ -843,6 +852,102 @@ def _on_portfolio_update(
                 order_engine_ledger_store, exit_reconciliation_checker, order_engine_token_store, payload,
             ),
         )
+
+    # Part 5 (docs/ORDER_HISTORY_V2_DESIGN.md) -- records *every* order sighting (not just new
+    # fills) into `order_history`, and derives `lots` server-side on a genuine fill. Independent
+    # of and in addition to the exit-only reconciliation above.
+    asyncio.create_task(
+        _record_order_history_from_push(
+            order_engine_ledger_store, order_history_recorder, order_engine_upstox,
+            order_engine_token_store, payload,
+        ),
+    )
+
+
+async def _record_order_history_from_push(
+    ledger_store: OrderEngineLedgerStore,
+    recorder: OrderHistoryRecorder,
+    upstox: UpstoxService,
+    token_store: EncryptedTokenStore,
+    payload: dict[str, Any],
+) -> None:
+    """Part 5's own reactive writer: never trusts [payload] (the raw portfolio-feed WS push)
+    directly for a durable write -- re-fetches the order from Upstox's order book first, same
+    "broker ground truth, always re-confirmed, never taken on faith" discipline
+    `ExitReconciliationChecker`/`_reconcile_order_engine_exit` already use. Records an
+    `order_history` row for every status (open/complete/rejected/cancelled), and on a `complete`
+    status with a resolved role, derives `lots` too.
+
+    Role resolution: exits are recovered by scanning currently-`PLACED` trigger rules (an exit
+    order's tag is derived from the firing `TriggerRule.id`, so a matching rule directly gives
+    both role and owning lot). Entries can't be recovered the same way -- their tag is derived
+    from a client-generated idempotency key this server never independently learns, since
+    reversing a hash isn't possible. Instead, `place_order_engine_order`
+    (`app/api/order_engine_routes.py`) writes a placement-time correlation row via
+    `OrderHistoryRecorder.record_placement` whenever its caller supplies a `role` -- this falls
+    back to reading that row by `broker_order_id` when the trigger-rule scan finds nothing. An
+    entry order placed without that `role` hint still gets recorded in `order_history` (role
+    `None`) but never auto-creates a lot, same as before this fallback existed."""
+    order_id = payload.get("order_id") or payload.get("exchange_order_id")
+    if not isinstance(order_id, str) or not order_id:
+        return
+    if not token_store.has_token():
+        return
+    try:
+        access_token = token_store.load_access_token()
+    except (TokenStoreError, UpstoxAuthRequiredError):
+        return
+
+    try:
+        broker_order = await find_order_by_id(upstox, access_token, order_id)
+        if broker_order is None:
+            return
+
+        idempotency_key: Optional[str] = None
+        lot_id: Optional[str] = None
+        role: Optional[str] = None
+        tag = broker_order.get("tag")
+        if isinstance(tag, str) and tag:
+            for rule in ledger_store.get_trigger_rules_by_state("PLACED"):
+                rule_id = rule.get("id")
+                if isinstance(rule_id, str) and derive_order_tag(rule_id) == tag:
+                    idempotency_key = rule_id
+                    lot_id = rule.get("lot_id")
+                    role = "EXIT"
+                    break
+
+        if role is None:
+            # No PLACED bracket leg matched -- fall back to whatever place_order_engine_order
+            # recorded at placement time (entries, and any other caller that supplied a role).
+            placed_row = ledger_store.get_order_by_broker_order_id(order_id)
+            if placed_row is not None:
+                idempotency_key = placed_row.get("idempotency_key") or idempotency_key
+                role = placed_row.get("role") or role
+                if role == "ENTRY":
+                    # record_placement reuses idempotency_key as the eventual lot id -- stable,
+                    # unique per placement, no separate id-generation scheme needed.
+                    lot_id = placed_row.get("lot_id") or idempotency_key
+
+        # Fill-application runs *before* the order_history write below: for an ENTRY, the lot
+        # doesn't exist yet until apply_fill_to_ledger creates it, and order_history.lot_id is a
+        # real FK (same DB file, Part 5's own choice) -- referencing a lot_id that doesn't exist
+        # yet would fail that constraint. An EXIT's lot already exists (created by its own prior
+        # entry), so it's always safe to reference immediately.
+        lot_confirmed_to_exist = None
+        if broker_order.get("status") == "complete" and role in ("ENTRY", "EXIT") and lot_id:
+            lot = ledger_store.get_lot(lot_id)
+            entry_transaction_type = lot.get("transaction_type") if lot else None
+            lot_confirmed_to_exist = recorder.apply_fill_to_ledger(
+                broker_order, lot_id=lot_id, role=role,
+                entry_transaction_type=entry_transaction_type,
+            )
+
+        snapshot_lot_id = lot_id if (role == "EXIT" or lot_confirmed_to_exist is not None) else None
+        recorder.record_order_snapshot(
+            broker_order, idempotency_key=idempotency_key, lot_id=snapshot_lot_id, role=role,
+        )
+    except Exception:
+        logger.warning("Order-history recording failed for order %s", order_id, exc_info=True)
 
 
 async def _reconcile_order_engine_exit(

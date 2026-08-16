@@ -109,6 +109,49 @@ class OrderEngineLedgerStore:
                     threshold_mode TEXT NOT NULL DEFAULT 'ABSOLUTE',
                     epoch_started_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS order_history (
+                    id TEXT PRIMARY KEY,
+                    broker_order_id TEXT NOT NULL UNIQUE,
+                    exchange_order_id TEXT,
+                    idempotency_key TEXT,
+                    order_tag TEXT,
+                    instrument_key TEXT NOT NULL,
+                    trading_symbol TEXT,
+                    transaction_type TEXT NOT NULL,
+                    product TEXT NOT NULL,
+                    order_type TEXT NOT NULL,
+                    requested_quantity INTEGER NOT NULL,
+                    requested_price REAL,
+                    trigger_price REAL,
+                    status TEXT NOT NULL,
+                    status_message TEXT,
+                    average_price REAL,
+                    filled_quantity INTEGER NOT NULL DEFAULT 0,
+                    lot_id TEXT REFERENCES lots(id),
+                    rule_id TEXT,
+                    role TEXT,
+                    placed_at TEXT,
+                    last_broker_update_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    raw_broker_payload_json TEXT,
+                    strategy_tag TEXT,
+                    followed_plan INTEGER,
+                    mistake_reason TEXT,
+                    remarks TEXT,
+                    confidence_score REAL,
+                    setup_type TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS ix_order_history_idempotency_key
+                    ON order_history (idempotency_key);
+                CREATE INDEX IF NOT EXISTS ix_order_history_lot
+                    ON order_history (lot_id);
+                CREATE INDEX IF NOT EXISTS ix_order_history_instrument_status
+                    ON order_history (instrument_key, status);
+                CREATE INDEX IF NOT EXISTS ix_order_history_created_at
+                    ON order_history (created_at);
                 """,
             )
             # `CREATE TABLE IF NOT EXISTS` above is a no-op against an already-existing `lots`
@@ -369,5 +412,138 @@ class OrderEngineLedgerStore:
             rows = connection.execute(
                 "SELECT * FROM order_engine_events WHERE lot_id = ? ORDER BY recorded_at, id",
                 (lot_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- order history (Part 5, docs/ORDER_HISTORY_V2_DESIGN.md) ----------------------------
+
+    def upsert_order(
+        self,
+        *,
+        id: str,  # noqa: A002 - matches the row's own primary key name, not the builtin shadow risk here
+        broker_order_id: str,
+        exchange_order_id: Optional[str],
+        idempotency_key: Optional[str],
+        order_tag: Optional[str],
+        instrument_key: str,
+        trading_symbol: Optional[str],
+        transaction_type: str,
+        product: str,
+        order_type: str,
+        requested_quantity: int,
+        requested_price: Optional[float],
+        trigger_price: Optional[float],
+        status: str,
+        status_message: Optional[str],
+        average_price: Optional[float],
+        filled_quantity: int,
+        lot_id: Optional[str] = None,
+        rule_id: Optional[str] = None,
+        role: Optional[str] = None,
+        placed_at: Optional[str] = None,
+        last_broker_update_at: Optional[str] = None,
+        raw_broker_payload_json: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Insert-or-update by `broker_order_id` -- one row per real broker order, never
+        averaged/merged across separate orders. A repeat sighting of the same order (a status
+        transition, a later fill) updates the same row in place rather than duplicating it.
+        Journaling columns (`strategy_tag`/`followed_plan`/`mistake_reason`/`remarks`/
+        `confidence_score`/`setup_type`) are deliberately never written here -- left `NULL` for a
+        future journal v2 UI/endpoint to fill in, per `docs/ORDER_HISTORY_V2_DESIGN.md`."""
+        now = self._now()
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT id, created_at FROM order_history WHERE broker_order_id = ?",
+                (broker_order_id,),
+            ).fetchone()
+            row_id = existing["id"] if existing is not None else id
+            created_at = existing["created_at"] if existing is not None else now
+            connection.execute(
+                """
+                INSERT INTO order_history (
+                    id, broker_order_id, exchange_order_id, idempotency_key, order_tag,
+                    instrument_key, trading_symbol, transaction_type, product, order_type,
+                    requested_quantity, requested_price, trigger_price, status, status_message,
+                    average_price, filled_quantity, lot_id, rule_id, role, placed_at,
+                    last_broker_update_at, created_at, updated_at, raw_broker_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(broker_order_id) DO UPDATE SET
+                    exchange_order_id = excluded.exchange_order_id,
+                    idempotency_key = COALESCE(excluded.idempotency_key, order_history.idempotency_key),
+                    order_tag = COALESCE(excluded.order_tag, order_history.order_tag),
+                    trading_symbol = excluded.trading_symbol,
+                    status = excluded.status,
+                    status_message = excluded.status_message,
+                    average_price = excluded.average_price,
+                    filled_quantity = excluded.filled_quantity,
+                    lot_id = COALESCE(excluded.lot_id, order_history.lot_id),
+                    rule_id = COALESCE(excluded.rule_id, order_history.rule_id),
+                    role = COALESCE(excluded.role, order_history.role),
+                    last_broker_update_at = excluded.last_broker_update_at,
+                    updated_at = excluded.updated_at,
+                    raw_broker_payload_json = excluded.raw_broker_payload_json
+                """,
+                (
+                    row_id, broker_order_id, exchange_order_id, idempotency_key, order_tag,
+                    instrument_key, trading_symbol, transaction_type, product, order_type,
+                    requested_quantity, requested_price, trigger_price, status, status_message,
+                    average_price, filled_quantity, lot_id, rule_id, role, placed_at,
+                    last_broker_update_at, created_at, now, raw_broker_payload_json,
+                ),
+            )
+        return self.get_order_by_broker_order_id(broker_order_id)  # type: ignore[return-value]
+
+    def get_order_by_broker_order_id(self, broker_order_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM order_history WHERE broker_order_id = ?", (broker_order_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_orders(
+        self,
+        *,
+        limit: int = 50,
+        before: Optional[str] = None,
+        instrument_key: Optional[str] = None,
+        status: Optional[str] = None,
+        lot_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Cursor-paginated, newest first (`created_at DESC, id DESC`) -- avoids offset drift on
+        this append-heavy, unbounded table. [before] is a previous page's last row `id`; the
+        cursor resolves to that row's own `(created_at, id)` and the next page is everything
+        strictly older than it, so concurrent inserts at the head never shift an in-progress
+        page. Backs `GET /order-engine/orders`."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if before is not None:
+            anchor = None
+            with self._connect() as connection:
+                anchor = connection.execute(
+                    "SELECT created_at, id FROM order_history WHERE id = ?", (before,),
+                ).fetchone()
+            if anchor is not None:
+                clauses.append("(created_at, id) < (?, ?)")
+                params.extend([anchor["created_at"], anchor["id"]])
+        if instrument_key is not None:
+            clauses.append("instrument_key = ?")
+            params.append(instrument_key)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if lot_id is not None:
+            clauses.append("lot_id = ?")
+            params.append(lot_id)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM order_history
+                {where}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]

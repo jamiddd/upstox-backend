@@ -16,6 +16,8 @@ from app.services.exit_reconciliation_checker import ExitReconciliationChecker
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
 from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 from app.services.order_engine_order_service import OrderEngineOrderService
+from app.services.order_history_recorder import OrderHistoryRecorder
+from app.main import _record_order_history_from_push
 
 """§8.4 milestone 7 -- §6.6-style simulation/fault-injection coverage extended to Part 4's own new
 pieces, same discipline every earlier simulation suite in this repo already follows (drive real
@@ -97,30 +99,31 @@ class _FakeNotificationService:
 
 
 def test_a_malformed_ledger_write_is_rejected_and_leaves_no_row_behind(tmp_path) -> None:
+    """`PUT /ledger/lots` was removed in Part 5 (docs/ORDER_HISTORY_V2_DESIGN.md) -- `lots` is now
+    server-derived, not client-upserted, so this scenario now exercises the still-client-driven
+    `PUT /ledger/trigger-rules` route instead, same "a malformed request never reaches the store"
+    intent as before."""
     settings = _settings(tmp_path)
     ledger = OrderEngineLedgerStore(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
     client = TestClient(app)
     try:
-        # entry_quantity must be > 0 -- this request fails Pydantic validation before it ever
-        # reaches OrderEngineLedgerStore.upsert_lot at all.
+        # rule_id must be non-empty -- this request fails Pydantic validation before it ever
+        # reaches OrderEngineLedgerStore.upsert_trigger_rule at all.
         response = client.put(
-            "/api/order-engine/ledger/lots",
+            "/api/order-engine/ledger/trigger-rules",
             headers={"X-API-Key": "mobile-secret"},
             json={
-                "lot_id": "lot-bad-write",
+                "rule_id": "",
                 "instrument_key": "NSE_FO|1",
-                "transaction_type": "BUY",
-                "entry_quantity": 0,
-                "remaining_quantity": 50,
-                "state": "OPEN",
+                "state": "ARMED",
             },
         )
         assert response.status_code == 422
 
         # Confirms the mid-flow failure left nothing behind -- not a partial row, not any row.
-        assert ledger.get_lot("lot-bad-write") is None
+        assert ledger.get_trigger_rule("") is None
     finally:
         app.dependency_overrides.clear()
 
@@ -213,3 +216,99 @@ async def test_a_max_loss_breach_is_caught_and_flattened_with_zero_client_involv
 
     assert len(notifications.records) == 1
     assert notifications.records[0]["severity"] == "critical"
+
+
+# -- Scenario 4 (Part 5): one simulated fill produces consistent lots + order_history -----------
+
+
+def test_one_simulated_entry_then_exit_fill_produces_consistent_lot_and_order_history(tmp_path) -> None:
+    """docs/ORDER_HISTORY_V2_DESIGN.md's own end-to-end check: a real `OrderHistoryRecorder`
+    driven by two confirmed broker order-book rows (an entry fill, then an exit fill) must leave
+    `order_history` with one row per broker order and `lots` with a single, correctly-derived
+    row -- the two writes this feature makes must never disagree with each other."""
+    ledger = OrderEngineLedgerStore(_settings(tmp_path))
+    recorder = OrderHistoryRecorder(ledger)
+
+    entry_order = {
+        "order_id": "broker-entry", "tag": "tagentry", "instrument_token": "NSE_FO|1",
+        "trading_symbol": "NIFTY", "transaction_type": "BUY", "product": "I",
+        "order_type": "MARKET", "quantity": 50, "status": "complete",
+        "average_price": 100.0, "filled_quantity": 50,
+    }
+    # The lot doesn't exist yet when the entry order is first sighted -- record_order_snapshot
+    # must not reference a lot_id the FK can't yet satisfy, same ordering the real
+    # `_record_order_history_from_push` wiring follows.
+    recorder.record_order_snapshot(entry_order, idempotency_key="rule-entry", role="ENTRY")
+    lot_after_entry = recorder.apply_fill_to_ledger(entry_order, lot_id="lot-1", role="ENTRY")
+    recorder.record_order_snapshot(entry_order, idempotency_key="rule-entry", lot_id="lot-1", role="ENTRY")
+
+    exit_order = {
+        "order_id": "broker-exit", "tag": "tagexit", "instrument_token": "NSE_FO|1",
+        "trading_symbol": "NIFTY", "transaction_type": "SELL", "product": "I",
+        "order_type": "MARKET", "quantity": 50, "status": "complete",
+        "average_price": 110.0, "filled_quantity": 50,
+    }
+    recorder.record_order_snapshot(exit_order, idempotency_key="rule-exit", lot_id="lot-1", role="EXIT")
+    lot_after_exit = recorder.apply_fill_to_ledger(
+        exit_order, lot_id="lot-1", role="EXIT", entry_transaction_type="BUY",
+    )
+
+    # order_history: one row per broker order, never merged.
+    history_rows = {row["broker_order_id"] for row in ledger.list_orders(limit=10)}
+    assert history_rows == {"broker-entry", "broker-exit"}
+    assert ledger.get_order_by_broker_order_id("broker-entry")["role"] == "ENTRY"
+    assert ledger.get_order_by_broker_order_id("broker-exit")["role"] == "EXIT"
+
+    # lots: a single lot, correctly opened then closed -- consistent with both order_history rows.
+    assert lot_after_entry["id"] == "lot-1"
+    assert lot_after_entry["state"] == "OPEN"
+    assert lot_after_exit["id"] == "lot-1"
+    assert lot_after_exit["state"] == "CLOSED"
+    assert lot_after_exit["remaining_quantity"] == 0
+    assert lot_after_exit["realized_pnl"] == 500.0  # (110 - 100) * 50
+    assert ledger.get_all_lots() == [ledger.get_lot("lot-1")]
+
+
+# -- Scenario 5 (Part 5 entry-correlation fix): a real WS push auto-creates a lot for an entry --
+
+
+@pytest.mark.anyio
+async def test_a_real_ws_push_for_a_correlated_entry_order_auto_creates_a_lot(tmp_path) -> None:
+    """Drives the *real* `app.main._record_order_history_from_push` (not a hand-rolled stand-in)
+    end to end: `place_order_engine_order`'s own placement-time correlation write
+    (`OrderHistoryRecorder.record_placement`) is simulated first (same thing the real route does
+    right after a successful placement), then a portfolio-feed WS push for that order_id arrives
+    and must resolve role=ENTRY purely from the correlation row (no PLACED trigger rule exists at
+    all here), auto-creating the lot -- closing Part 5's own named entry-correlation gap."""
+    ledger = OrderEngineLedgerStore(_settings(tmp_path))
+    recorder = OrderHistoryRecorder(ledger)
+    recorder.record_placement(
+        broker_order_id="broker-entry-real", order_tag="tagentryreal",
+        idempotency_key="idem-entry-real", role="ENTRY", instrument_key="NSE_FO|1",
+        transaction_type="BUY", product="I", order_type="MARKET",
+        requested_quantity=50, requested_price=None, trigger_price=None,
+    )
+
+    upstox = _FakeUpstox(order_book_data=[
+        {
+            "order_id": "broker-entry-real", "tag": "tagentryreal", "instrument_token": "NSE_FO|1",
+            "trading_symbol": "NIFTY", "transaction_type": "BUY", "product": "I",
+            "order_type": "MARKET", "quantity": 50, "status": "complete",
+            "average_price": 100.0, "filled_quantity": 50,
+        },
+    ])
+    token_store = _FakeTokenStore()
+    push_payload = {"order_id": "broker-entry-real", "status": "complete", "tag": "tagentryreal"}
+
+    await _record_order_history_from_push(ledger, recorder, upstox, token_store, push_payload)
+
+    lot = ledger.get_lot("idem-entry-real")
+    assert lot is not None
+    assert lot["state"] == "OPEN"
+    assert lot["entry_price"] == 100.0
+    assert lot["remaining_quantity"] == 50
+
+    history_row = ledger.get_order_by_broker_order_id("broker-entry-real")
+    assert history_row["status"] == "complete"
+    assert history_row["lot_id"] == "idem-entry-real"
+    assert history_row["role"] == "ENTRY"

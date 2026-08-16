@@ -285,3 +285,123 @@ def test_max_loss_epoch_persists_percentage_threshold_mode(tmp_path) -> None:
     assert epoch["threshold_mode"] == "PERCENTAGE"
     assert epoch["threshold_x"] == 5.0
     assert store.get_max_loss_epoch()["threshold_mode"] == "PERCENTAGE"
+
+
+def _order_kwargs(**overrides) -> dict:
+    base = dict(
+        id="hist-1",
+        broker_order_id="broker-order-1",
+        exchange_order_id="exch-1",
+        idempotency_key="rule-1",
+        order_tag="tag123",
+        instrument_key="NSE_FO|1",
+        trading_symbol="NIFTY",
+        transaction_type="BUY",
+        product="I",
+        order_type="MARKET",
+        requested_quantity=50,
+        requested_price=None,
+        trigger_price=None,
+        status="open",
+        status_message=None,
+        average_price=None,
+        filled_quantity=0,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_upsert_order_inserts_then_updates_the_same_row_by_broker_order_id(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+
+    inserted = store.upsert_order(**_order_kwargs())
+    assert inserted["broker_order_id"] == "broker-order-1"
+    assert inserted["status"] == "open"
+    first_created_at = inserted["created_at"]
+
+    updated = store.upsert_order(**_order_kwargs(
+        id="hist-1-resend", status="complete", average_price=101.5, filled_quantity=50,
+    ))
+    assert updated["status"] == "complete"
+    assert updated["average_price"] == 101.5
+    assert updated["filled_quantity"] == 50
+    # A resend keyed by broker_order_id updates the same row -- id and created_at don't move.
+    assert updated["id"] == inserted["id"]
+    assert updated["created_at"] == first_created_at
+
+    with store._connect() as connection:  # noqa: SLF001 -- test-only direct check
+        count = connection.execute("SELECT COUNT(*) FROM order_history").fetchone()[0]
+    assert count == 1
+
+
+def test_upsert_order_journaling_columns_default_to_null(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+
+    order = store.upsert_order(**_order_kwargs())
+
+    assert order["strategy_tag"] is None
+    assert order["followed_plan"] is None
+    assert order["mistake_reason"] is None
+    assert order["remarks"] is None
+    assert order["confidence_score"] is None
+    assert order["setup_type"] is None
+
+
+def test_get_order_by_broker_order_id_returns_none_when_missing(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    assert store.get_order_by_broker_order_id("nope") is None
+
+
+def test_list_orders_orders_newest_first_and_paginates_with_a_cursor(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    for index in range(1, 4):
+        store.upsert_order(**_order_kwargs(id=f"hist-{index}", broker_order_id=f"broker-{index}"))
+
+    first_page = store.list_orders(limit=2)
+    assert [row["broker_order_id"] for row in first_page] == ["broker-3", "broker-2"]
+
+    second_page = store.list_orders(limit=2, before=first_page[-1]["id"])
+    assert [row["broker_order_id"] for row in second_page] == ["broker-1"]
+
+
+def test_list_orders_filters_by_instrument_status_and_lot(tmp_path) -> None:
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    store.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN",
+    )
+    store.upsert_order(**_order_kwargs(
+        id="hist-a", broker_order_id="broker-a", instrument_key="NSE_FO|1",
+        status="complete", lot_id="lot-1",
+    ))
+    store.upsert_order(**_order_kwargs(
+        id="hist-b", broker_order_id="broker-b", instrument_key="NSE_FO|2",
+        status="rejected", lot_id=None,
+    ))
+
+    assert [row["broker_order_id"] for row in store.list_orders(instrument_key="NSE_FO|1")] == ["broker-a"]
+    assert [row["broker_order_id"] for row in store.list_orders(status="rejected")] == ["broker-b"]
+    assert [row["broker_order_id"] for row in store.list_orders(lot_id="lot-1")] == ["broker-a"]
+
+
+def test_upsert_order_preserves_lot_id_role_and_idempotency_key_once_matched(tmp_path) -> None:
+    """A placement-accept sighting may not yet know the lot/role (no fill yet); a later
+    complete-status sighting fills those in. A COALESCE keeps whichever value is non-null rather
+    than letting a subsequent update blank out what an earlier sighting already resolved."""
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    store.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN",
+    )
+    store.upsert_order(**_order_kwargs(idempotency_key=None, lot_id=None, rule_id=None, role=None))
+
+    updated = store.upsert_order(**_order_kwargs(
+        idempotency_key="rule-1", lot_id="lot-1", rule_id="rule-1", role="ENTRY",
+        status="complete", average_price=100.0, filled_quantity=50,
+    ))
+
+    assert updated["idempotency_key"] == "rule-1"
+    assert updated["lot_id"] == "lot-1"
+    assert updated["role"] == "ENTRY"

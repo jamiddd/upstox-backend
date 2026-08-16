@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from app.services.broker_order_lookup import find_order_by_id
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
+from app.services.realized_pnl import compute_realized_pnl
 from app.services.upstox_service import UpstoxService
 
 """§8.2/§8.4 milestone 5's exit reconciliation (`docs/ORDER_POSITION_OVERHAUL_DESIGN.md`) -- the
@@ -86,8 +88,12 @@ class ExitReconciliationChecker:
 
         broker_avg_price = _number(broker_order.get("average_price"))
         broker_filled_quantity = _number(broker_order.get("filled_quantity"))
-        sign = -1.0 if str(lot.get("transaction_type")).upper() == "SELL" else 1.0
-        broker_realized_pnl = (broker_avg_price - entry_price) * broker_filled_quantity * sign
+        broker_realized_pnl = compute_realized_pnl(
+            entry_price=entry_price,
+            avg_exit_price=broker_avg_price,
+            filled_quantity=broker_filled_quantity,
+            transaction_type=str(lot.get("transaction_type")),
+        )
 
         ledger_realized_pnl = _number(lot.get("realized_pnl"))
 
@@ -130,14 +136,7 @@ class ExitReconciliationChecker:
         )
 
     async def _find_order(self, access_token: str, order_id: str) -> Optional[dict[str, Any]]:
-        book = await self._upstox.get_order_book(access_token)
-        orders = book.get("data") if isinstance(book, dict) else None
-        if not isinstance(orders, list):
-            return None
-        for order in orders:
-            if isinstance(order, dict) and order.get("order_id") == order_id:
-                return order
-        return None
+        return await find_order_by_id(self._upstox, access_token, order_id)
 
 
 def _number(value: Any) -> float:

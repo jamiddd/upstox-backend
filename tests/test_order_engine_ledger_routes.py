@@ -5,13 +5,35 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_order_engine_ledger_store, get_order_engine_lot_tracker
+from app.api.dependencies import (
+    get_order_engine_ledger_store,
+    get_order_engine_lot_tracker,
+    get_token_store,
+    get_upstox_service,
+)
 from app.core.config import Settings, get_settings
 from app.main import app
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
 from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 
 _HEADERS = {"X-API-Key": "mobile-secret"}
+
+
+class _FakePlacementTokenStore:
+    def load_access_token(self) -> str:
+        return "token"
+
+
+class _FakePlacementUpstox:
+    """Minimal fake for `OrderEngineOrderService.place_order`'s own calls -- an empty order book
+    (so `find_existing_order` finds nothing, forcing a fresh placement) plus a scripted
+    `place_order` accept response."""
+
+    async def get_order_book(self, access_token):
+        return {"status": "success", "data": []}
+
+    async def place_order(self, access_token, **kwargs):
+        return {"status": "success", "data": {"order_id": "broker-entry-1"}}
 
 
 def _settings() -> Settings:
@@ -41,30 +63,43 @@ def _client(tmp_path: Path) -> TestClient:
     return TestClient(app)
 
 
-def test_upsert_and_get_lot_round_trips(tmp_path) -> None:
+def test_get_lot_returns_what_the_store_holds(tmp_path) -> None:
+    """`PUT /ledger/lots` was removed in Part 5 (docs/ORDER_HISTORY_V2_DESIGN.md) -- the server is
+    now the sole writer of `lots`, so this seeds directly through the store, same as
+    `OrderHistoryRecorder` would."""
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    ledger.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN", target_price=110.0, stoploss_price=90.0,
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    try:
+        fetched = TestClient(app).get("/api/order-engine/ledger/lots/lot-1", headers=_HEADERS)
+        assert fetched.status_code == 200
+        assert fetched.json()["lot"]["state"] == "OPEN"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_put_ledger_lots_route_is_gone(tmp_path) -> None:
+    """Part 5's explicit "remove outright" decision -- nothing should still be listening here."""
     client = _client(tmp_path)
     try:
         response = client.put(
             "/api/order-engine/ledger/lots",
             headers=_HEADERS,
             json={
-                "lot_id": "lot-1",
-                "instrument_key": "NSE_FO|1",
-                "transaction_type": "BUY",
-                "entry_price": 100.0,
-                "entry_quantity": 50,
-                "remaining_quantity": 50,
-                "state": "OPEN",
-                "target_price": 110.0,
-                "stoploss_price": 90.0,
+                "lot_id": "lot-1", "instrument_key": "NSE_FO|1", "transaction_type": "BUY",
+                "entry_quantity": 50, "remaining_quantity": 50, "state": "OPEN",
             },
         )
-        assert response.status_code == 200, response.text
-        assert response.json()["lot"]["id"] == "lot-1"
-
-        fetched = client.get("/api/order-engine/ledger/lots/lot-1", headers=_HEADERS)
-        assert fetched.status_code == 200
-        assert fetched.json()["lot"]["state"] == "OPEN"
+        assert response.status_code in (404, 405)
     finally:
         app.dependency_overrides.clear()
 
@@ -79,20 +114,20 @@ def test_get_lot_404_when_missing(tmp_path) -> None:
 
 
 def test_upsert_trigger_rule_and_tighten_stop_loss(tmp_path) -> None:
-    client = _client(tmp_path)
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    ledger.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=None, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN",
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    client = TestClient(app)
     try:
-        client.put(
-            "/api/order-engine/ledger/lots",
-            headers=_HEADERS,
-            json={
-                "lot_id": "lot-1",
-                "instrument_key": "NSE_FO|1",
-                "transaction_type": "BUY",
-                "entry_quantity": 50,
-                "remaining_quantity": 50,
-                "state": "OPEN",
-            },
-        )
         upsert = client.put(
             "/api/order-engine/ledger/trigger-rules",
             headers=_HEADERS,
@@ -243,27 +278,25 @@ def test_upsert_max_loss_epoch_rejects_a_non_positive_threshold(tmp_path) -> Non
 
 
 def test_pnl_summary_sums_realized_across_open_and_closed_lots(tmp_path) -> None:
-    client = _client(tmp_path)
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    ledger.upsert_lot(
+        lot_id="lot-open", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=250.0, state="OPEN",
+    )
+    ledger.upsert_lot(
+        lot_id="lot-closed", instrument_key="NSE_FO|2", transaction_type="SELL",
+        entry_price=200.0, entry_quantity=10, remaining_quantity=0,
+        realized_pnl=-30.0, state="CLOSED",
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    client = TestClient(app)
     try:
-        client.put(
-            "/api/order-engine/ledger/lots",
-            headers=_HEADERS,
-            json={
-                "lot_id": "lot-open", "instrument_key": "NSE_FO|1", "transaction_type": "BUY",
-                "entry_price": 100.0, "entry_quantity": 50, "remaining_quantity": 50,
-                "realized_pnl": 250.0, "state": "OPEN",
-            },
-        )
-        client.put(
-            "/api/order-engine/ledger/lots",
-            headers=_HEADERS,
-            json={
-                "lot_id": "lot-closed", "instrument_key": "NSE_FO|2", "transaction_type": "SELL",
-                "entry_price": 200.0, "entry_quantity": 10, "remaining_quantity": 0,
-                "realized_pnl": -30.0, "state": "CLOSED",
-            },
-        )
-
         response = client.get("/api/order-engine/ledger/pnl-summary", headers=_HEADERS)
 
         assert response.status_code == 200, response.text
@@ -321,5 +354,176 @@ def test_pnl_summary_is_all_zero_with_no_lots_at_all(tmp_path) -> None:
         assert response.json() == {
             "realized_pnl": 0.0, "unrealized_pnl": 0.0, "open_lot_count": 0, "per_lot": [],
         }
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _seed_order(ledger: OrderEngineLedgerStore, **overrides) -> dict:
+    base = dict(
+        id="hist-1", broker_order_id="broker-1", exchange_order_id=None,
+        idempotency_key=None, order_tag=None, instrument_key="NSE_FO|1",
+        trading_symbol="NIFTY", transaction_type="BUY", product="I", order_type="MARKET",
+        requested_quantity=50, requested_price=None, trigger_price=None, status="open",
+        status_message=None, average_price=None, filled_quantity=0,
+    )
+    base.update(overrides)
+    return ledger.upsert_order(**base)
+
+
+def test_list_order_history_returns_newest_first(tmp_path) -> None:
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    _seed_order(ledger, id="hist-1", broker_order_id="broker-1")
+    _seed_order(ledger, id="hist-2", broker_order_id="broker-2")
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    try:
+        response = TestClient(app).get("/api/order-engine/orders", headers=_HEADERS)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert [order["broker_order_id"] for order in body["orders"]] == ["broker-2", "broker-1"]
+        assert body["next_cursor"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_list_order_history_paginates_with_a_cursor(tmp_path) -> None:
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    for index in range(1, 4):
+        _seed_order(ledger, id=f"hist-{index}", broker_order_id=f"broker-{index}")
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    client = TestClient(app)
+    try:
+        first_page = client.get("/api/order-engine/orders?limit=2", headers=_HEADERS)
+        assert first_page.status_code == 200, first_page.text
+        first_body = first_page.json()
+        assert [o["broker_order_id"] for o in first_body["orders"]] == ["broker-3", "broker-2"]
+        assert first_body["next_cursor"] is not None
+
+        second_page = client.get(
+            f"/api/order-engine/orders?limit=2&before={first_body['next_cursor']}", headers=_HEADERS,
+        )
+        assert second_page.status_code == 200, second_page.text
+        second_body = second_page.json()
+        assert [o["broker_order_id"] for o in second_body["orders"]] == ["broker-1"]
+        assert second_body["next_cursor"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_list_order_history_filters_by_status(tmp_path) -> None:
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    _seed_order(ledger, id="hist-a", broker_order_id="broker-a", status="complete")
+    _seed_order(ledger, id="hist-b", broker_order_id="broker-b", status="rejected")
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    try:
+        response = TestClient(app).get(
+            "/api/order-engine/orders?status=rejected", headers=_HEADERS,
+        )
+        assert response.status_code == 200, response.text
+        assert [o["broker_order_id"] for o in response.json()["orders"]] == ["broker-b"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_list_order_history_empty_result_shape(tmp_path) -> None:
+    client = _client(tmp_path)
+    try:
+        response = client.get("/api/order-engine/orders", headers=_HEADERS)
+        assert response.status_code == 200, response.text
+        assert response.json() == {"orders": [], "next_cursor": None}
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_list_order_history_requires_mobile_api_key(tmp_path) -> None:
+    client = _client(tmp_path)
+    try:
+        response = client.get("/api/order-engine/orders")
+        assert response.status_code in (401, 403)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_placing_an_order_with_a_role_writes_a_placement_time_correlation_row(tmp_path) -> None:
+    """Part 5's entry-correlation fix (docs/ORDER_HISTORY_V2_DESIGN.md): a caller that supplies
+    `role` gets a `submitted` order_history row written synchronously, keyed by the broker's own
+    order_id, carrying the idempotency_key the server would otherwise have no way to recover
+    later (its tag is a one-way hash)."""
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    app.dependency_overrides[get_upstox_service] = lambda: _FakePlacementUpstox()
+    app.dependency_overrides[get_token_store] = lambda: _FakePlacementTokenStore()
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/order-engine/orders",
+            headers=_HEADERS,
+            json={
+                "idempotency_key": "idem-entry-1",
+                "instrument_key": "NSE_FO|1",
+                "transaction_type": "BUY",
+                "quantity": 50,
+                "role": "ENTRY",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["broker_order_id"] == "broker-entry-1"
+
+        row = ledger.get_order_by_broker_order_id("broker-entry-1")
+        assert row is not None
+        assert row["status"] == "submitted"
+        assert row["idempotency_key"] == "idem-entry-1"
+        assert row["role"] == "ENTRY"
+        assert row["lot_id"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_placing_an_order_without_a_role_writes_no_correlation_row(tmp_path) -> None:
+    """Backward-compatible default: a caller that doesn't set `role` (every pre-existing caller)
+    is unaffected -- no order_history row is written from the placement route at all."""
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    app.dependency_overrides[get_upstox_service] = lambda: _FakePlacementUpstox()
+    app.dependency_overrides[get_token_store] = lambda: _FakePlacementTokenStore()
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/order-engine/orders",
+            headers=_HEADERS,
+            json={
+                "idempotency_key": "idem-exit-1",
+                "instrument_key": "NSE_FO|1",
+                "transaction_type": "SELL",
+                "quantity": 50,
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert ledger.get_order_by_broker_order_id("broker-entry-1") is None
     finally:
         app.dependency_overrides.clear()
