@@ -11,6 +11,7 @@ from app.core.market_hours import is_market_open
 from app.services.atm_iv_snapshot_store import AtmIvSnapshotStore
 from app.services.main_screen_service import MainScreenService
 from app.services.token_store import EncryptedTokenStore
+from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_service import UpstoxService
 
 logger = logging.getLogger(__name__)
@@ -19,32 +20,21 @@ _IST = ZoneInfo("Asia/Kolkata")
 _LOOP_INTERVAL_SECONDS = 15.0
 _RETENTION_WINDOW = timedelta(days=30)
 
-# Fixed set of major tradeable indices to capture ATM IV for -- unlike OI's collector (driven by
-# whatever the user has picked into TrackedInstrumentsStore), the user explicitly asked for these
-# seven regardless of what's tracked, since IV percentile is meant to always be available for the
-# indices actually traded from the Terminal screen.
-#
-# BANKEX and NIFTYNEXT50 don't appear anywhere else in this backend (no prior feature needed
-# them) -- these two instrument keys were confirmed 2026-08-15 against Upstox's own instrument
-# master (complete.json.gz): "BSE_INDEX|BANKEX" (896 listed CE/PE contracts under it) and
-# "NSE_INDEX|Nifty Next 50" (1082 listed CE/PE contracts, trading symbol NIFTYNXT50).
-_TRACKED_UNDERLYING_KEYS: tuple[str, ...] = (
-    "NSE_INDEX|Nifty 50",
-    "BSE_INDEX|SENSEX",
-    "NSE_INDEX|Nifty Bank",
-    "NSE_INDEX|Nifty Fin Service",
-    "NSE_INDEX|NIFTY MID SELECT",
-    "BSE_INDEX|BANKEX",
-    "NSE_INDEX|Nifty Next 50",
-)
-
 
 async def run_atm_iv_snapshot_collector(settings: Settings) -> None:
     """Persist one ATM IV snapshot per tracked index and five-minute market slot -- same shape as
-    `run_oi_snapshot_collector`, just a fixed underlying list and a rolling retention window
-    instead of "through expiry day" (see `AtmIvSnapshotStore`'s own doc comment for why).
+    `run_oi_snapshot_collector`, same source for *which* underlyings ([TrackedInstrumentsStore],
+    i.e. the Android app's own Delta Tracking selection) as of 2026-08-17. Previously read its own
+    separate hardcoded seven-index list instead -- the user's own instruction, once that fixed list
+    turned out to have drifted out of sync with what Delta Tracking actually showed: "make sure iv
+    is also using the tracked instruments list only. not separate list." No data loss from the
+    switch (no trading sessions had happened yet against the old list) -- see [AtmIvSnapshotStore]
+    for the unchanged storage shape; only which underlyings feed it changed. Still its own rolling
+    retention window ([_RETENTION_WINDOW]), not "through expiry day" like OI's collector -- see
+    [AtmIvSnapshotStore]'s own doc comment for why.
     """
     token_store = EncryptedTokenStore(settings)
+    tracked_store = TrackedInstrumentsStore(settings)
     upstox = UpstoxService(settings)
     main_screen = MainScreenService(upstox)
     snapshot_store: AtmIvSnapshotStore | None = None
@@ -58,6 +48,7 @@ async def run_atm_iv_snapshot_collector(settings: Settings) -> None:
             cleanup_completed_for = await _collect_tick(
                 now=now,
                 token_store=token_store,
+                tracked_store=tracked_store,
                 main_screen=main_screen,
                 snapshot_store=snapshot_store,
                 cleanup_completed_for=cleanup_completed_for,
@@ -73,6 +64,7 @@ async def _collect_tick(
     *,
     now: datetime,
     token_store: EncryptedTokenStore,
+    tracked_store: TrackedInstrumentsStore,
     main_screen: MainScreenService,
     snapshot_store: AtmIvSnapshotStore,
     cleanup_completed_for: datetime | None,
@@ -97,7 +89,7 @@ async def _collect_tick(
     except TokenStoreError:
         return cleanup_completed_for
 
-    for underlying_key in _TRACKED_UNDERLYING_KEYS:
+    for underlying_key in tracked_store.load():
         try:
             if await asyncio.to_thread(snapshot_store.has_snapshot, underlying_key, slot_start):
                 continue
