@@ -758,3 +758,174 @@ def test_cancel_trigger_rule_rejected_for_terminal_or_mid_transition_states(tmp_
             assert ledger.get_trigger_rule(f"rule-{state}")["state"] == state
     finally:
         app.dependency_overrides.clear()
+
+
+def test_list_ledger_lots_returns_every_lot_regardless_of_state(tmp_path) -> None:
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    ledger.upsert_lot(
+        lot_id="lot-open", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN",
+    )
+    ledger.upsert_lot(
+        lot_id="lot-closed", instrument_key="NSE_FO|2", transaction_type="SELL",
+        entry_price=200.0, entry_quantity=25, remaining_quantity=0,
+        realized_pnl=15.0, state="CLOSED",
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    try:
+        response = TestClient(app).get("/api/order-engine/ledger/lots", headers=_HEADERS)
+        assert response.status_code == 200, response.text
+        lot_ids = {lot["id"] for lot in response.json()["lots"]}
+        assert lot_ids == {"lot-open", "lot-closed"}
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _seeded_bracket_ledger(tmp_path: Path) -> OrderEngineLedgerStore:
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    ledger.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN", target_price=120.0, stoploss_price=90.0,
+        target_rule_id="rule-tp", stoploss_rule_id="rule-sl",
+    )
+    ledger.upsert_trigger_rule(
+        rule_id="rule-tp", lot_id="lot-1", instrument_key="NSE_FO|1",
+        role="TARGET", state="ARMED", condition_op="ABOVE", condition_value=120.0,
+        sibling_rule_id="rule-sl",
+    )
+    ledger.upsert_trigger_rule(
+        rule_id="rule-sl", lot_id="lot-1", instrument_key="NSE_FO|1",
+        role="STOP_LOSS", state="ARMED", condition_op="BELOW", condition_value=90.0,
+        sibling_rule_id="rule-tp",
+    )
+    return ledger
+
+
+def test_modify_lot_bracket_moves_both_legs(tmp_path) -> None:
+    client = _client(tmp_path)
+    ledger = _seeded_bracket_ledger(tmp_path)
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    try:
+        response = client.put(
+            "/api/order-engine/ledger/lots/lot-1/bracket",
+            headers=_HEADERS,
+            json={"target_price": 130.0, "stoploss_price": 95.0},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["target"]["outcome"] == "modified"
+        assert body["stoploss"]["outcome"] == "modified"
+        assert body["lot"]["target_price"] == 130.0
+        assert body["lot"]["stoploss_price"] == 95.0
+        assert ledger.get_trigger_rule("rule-tp")["condition_value"] == 130.0
+        assert ledger.get_trigger_rule("rule-sl")["condition_value"] == 95.0
+        # Untouched -- a value-only move, never a state transition.
+        assert ledger.get_trigger_rule("rule-tp")["state"] == "ARMED"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_modify_lot_bracket_one_leg_only(tmp_path) -> None:
+    client = _client(tmp_path)
+    ledger = _seeded_bracket_ledger(tmp_path)
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    try:
+        response = client.put(
+            "/api/order-engine/ledger/lots/lot-1/bracket",
+            headers=_HEADERS,
+            json={"target_price": 135.0},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["target"]["outcome"] == "modified"
+        assert body["stoploss"] is None
+        assert body["lot"]["target_price"] == 135.0
+        # The leg not touched by this call is left exactly as it was.
+        assert body["lot"]["stoploss_price"] == 90.0
+        assert ledger.get_trigger_rule("rule-sl")["condition_value"] == 90.0
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_modify_lot_bracket_rejects_a_leg_that_already_fired(tmp_path) -> None:
+    client = _client(tmp_path)
+    ledger = _seeded_bracket_ledger(tmp_path)
+    ledger.cas_update_trigger_rule_state("rule-sl", 0, "PLACED")
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    try:
+        response = client.put(
+            "/api/order-engine/ledger/lots/lot-1/bracket",
+            headers=_HEADERS,
+            json={"target_price": 130.0, "stoploss_price": 95.0},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # The still-ARMED leg succeeds even though its sibling can't.
+        assert body["target"]["outcome"] == "modified"
+        assert body["stoploss"]["outcome"] == "not_armed"
+        assert body["lot"]["target_price"] == 130.0
+        assert body["lot"]["stoploss_price"] == 90.0  # untouched
+        assert ledger.get_trigger_rule("rule-sl")["condition_value"] == 90.0
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_modify_lot_bracket_no_such_leg_when_lot_has_no_bracket_armed(tmp_path) -> None:
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    ledger.upsert_lot(
+        lot_id="lot-bare", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN",
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    try:
+        response = TestClient(app).put(
+            "/api/order-engine/ledger/lots/lot-bare/bracket",
+            headers=_HEADERS,
+            json={"target_price": 130.0},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["target"]["outcome"] == "no_such_leg"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_modify_lot_bracket_404_for_unknown_lot(tmp_path) -> None:
+    client = _client(tmp_path)
+    try:
+        response = client.put(
+            "/api/order-engine/ledger/lots/unknown/bracket",
+            headers=_HEADERS,
+            json={"target_price": 130.0},
+        )
+        assert response.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_modify_lot_bracket_422_when_nothing_is_set(tmp_path) -> None:
+    client = _client(tmp_path)
+    ledger = _seeded_bracket_ledger(tmp_path)
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    try:
+        response = client.put(
+            "/api/order-engine/ledger/lots/lot-1/bracket", headers=_HEADERS, json={},
+        )
+        assert response.status_code == 422
+    finally:
+        app.dependency_overrides.clear()

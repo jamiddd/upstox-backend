@@ -467,6 +467,30 @@ class OrderEngineLedgerStore:
                 ),
             )
 
+    def update_lot_bracket_price(
+        self, lot_id: str, *, target_price: Optional[float] = None, stoploss_price: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Keeps `lots.target_price`/`stoploss_price` in sync after a still-`ARMED` bracket leg's
+        `condition_value` moves server-side (see `modify_ledger_lot_bracket`'s own route) --
+        mirrors the client's own `LotRepository.updateBracketPrices`. Only the field(s) actually
+        passed are touched; a `None` here means "this leg wasn't part of this modify call," never
+        "clear this price" -- same partial-update posture [update_lot_notes] already uses,
+        specialized to the two position-bearing columns that one deliberately excludes."""
+        updates: dict[str, Any] = {}
+        if target_price is not None:
+            updates["target_price"] = target_price
+        if stoploss_price is not None:
+            updates["stoploss_price"] = stoploss_price
+        if not updates:
+            return self.get_lot(lot_id)
+        set_clause = ", ".join(f"{key} = ?" for key in updates)
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE lots SET {set_clause}, updated_at = ? WHERE id = ?",
+                (*updates.values(), self._now(), lot_id),
+            )
+        return self.get_lot(lot_id)
+
     def get_all_lots(self) -> list[dict[str, Any]]:
         """Every lot regardless of state -- unlike [get_open_lots], this includes `CLOSED` lots
         too, needed to sum whole-day realized P&L the same way the client's own

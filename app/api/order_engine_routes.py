@@ -431,6 +431,24 @@ class OrderEngineTightenStopLossRequest(BaseModel):
     condition_value: float
 
 
+class OrderEngineLotListResponse(BaseModel):
+    lots: list[dict[str, Any]]
+
+
+@router.get("/ledger/lots", response_model=OrderEngineLotListResponse)
+async def list_ledger_lots(
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineLotListResponse:
+    """`docs/ORDER_ENGINE_RELIABILITY_AUDIT.md`'s B5 phase 2: the "list my lots" endpoint the
+    client's local Room `Lot` table currently exists only because there was no server-side
+    equivalent -- every lot (open and closed, same "whole day matters" posture
+    `get_ledger_pnl_summary`'s own `realized_pnl` sum already uses, oldest first) with its full
+    row (`remaining_quantity`/`entry_price`/bracket prices/`state`/`product`/etc.), not the
+    narrower `armed-brackets`/`pnl-summary` shapes, which each carry only the fields their own
+    original caller needed."""
+    return OrderEngineLotListResponse(lots=ledger.get_all_lots())
+
+
 @router.get("/ledger/lots/{lot_id}", response_model=OrderEngineLotResponse)
 async def get_ledger_lot(
     lot_id: str,
@@ -440,6 +458,111 @@ async def get_ledger_lot(
     if lot is None:
         raise _http_error(status.HTTP_404_NOT_FOUND, "No matching lot found")
     return OrderEngineLotResponse(lot=lot)
+
+
+class OrderEngineModifyLotBracketRequest(BaseModel):
+    """At least one of the two must be set -- a caller wanting to touch neither has nothing to
+    call this route for."""
+
+    target_price: Optional[float] = None
+    stoploss_price: Optional[float] = None
+
+
+class OrderEngineModifyLotBracketLegResult(BaseModel):
+    outcome: Literal["modified", "no_such_leg", "not_armed"]
+
+
+class OrderEngineModifyLotBracketResponse(BaseModel):
+    lot: dict[str, Any]
+    target: Optional[OrderEngineModifyLotBracketLegResult] = None
+    stoploss: Optional[OrderEngineModifyLotBracketLegResult] = None
+
+
+def _modify_bracket_leg(
+    ledger: OrderEngineLedgerStore, rule_id: Optional[str], new_value: float,
+) -> str:
+    """One leg's own modify decision, same "a rule's own state decides what's legal" shape
+    `cancel_ledger_trigger_rule`/the now-dead `TriggerRuleCanceller` both already use -- only a
+    still-`ARMED` leg can move (a pure internal value change, no broker call, mirrors
+    `TriggerRepository.modifyConditionValue`/`tighten_ledger_trigger_rule_stop_loss`'s existing
+    value-only-upsert pattern rather than a version-CAS'd update -- same posture that route
+    already established for this exact kind of change). `no_such_leg` covers both "this lot never
+    had this side armed" (`rule_id` is `None`) and "the id it recorded doesn't resolve to a real
+    row" (shouldn't happen -- a real FK -- but never assumed)."""
+    if not rule_id:
+        return "no_such_leg"
+    rule = ledger.get_trigger_rule(rule_id)
+    if rule is None:
+        return "no_such_leg"
+    if rule.get("state") != "ARMED":
+        return "not_armed"
+    ledger.upsert_trigger_rule(
+        rule_id=rule_id, lot_id=rule["lot_id"], instrument_key=rule["instrument_key"],
+        role=rule["role"], state=rule["state"], condition_op=rule["condition_op"],
+        condition_value=new_value, sibling_rule_id=rule["sibling_rule_id"],
+    )
+    return "modified"
+
+
+@router.put("/ledger/lots/{lot_id}/bracket", response_model=OrderEngineModifyLotBracketResponse)
+async def modify_ledger_lot_bracket(
+    lot_id: str,
+    body: OrderEngineModifyLotBracketRequest,
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineModifyLotBracketResponse:
+    """`docs/ORDER_ENGINE_RELIABILITY_AUDIT.md`'s B5 phase 2: the "modify an armed bracket leg"
+    endpoint the client's `LotBracketModifier`/`NewEngineHomeScreen`'s "Modify" button need --
+    that button is live today but silently no-ops against a real bracket (it only ever mutated a
+    local `TriggerRule` row, never populated for a server-armed one post-Part-B3). Each side
+    ([target_price]/[stoploss_price]) is resolved and modified independently via
+    [_modify_bracket_leg] against [lot_id]'s own `target_rule_id`/`stoploss_rule_id` (the lots
+    table's own denormalized pointers, set once by `order_engine_lot_bracket_armer.arm_lot_bracket`
+    -- no separate trigger-rule scan needed); one leg's `not_armed`/`no_such_leg` outcome never
+    blocks the other from succeeding. `lots.target_price`/`stoploss_price` themselves are updated
+    to match only the leg(s) that actually succeeded, so a caller reading the returned [lot] sees
+    exactly the durable prices now in effect, not the ones it merely asked for.
+    """
+    lot = ledger.get_lot(lot_id)
+    if lot is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "No matching lot found")
+    if body.target_price is None and body.stoploss_price is None:
+        raise _http_error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Must set at least one of target_price/stoploss_price",
+        )
+
+    target_result: Optional[OrderEngineModifyLotBracketLegResult] = None
+    stoploss_result: Optional[OrderEngineModifyLotBracketLegResult] = None
+    new_target_price: Optional[float] = None
+    new_stoploss_price: Optional[float] = None
+
+    if body.target_price is not None:
+        outcome = _modify_bracket_leg(ledger, lot.get("target_rule_id"), body.target_price)
+        target_result = OrderEngineModifyLotBracketLegResult(outcome=outcome)
+        if outcome == "modified":
+            new_target_price = body.target_price
+            ledger.record_event(
+                event_type="TRIGGER_RULE_MODIFIED", lot_id=lot_id, rule_id=lot.get("target_rule_id"),
+                payload={"condition_value": body.target_price},
+            )
+
+    if body.stoploss_price is not None:
+        outcome = _modify_bracket_leg(ledger, lot.get("stoploss_rule_id"), body.stoploss_price)
+        stoploss_result = OrderEngineModifyLotBracketLegResult(outcome=outcome)
+        if outcome == "modified":
+            new_stoploss_price = body.stoploss_price
+            ledger.record_event(
+                event_type="TRIGGER_RULE_MODIFIED", lot_id=lot_id, rule_id=lot.get("stoploss_rule_id"),
+                payload={"condition_value": body.stoploss_price},
+            )
+
+    updated_lot = lot
+    if new_target_price is not None or new_stoploss_price is not None:
+        updated_lot = ledger.update_lot_bracket_price(
+            lot_id, target_price=new_target_price, stoploss_price=new_stoploss_price,
+        ) or lot
+
+    return OrderEngineModifyLotBracketResponse(lot=updated_lot, target=target_result, stoploss=stoploss_result)
 
 
 @router.put(
