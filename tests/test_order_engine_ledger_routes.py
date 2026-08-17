@@ -527,3 +527,74 @@ def test_placing_an_order_without_a_role_writes_no_correlation_row(tmp_path) -> 
         assert ledger.get_order_by_broker_order_id("broker-entry-1") is None
     finally:
         app.dependency_overrides.clear()
+
+
+def test_get_engine_health_is_none_before_anything_has_evaluated() -> None:
+    """§6.4 Part B4 -- a fresh process (or one that's never evaluated a tick) reports `None`, not
+    a fabricated timestamp; the client's own EngineHeartbeatMonitor treats that as "not enough
+    data yet," never an immediate DEGRADED verdict."""
+    import app.services.order_engine_trigger_evaluator as evaluator
+
+    evaluator._last_evaluated_at = None  # isolate from whatever an earlier test may have stamped
+    app.dependency_overrides[get_settings] = lambda: _settings()
+    try:
+        response = TestClient(app).get("/api/order-engine/engine-health", headers=_HEADERS)
+        assert response.status_code == 200, response.text
+        assert response.json()["last_evaluated_at"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_get_engine_health_reports_the_evaluators_own_last_stamp() -> None:
+    import app.services.order_engine_trigger_evaluator as evaluator
+    from datetime import datetime, timezone
+
+    evaluator._last_evaluated_at = datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc)
+    app.dependency_overrides[get_settings] = lambda: _settings()
+    try:
+        response = TestClient(app).get("/api/order-engine/engine-health", headers=_HEADERS)
+        assert response.status_code == 200, response.text
+        assert response.json()["last_evaluated_at"] == "2026-08-17T10:00:00+00:00"
+    finally:
+        evaluator._last_evaluated_at = None
+        app.dependency_overrides.clear()
+
+
+def test_get_ledger_armed_brackets_joins_the_lots_own_exit_shape(tmp_path) -> None:
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    ledger.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN", product="I",
+    )
+    ledger.upsert_trigger_rule(
+        rule_id="rule-sl", lot_id="lot-1", instrument_key="NSE_FO|1",
+        role="STOP_LOSS", state="ARMED", condition_op="BELOW", condition_value=90.0,
+        sibling_rule_id="rule-tp",
+    )
+    # PLACED, not ARMED -- must not appear in the response.
+    ledger.upsert_trigger_rule(
+        rule_id="rule-tp", lot_id="lot-1", instrument_key="NSE_FO|1",
+        role="TARGET", state="PLACED", condition_op="ABOVE", condition_value=120.0,
+        sibling_rule_id="rule-sl",
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    try:
+        response = TestClient(app).get("/api/order-engine/ledger/armed-brackets", headers=_HEADERS)
+        assert response.status_code == 200, response.text
+        brackets = response.json()["brackets"]
+        assert len(brackets) == 1
+        bracket = brackets[0]
+        assert bracket["rule_id"] == "rule-sl"
+        assert bracket["condition_op"] == "BELOW"
+        assert bracket["condition_value"] == 90.0
+        assert bracket["lot_transaction_type"] == "BUY"
+        assert bracket["lot_remaining_quantity"] == 50
+        assert bracket["lot_product"] == "I"
+    finally:
+        app.dependency_overrides.clear()

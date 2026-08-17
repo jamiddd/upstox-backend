@@ -82,6 +82,49 @@ def test_apply_fill_to_ledger_entry_creates_a_new_lot(tmp_path) -> None:
     assert lot["remaining_quantity"] == 50
 
 
+def test_apply_fill_to_ledger_entry_arms_the_bracket_on_a_fresh_lot(tmp_path) -> None:
+    """§6.3 Part B2: a fresh entry fill carrying a bracket must arm it server-side in the same
+    pass that creates the lot -- no client round trip required."""
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    recorder = OrderHistoryRecorder(store)
+
+    broker_order = _broker_order(status="complete", average_price=100.0, filled_quantity=50)
+    lot = recorder.apply_fill_to_ledger(
+        broker_order, lot_id="lot-1", role="ENTRY",
+        target_price=120.0, stoploss_price=90.0, trailing_gap=None,
+    )
+
+    assert lot["target_price"] == 120.0
+    assert lot["stoploss_price"] == 90.0
+    assert lot["target_rule_id"] is not None
+    assert lot["stoploss_rule_id"] is not None
+    armed = store.get_armed_trigger_rules_for_instrument("NSE_FO|1")
+    assert {rule["role"] for rule in armed} == {"TARGET", "STOP_LOSS"}
+
+
+def test_apply_fill_to_ledger_entry_does_not_rearm_an_already_open_lot(tmp_path) -> None:
+    """A second entry order building on an already-open lot must not create a second, disconnected
+    pair of trigger_rules -- arming only ever happens once, at lot creation."""
+    store = OrderEngineLedgerStore(_settings(tmp_path))
+    recorder = OrderHistoryRecorder(store)
+    store.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN",
+    )
+
+    second_fill = _broker_order(
+        order_id="broker-2", status="complete", average_price=110.0, filled_quantity=50,
+    )
+    lot = recorder.apply_fill_to_ledger(
+        second_fill, lot_id="lot-1", role="ENTRY",
+        target_price=200.0, stoploss_price=50.0, trailing_gap=None,
+    )
+
+    assert lot["target_rule_id"] is None  # never armed -- this fill hit the re-average branch
+    assert store.get_armed_trigger_rules_for_instrument("NSE_FO|1") == []
+
+
 def test_apply_fill_to_ledger_entry_reaverages_an_existing_open_lot(tmp_path) -> None:
     store = OrderEngineLedgerStore(_settings(tmp_path))
     recorder = OrderHistoryRecorder(store)

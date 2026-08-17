@@ -6,6 +6,7 @@ from typing import Any, Literal, Optional
 from uuid import uuid4
 
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
+from app.services.order_engine_lot_bracket_armer import arm_lot_bracket
 from app.services.realized_pnl import compute_realized_pnl
 
 """Part 5 (`docs/ORDER_HISTORY_V2_DESIGN.md`) -- the backend's own record of every real broker
@@ -38,6 +39,9 @@ class OrderHistoryRecorder:
         requested_quantity: int,
         requested_price: Optional[float],
         trigger_price: Optional[float],
+        target_price: Optional[float] = None,
+        stoploss_price: Optional[float] = None,
+        trailing_gap: Optional[float] = None,
     ) -> dict[str, Any]:
         """The one deliberate exception to "only ever write from a confirmed broker re-fetch":
         called synchronously right after a successful placement, using only data the caller
@@ -51,7 +55,14 @@ class OrderHistoryRecorder:
         it -- stable and unique per placement, no separate id-generation scheme needed. `status`
         is written as `"submitted"` -- a locally-known fact ("we asked Upstox to place this"), not
         a broker-confirmed status; the first real WS-push-triggered re-fetch overwrites it with
-        broker truth via [record_order_snapshot]'s own upsert-by-`broker_order_id`."""
+        broker truth via [record_order_snapshot]'s own upsert-by-`broker_order_id`.
+
+        [target_price]/[stoploss_price]/[trailing_gap] (§6.3 Part B2): the bracket this entry
+        placement itself intends, carried on this same correlation row purely so it survives to
+        fill time -- `_record_order_history_from_push` (app.main) reads them back off this row
+        when the fill confirms and hands them to [apply_fill_to_ledger], which arms the bracket via
+        [arm_lot_bracket] in the same pass that creates the `Lot`. All three `None` (every
+        pre-existing caller, and any `"EXIT"`/`"MANUAL"` placement) means no bracket to carry."""
         return self._ledger_store.upsert_order(
             id=str(uuid4()),
             broker_order_id=broker_order_id,
@@ -76,6 +87,9 @@ class OrderHistoryRecorder:
             placed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             last_broker_update_at=None,
             raw_broker_payload_json=None,
+            target_price=target_price,
+            stoploss_price=stoploss_price,
+            trailing_gap=trailing_gap,
         )
 
     def record_order_snapshot(
@@ -129,11 +143,18 @@ class OrderHistoryRecorder:
         lot_id: Optional[str],
         role: str,
         entry_transaction_type: Optional[str] = None,
+        target_price: Optional[float] = None,
+        stoploss_price: Optional[float] = None,
+        trailing_gap: Optional[float] = None,
     ) -> Optional[dict[str, Any]]:
         """Only meaningful for a `status == "complete"` broker order with a resolved [role]
         (`"ENTRY"`/`"EXIT"` -- `"MANUAL"`/`None` never mutates `lots`, per Part 5's "record every
         order, but only real lot-workflow fills mutate positions" design). Returns the mutated
-        lot row, or `None` if there was nothing to do."""
+        lot row, or `None` if there was nothing to do.
+
+        [target_price]/[stoploss_price]/[trailing_gap] (§6.3 Part B2, `ENTRY` only): the intended
+        bracket, forwarded straight to [_apply_entry_fill] -- see that method's own doc comment for
+        when it actually arms anything."""
         if role not in ("ENTRY", "EXIT"):
             return None
 
@@ -152,6 +173,9 @@ class OrderHistoryRecorder:
                 transaction_type=transaction_type,
                 average_price=average_price,
                 filled_quantity=filled_quantity,
+                target_price=target_price,
+                stoploss_price=stoploss_price,
+                trailing_gap=trailing_gap,
             )
 
         return self._apply_exit_fill(
@@ -169,11 +193,14 @@ class OrderHistoryRecorder:
         transaction_type: str,
         average_price: float,
         filled_quantity: int,
+        target_price: Optional[float] = None,
+        stoploss_price: Optional[float] = None,
+        trailing_gap: Optional[float] = None,
     ) -> dict[str, Any]:
         existing = self._ledger_store.get_lot(lot_id) if lot_id else None
         if existing is None:
             new_lot_id = lot_id or str(uuid4())
-            return self._ledger_store.upsert_lot(
+            lot = self._ledger_store.upsert_lot(
                 lot_id=new_lot_id,
                 instrument_key=instrument_key,
                 transaction_type=transaction_type,
@@ -182,6 +209,16 @@ class OrderHistoryRecorder:
                 remaining_quantity=filled_quantity,
                 realized_pnl=0.0,
                 state="OPEN",
+            )
+            # §6.3 Part B2: arm the bracket in this same pass, exactly once, right where the lot
+            # itself is born -- same "arm in the same write" posture LotRepository.createLot
+            # already follows client-side. Deliberately not on the re-averaging branch below (a
+            # second entry order building on an already-open lot never re-arms) -- an already-armed
+            # lot's bracket is managed from here on by the trigger evaluator/manual modify paths,
+            # not by a later entry fill.
+            return arm_lot_bracket(
+                self._ledger_store, lot,
+                target_price=target_price, stoploss_price=stoploss_price, trailing_gap=trailing_gap,
             )
 
         # A second entry order building the same still-open lot -- quantity-weighted re-average,

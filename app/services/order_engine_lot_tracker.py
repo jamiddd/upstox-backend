@@ -130,6 +130,14 @@ class OrderEngineLotTracker:
             if lot["instrument_key"] not in self._last_ltp
         ]
 
+    def last_ltp(self, instrument_key: str) -> Optional[float]:
+        """The most recent tick seen for [instrument_key], or `None` if none has arrived since
+        process start -- what `order_engine_trigger_evaluator.run_fallback_loop` uses to evaluate
+        armed rules during a stretch with no fresh ticks reaching [apply_tick] directly (same
+        "backstop, not primary" relationship `order_engine_max_loss_watcher.run_fallback_loop` has
+        to its own tick-driven `check_now`)."""
+        return self._last_ltp.get(instrument_key)
+
     def instrument_keys(self) -> set[str]:
         """Every currently open lot's instrument -- what a subscription manager needs to keep
         subscribed on the shared market feed so [apply_tick] actually gets called for them,

@@ -192,6 +192,19 @@ class OrderEngineLedgerStore:
                 "ALTER TABLE lots ADD COLUMN confidence_score REAL",
                 "ALTER TABLE lots ADD COLUMN setup_type TEXT",
                 "ALTER TABLE order_history ADD COLUMN charges REAL",
+                # §6.3's server-side trigger evaluator (docs/ORDER_POSITION_OVERHAUL_DESIGN.md) --
+                # bracket execution moves server-side, so trigger_rules needs the same
+                # database-level CAS guard the Android client's own `TriggerRule.version` already
+                # gives it (see [cas_update_trigger_rule_state]), to stay race-safe against two
+                # concurrent ticks for the same instrument evaluating the same rule.
+                "ALTER TABLE trigger_rules ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+                # §6.3 Part B2: the bracket a client-placed entry order intends, carried on its own
+                # order_history row from placement time (see OrderHistoryRecorder.record_placement)
+                # so the server can arm it itself once the fill actually confirms -- see
+                # order_engine_lot_bracket_armer.py.
+                "ALTER TABLE order_history ADD COLUMN target_price REAL",
+                "ALTER TABLE order_history ADD COLUMN stoploss_price REAL",
+                "ALTER TABLE order_history ADD COLUMN trailing_gap REAL",
             ):
                 try:
                     connection.execute(column_sql)
@@ -351,6 +364,70 @@ class OrderEngineLedgerStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_armed_trigger_rules_for_instrument(self, instrument_key: str) -> list[dict[str, Any]]:
+        """[get_armed_trigger_rules] scoped to one instrument -- what the server-side trigger
+        evaluator (`order_engine_trigger_evaluator.check_now`) actually needs on every tick, hits
+        the same `(instrument_key, state)` index [get_trigger_rule]'s own sibling queries already
+        use rather than scanning every armed rule across every instrument on every single tick."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM trigger_rules WHERE instrument_key = ? AND state = 'ARMED' "
+                "ORDER BY created_at",
+                (instrument_key,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def cas_update_trigger_rule_state(
+        self, rule_id: str, expected_version: int, new_state: str,
+    ) -> Optional[dict[str, Any]]:
+        """The real database-level CAS behind the server-side trigger evaluator -- only moves
+        [rule_id] to [new_state] if it's still at [expected_version], bumping the version by one on
+        success. Returns the updated row on success, `None` if the row doesn't exist or the CAS
+        lost the race (another tick/evaluation already moved it) -- a caller getting `None` back
+        must not treat the transition as having happened. Mirrors the Android client's own
+        `TriggerDao.casUpdate` exactly (same "return nothing on a lost race, no internal retry"
+        posture), since this store's `trigger_rules.version` column exists for exactly the same
+        reason `TriggerRule.version` does there."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE trigger_rules SET state = ?, version = version + 1, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (new_state, self._now(), rule_id, expected_version),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return self.get_trigger_rule(rule_id)
+
+    def get_armed_brackets_with_lot_info(self) -> list[dict[str, Any]]:
+        """§6.4 Part B4: every currently-`ARMED` `trigger_rules` row, joined with the fields its
+        own lot's `ClientFallbackRule` construction needs (transaction_type/remaining_quantity/
+        product -- the exit order shape, same as `order_engine_trigger_evaluator._fire_rule`'s own
+        lot lookup) -- what `GET /order-engine/ledger/armed-brackets` serves so the Android
+        client's `EngineHeartbeatMonitor`-triggered `ClientFallbackEvaluator` can arm the *same*
+        rule ids the server itself would fire, without needing a second, separate round trip per
+        rule. A rule whose `lot_id` no longer resolves to a real lot (shouldn't happen -- a real
+        FK) is skipped rather than returned with nulled-out lot fields."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    trigger_rules.id AS rule_id,
+                    trigger_rules.instrument_key AS instrument_key,
+                    trigger_rules.role AS role,
+                    trigger_rules.condition_op AS condition_op,
+                    trigger_rules.condition_value AS condition_value,
+                    trigger_rules.lot_id AS lot_id,
+                    lots.transaction_type AS lot_transaction_type,
+                    lots.remaining_quantity AS lot_remaining_quantity,
+                    lots.product AS lot_product
+                FROM trigger_rules
+                JOIN lots ON lots.id = trigger_rules.lot_id
+                WHERE trigger_rules.state = 'ARMED'
+                ORDER BY trigger_rules.created_at
+                """,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_trigger_rules_by_state(self, state: str) -> list[dict[str, Any]]:
         """General-purpose sibling to [get_armed_trigger_rules] -- needed by
         `_on_portfolio_update`'s exit-reconciliation wiring, which has to scan every currently
@@ -475,6 +552,9 @@ class OrderEngineLedgerStore:
         placed_at: Optional[str] = None,
         last_broker_update_at: Optional[str] = None,
         raw_broker_payload_json: Optional[str] = None,
+        target_price: Optional[float] = None,
+        stoploss_price: Optional[float] = None,
+        trailing_gap: Optional[float] = None,
     ) -> dict[str, Any]:
         """Insert-or-update by `broker_order_id` -- one row per real broker order, never
         averaged/merged across separate orders. A repeat sighting of the same order (a status
@@ -497,8 +577,9 @@ class OrderEngineLedgerStore:
                     instrument_key, trading_symbol, transaction_type, product, order_type,
                     requested_quantity, requested_price, trigger_price, status, status_message,
                     average_price, filled_quantity, lot_id, rule_id, role, placed_at,
-                    last_broker_update_at, created_at, updated_at, raw_broker_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_broker_update_at, created_at, updated_at, raw_broker_payload_json,
+                    target_price, stoploss_price, trailing_gap
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(broker_order_id) DO UPDATE SET
                     exchange_order_id = excluded.exchange_order_id,
                     idempotency_key = COALESCE(excluded.idempotency_key, order_history.idempotency_key),
@@ -513,7 +594,10 @@ class OrderEngineLedgerStore:
                     role = COALESCE(excluded.role, order_history.role),
                     last_broker_update_at = excluded.last_broker_update_at,
                     updated_at = excluded.updated_at,
-                    raw_broker_payload_json = excluded.raw_broker_payload_json
+                    raw_broker_payload_json = excluded.raw_broker_payload_json,
+                    target_price = COALESCE(excluded.target_price, order_history.target_price),
+                    stoploss_price = COALESCE(excluded.stoploss_price, order_history.stoploss_price),
+                    trailing_gap = COALESCE(excluded.trailing_gap, order_history.trailing_gap)
                 """,
                 (
                     row_id, broker_order_id, exchange_order_id, idempotency_key, order_tag,
@@ -521,6 +605,7 @@ class OrderEngineLedgerStore:
                     requested_quantity, requested_price, trigger_price, status, status_message,
                     average_price, filled_quantity, lot_id, rule_id, role, placed_at,
                     last_broker_update_at, created_at, now, raw_broker_payload_json,
+                    target_price, stoploss_price, trailing_gap,
                 ),
             )
         return self.get_order_by_broker_order_id(broker_order_id)  # type: ignore[return-value]

@@ -42,6 +42,12 @@ class FeedSubscriptionManager:
        currently cares about (selected/pinned contract, nearby-strike window, open positions,
        watchlist), registered per session id so multiple connections don't clobber each other's
        wants and a disconnecting session's contribution can be cleanly removed.
+    4. **Always-needed (order-engine open lots)** -- every currently open new-engine lot's own
+       instrument (see `set_order_engine_instruments`), same "regardless of whether any app
+       session is connected" reasoning as (2) above -- this is what makes
+       `order_engine_trigger_evaluator.check_now` (§6.3's server-side bracket executor) actually
+       tick-driven for a position no client happens to have open, rather than silently starved of
+       ticks until the fallback loop's next pass.
 
     Full-mode wins over LTPC when both are requested for the same key (matches Android's own
     `MarketFeedClient` posture: `replaceFullSubscription`'s LTPC-retention only concerns keys
@@ -60,6 +66,7 @@ class FeedSubscriptionManager:
         self._client_full: dict[str, set[str]] = {}
         self._client_ltpc: dict[str, set[str]] = {}
         self._position_instruments: set[str] = set()
+        self._order_engine_instruments: set[str] = set()
         self._apply_lock = asyncio.Lock()
 
     async def refresh_tracked_instruments(self) -> None:
@@ -111,6 +118,15 @@ class FeedSubscriptionManager:
             self._position_instruments = instrument_keys
             await self._apply()
 
+    async def set_order_engine_instruments(self, instrument_keys: set[str]) -> None:
+        """Replaces the always-needed order-engine open-lot set -- see this class's own doc
+        comment, source (4). Called wherever the caller already refreshes/derives
+        `OrderEngineLotTracker.instrument_keys()`, same trigger points
+        `set_open_position_instruments` already uses for the old engine's own position set."""
+        async with self._apply_lock:
+            self._order_engine_instruments = instrument_keys
+            await self._apply()
+
     async def _apply(self) -> None:
         d30_union: set[str] = set()
         for keys in self._client_d30.values():
@@ -135,7 +151,7 @@ class FeedSubscriptionManager:
                 _FULL_MODE_CAP,
             )
 
-        ltpc_union: set[str] = set(self._position_instruments)
+        ltpc_union: set[str] = set(self._position_instruments) | set(self._order_engine_instruments)
         for keys in self._client_ltpc.values():
             ltpc_union |= keys
         ltpc_union -= full_union | d30_union
@@ -153,6 +169,7 @@ class FeedSubscriptionManager:
         return {
             "tracked_instruments": sorted(self._tracked_store.load()),
             "position_instruments": sorted(self._position_instruments),
+            "order_engine_instruments": sorted(self._order_engine_instruments),
             "d30_application_cap": _FULL_D30_APPLICATION_CAP,
             "client_d30_by_session": {
                 session_id: sorted(keys) for session_id, keys in self._client_d30.items()

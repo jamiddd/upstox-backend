@@ -36,6 +36,8 @@ from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 from app.services.order_engine_max_loss_watcher import check_now as check_order_engine_max_loss_now
 from app.services.order_engine_max_loss_watcher import run_fallback_loop as run_order_engine_max_loss_watcher_fallback
 from app.services.order_engine_order_service import OrderEngineOrderService, derive_order_tag
+from app.services.order_engine_trigger_evaluator import check_now as check_order_engine_triggers_now
+from app.services.order_engine_trigger_evaluator import run_fallback_loop as run_order_engine_trigger_evaluator_fallback
 from app.services.broker_order_lookup import find_order_by_id
 from app.services.order_history_recorder import OrderHistoryRecorder
 from app.services.journal_reconciler import JournalReconciler, run_journal_reconciler
@@ -170,6 +172,23 @@ class _OrderEngineMaxLossWatcherDeps:
     order_service: OrderEngineOrderService
     notification_service: NotificationService
     exit_all_lock: asyncio.Lock
+
+
+@dataclass
+class _OrderEngineTriggerEvaluatorDeps:
+    """§6.3's server-side bracket executor's own deps bundle -- same "avoid eight positional
+    captures in _on_market_tick's lambda" reasoning as [_OrderEngineMaxLossWatcherDeps]. Reuses
+    that dataclass's own token_store/ledger_store/lot_tracker/order_service/notification_service
+    (all already constructed for the max-loss watcher) rather than duplicating them -- no lock
+    here, unlike the max-loss watcher's `exit_all_lock`, since correctness comes from
+    `OrderEngineLedgerStore.cas_update_trigger_rule_state`'s own database-level CAS, not from
+    serializing callers (see `order_engine_trigger_evaluator`'s own header comment)."""
+
+    token_store: EncryptedTokenStore
+    ledger_store: OrderEngineLedgerStore
+    lot_tracker: OrderEngineLotTracker
+    order_service: OrderEngineOrderService
+    notification_service: NotificationService
 
 
 class _FeedStateNotifier:
@@ -424,7 +443,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         token_store=market_feed_token_store,
         on_tick=lambda tick: _on_market_tick(
             candle_builder, stream_manager, position_tracker, max_loss_watcher_deps,
-            order_flow_service, order_engine_lot_tracker, order_engine_max_loss_watcher_deps, tick,
+            order_flow_service, order_engine_lot_tracker, order_engine_max_loss_watcher_deps,
+            order_engine_trigger_evaluator_deps, tick,
         ),
         on_state_change=market_feed_notifier.handle,
     )
@@ -481,6 +501,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         notification_service=notification_service,
         exit_all_lock=order_engine_exit_all_lock,
     )
+    order_engine_trigger_evaluator_deps = _OrderEngineTriggerEvaluatorDeps(
+        token_store=order_engine_token_store,
+        ledger_store=order_engine_ledger_store,
+        lot_tracker=order_engine_lot_tracker,
+        order_service=order_engine_order_service,
+        notification_service=notification_service,
+    )
 
     app.state.order_engine_lot_tracker = order_engine_lot_tracker
     app.state.market_feed_client = market_feed_client
@@ -509,6 +536,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     with contextlib.suppress(Exception):
         await position_tracker.refresh()
         await subscription_manager.set_open_position_instruments(position_tracker.instrument_keys())
+        await subscription_manager.set_order_engine_instruments(order_engine_lot_tracker.instrument_keys())
 
     market_feed_client.start()
     portfolio_feed_client.start()
@@ -517,6 +545,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     position_tracker_refresh_task = asyncio.create_task(
         _run_position_tracker_refresh(position_tracker, subscription_manager),
+    )
+    order_engine_subscription_refresh_task = asyncio.create_task(
+        _run_order_engine_subscription_refresh(order_engine_lot_tracker, subscription_manager),
     )
     market_feed_staleness_notifier = _MarketFeedStalenessNotifier(
         notification_service=notification_service,
@@ -549,6 +580,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             exit_all_lock=order_engine_max_loss_watcher_deps.exit_all_lock,
         ),
     )
+    # §6.3's backstop -- check_now itself now also runs on every live tick that touches an open
+    # order-engine lot, see _on_market_tick; this loop only matters for stretches with no ticks,
+    # same "backstop, not primary" relationship the max-loss watcher's own fallback loop has.
+    order_engine_trigger_evaluator_task = asyncio.create_task(
+        run_order_engine_trigger_evaluator_fallback(
+            token_store=order_engine_trigger_evaluator_deps.token_store,
+            ledger_store=order_engine_trigger_evaluator_deps.ledger_store,
+            lot_tracker=order_engine_trigger_evaluator_deps.lot_tracker,
+            order_engine_order_service=order_engine_trigger_evaluator_deps.order_service,
+            notification_service=order_engine_trigger_evaluator_deps.notification_service,
+        ),
+    )
 
     await notification_service.record(
         category="system",
@@ -569,8 +612,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         gtt_status_poller_task.cancel()
         max_loss_watcher_task.cancel()
         order_engine_max_loss_watcher_task.cancel()
+        order_engine_trigger_evaluator_task.cancel()
         subscription_refresh_task.cancel()
         position_tracker_refresh_task.cancel()
+        order_engine_subscription_refresh_task.cancel()
         market_feed_staleness_task.cancel()
         journal_reconciler_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -592,9 +637,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError):
             await order_engine_max_loss_watcher_task
         with contextlib.suppress(asyncio.CancelledError):
+            await order_engine_trigger_evaluator_task
+        with contextlib.suppress(asyncio.CancelledError):
             await subscription_refresh_task
         with contextlib.suppress(asyncio.CancelledError):
             await position_tracker_refresh_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await order_engine_subscription_refresh_task
         with contextlib.suppress(asyncio.CancelledError):
             await market_feed_staleness_task
         with contextlib.suppress(asyncio.CancelledError):
@@ -635,6 +684,28 @@ async def _run_position_tracker_refresh(
             raise
         except Exception:
             logger.warning("Position P&L tracker refresh failed unexpectedly", exc_info=True)
+
+
+async def _run_order_engine_subscription_refresh(
+    lot_tracker: OrderEngineLotTracker,
+    subscription_manager: FeedSubscriptionManager,
+) -> None:
+    """[_run_position_tracker_refresh]'s sibling for the order engine's own open-lot set (see
+    `FeedSubscriptionManager`'s own doc comment, source 4) -- a fallback only, since
+    `_on_portfolio_update` already triggers an immediate push the moment any order-engine order
+    actually changes (a fresh entry fill, an exit closing a lot). Unlike the old engine's own
+    refresh, there's no network re-fetch here -- `OrderEngineLotTracker.instrument_keys()` reads
+    the local ledger directly, always current -- this loop exists purely to catch a lot opened by
+    some path that didn't happen to trigger an immediate push, same "backstop, not primary"
+    posture as everything else server-side already follows for this engine."""
+    while True:
+        await asyncio.sleep(_POSITION_TRACKER_REFRESH_INTERVAL_SECONDS)
+        try:
+            await subscription_manager.set_order_engine_instruments(lot_tracker.instrument_keys())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Order-engine subscription refresh failed unexpectedly", exc_info=True)
 
 
 async def _run_market_feed_staleness_check(
@@ -715,6 +786,7 @@ def _on_market_tick(
     order_flow_service: OrderFlowService,
     order_engine_lot_tracker: OrderEngineLotTracker,
     order_engine_max_loss_watcher_deps: _OrderEngineMaxLossWatcherDeps,
+    order_engine_trigger_evaluator_deps: _OrderEngineTriggerEvaluatorDeps,
     tick: FeedTick,
 ) -> None:
     live_candle = candle_builder.handle_tick(tick)
@@ -748,6 +820,21 @@ def _on_market_tick(
                 order_engine_order_service=order_engine_max_loss_watcher_deps.order_service,
                 notification_service=order_engine_max_loss_watcher_deps.notification_service,
                 exit_all_lock=order_engine_max_loss_watcher_deps.exit_all_lock,
+            ),
+        )
+        # §6.3's server-side bracket executor, wired to a live caller: same "gate on the relevant
+        # instrument set" posture as the max-loss check just above -- every open order-engine lot's
+        # instrument is exactly the set an armed trigger_rule could belong to (a rule always
+        # belongs to a lot, see OrderEngineLedgerStore's own schema).
+        asyncio.create_task(
+            check_order_engine_triggers_now(
+                tick.instrument_key,
+                tick.ltp,
+                now=datetime.now(timezone.utc),
+                token_store=order_engine_trigger_evaluator_deps.token_store,
+                ledger_store=order_engine_trigger_evaluator_deps.ledger_store,
+                order_engine_order_service=order_engine_trigger_evaluator_deps.order_service,
+                notification_service=order_engine_trigger_evaluator_deps.notification_service,
             ),
         )
 
@@ -792,10 +879,23 @@ def _on_portfolio_update(
         except Exception:
             logger.warning("Position P&L tracker refresh (on order update) failed", exc_info=True)
 
+    async def _refresh_order_engine_subscription() -> None:
+        try:
+            # No network re-fetch needed -- get_open_lots() reads the local ledger directly,
+            # already current the moment order_history_recorder.apply_fill_to_ledger (called
+            # further below in this same handler) returns.
+            instrument_keys = {lot["instrument_key"] for lot in order_engine_ledger_store.get_open_lots()}
+            await subscription_manager.set_order_engine_instruments(instrument_keys)
+        except Exception:
+            logger.warning("Order-engine subscription refresh (on order update) failed", exc_info=True)
+
     # Any order-related event (new fill, rejection, modification) can mean the open-position set
     # itself just changed -- refresh immediately rather than waiting for the next periodic tick,
     # so a newly opened position starts getting live max-loss coverage right away.
     asyncio.create_task(_refresh_position_tracker())
+    # Same immediacy for a newly opened order-engine lot -- see _run_order_engine_subscription_refresh's
+    # own doc comment for why this one needs no network re-fetch, just a fresh local read.
+    asyncio.create_task(_refresh_order_engine_subscription())
     asyncio.create_task(journal_reconciler.reconcile())
 
     is_new_fill = _handle_order_update(detector, payload)
@@ -917,6 +1017,7 @@ async def _record_order_history_from_push(
                     role = "EXIT"
                     break
 
+        placed_row: Optional[dict[str, Any]] = None
         if role is None:
             # No PLACED bracket leg matched -- fall back to whatever place_order_engine_order
             # recorded at placement time (entries, and any other caller that supplied a role).
@@ -938,9 +1039,16 @@ async def _record_order_history_from_push(
         if broker_order.get("status") == "complete" and role in ("ENTRY", "EXIT") and lot_id:
             lot = ledger_store.get_lot(lot_id)
             entry_transaction_type = lot.get("transaction_type") if lot else None
+            # §6.3 Part B2: the bracket this ENTRY placement itself intended, carried on
+            # placed_row since record_placement's own call time -- see that method's own doc
+            # comment. None for an EXIT (placed_row is never fetched on that path -- role came
+            # from the PLACED-rule scan above instead) or an ENTRY placed with no bracket at all.
             lot_confirmed_to_exist = recorder.apply_fill_to_ledger(
                 broker_order, lot_id=lot_id, role=role,
                 entry_transaction_type=entry_transaction_type,
+                target_price=placed_row.get("target_price") if placed_row else None,
+                stoploss_price=placed_row.get("stoploss_price") if placed_row else None,
+                trailing_gap=placed_row.get("trailing_gap") if placed_row else None,
             )
 
         snapshot_lot_id = lot_id if (role == "EXIT" or lot_confirmed_to_exist is not None) else None

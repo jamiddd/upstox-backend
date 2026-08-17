@@ -23,6 +23,7 @@ from app.services.order_engine_order_service import (
     derive_order_tag,
 )
 from app.services.order_history_recorder import OrderHistoryRecorder
+from app.services import order_engine_trigger_evaluator
 from app.services.token_store import EncryptedTokenStore
 from app.services.trade_context_service import extract_order_ids
 from app.services.upstox_service import UpstoxService
@@ -62,6 +63,17 @@ class OrderEnginePlaceOrderRequest(BaseModel):
     # been derived (a one-way hash), needed so a later fill can correctly auto-create/update
     # `lots` instead of sitting unresolved in `order_history` forever.
     role: Optional[Literal["ENTRY", "EXIT", "MANUAL"]] = None
+    # §6.3 Part B2: the bracket this placement itself intends -- only meaningful alongside
+    # role="ENTRY" (Android's EntryOrderPlacer is the one caller that sets these). Carried through
+    # record_placement onto this order's own order_history row so the server can arm the bracket
+    # itself once the fill confirms (OrderHistoryRecorder._apply_entry_fill ->
+    # order_engine_lot_bracket_armer.arm_lot_bracket), rather than waiting for the client's own
+    # PUT /ledger/trigger-rules mirror -- see that route's own doc comment for why that mirror
+    # alone left a disconnected phone's fresh entry completely unprotected. All `None` (every
+    # pre-existing caller, and any EXIT/MANUAL placement) means no bracket to arm.
+    target_price: Optional[float] = None
+    stoploss_price: Optional[float] = None
+    trailing_gap: Optional[float] = None
 
 
 class OrderEnginePlaceOrderResponse(BaseModel):
@@ -197,6 +209,9 @@ async def place_order_engine_order(
                 requested_quantity=order.quantity,
                 requested_price=order.price,
                 trigger_price=order.trigger_price,
+                target_price=order.target_price,
+                stoploss_price=order.stoploss_price,
+                trailing_gap=order.trailing_gap,
             )
         except Exception:
             logger.warning(
@@ -604,6 +619,63 @@ async def get_ledger_pnl_summary(
                 unrealized_pnl=status.live_pnl,
             )
             for status in lot_tracker.per_lot_live_pnl()
+        ],
+    )
+
+
+class OrderEngineHealthResponse(BaseModel):
+    """§6.4 Part B4's heartbeat exposure -- what the Android client's `EngineHeartbeatMonitor`
+    polls to tell whether the server's own trigger-evaluation loop is actually advancing, not just
+    whether this HTTP endpoint itself is reachable. `last_evaluated_at` is `None` before this
+    backend process has evaluated anything at all (a fresh restart, or before the first tick/
+    fallback-loop pass) -- the client's own `EngineHeartbeatMonitor.observe` needs a real `Instant`,
+    so a caller should treat `None` here as "not enough data yet," not as an immediate DEGRADED
+    verdict."""
+
+    last_evaluated_at: Optional[str] = None
+
+
+@router.get("/engine-health", response_model=OrderEngineHealthResponse)
+async def get_order_engine_health() -> OrderEngineHealthResponse:
+    stamp = order_engine_trigger_evaluator.last_evaluated_at()
+    return OrderEngineHealthResponse(last_evaluated_at=stamp.isoformat() if stamp is not None else None)
+
+
+class OrderEngineArmedBracketResponse(BaseModel):
+    """One `ARMED` bracket leg, with its own lot's exit-order shape already resolved -- see
+    `OrderEngineLedgerStore.get_armed_brackets_with_lot_info`'s own doc comment for why this is a
+    join, not a separate per-rule lot fetch. [rule_id] is deliberately reused as the fallback
+    order's own idempotency key by the Android client -- the *same* id this server would use if it
+    fired this exact rule itself, so a late-recovering server's own attempt is rejected as a
+    duplicate rather than doubling the exit."""
+
+    rule_id: str
+    instrument_key: str
+    role: Optional[str] = None
+    condition_op: Optional[str] = None
+    condition_value: Optional[float] = None
+    lot_id: Optional[str] = None
+    lot_transaction_type: Optional[str] = None
+    lot_remaining_quantity: Optional[int] = None
+    lot_product: Optional[str] = None
+
+
+class OrderEngineArmedBracketsResponse(BaseModel):
+    brackets: list[OrderEngineArmedBracketResponse]
+
+
+@router.get("/ledger/armed-brackets", response_model=OrderEngineArmedBracketsResponse)
+async def get_ledger_armed_brackets(
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineArmedBracketsResponse:
+    """§6.4 Part B4: what `ClientFallbackEvaluator` arms itself from once
+    `EngineHeartbeatMonitor` reports `DEGRADED` -- every bracket leg the server itself currently
+    considers armed and would fire, in the exact shape the client needs to build its own
+    equivalent `ClientFallbackRule` without a second round trip per rule."""
+    return OrderEngineArmedBracketsResponse(
+        brackets=[
+            OrderEngineArmedBracketResponse(**row)
+            for row in ledger.get_armed_brackets_with_lot_info()
         ],
     )
 
