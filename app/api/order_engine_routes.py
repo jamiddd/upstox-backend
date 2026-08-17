@@ -503,6 +503,104 @@ async def tighten_ledger_trigger_rule_stop_loss(
     return OrderEngineTriggerRuleResponse(trigger_rule=rule)
 
 
+class OrderEngineCancelTriggerRuleResponse(BaseModel):
+    """Server-side twin of Android's own (now-dead, post-Part-B3) `TriggerRuleCanceller` outcome
+    shape (`TriggerCancelOutcome`) -- one flat response instead of a sealed class, since this is
+    the wire boundary, not the domain type itself."""
+
+    outcome: Literal[
+        "cancelled_internally", "cancelled_on_broker", "not_found_on_broker", "rejected",
+    ]
+    trigger_rule: Optional[dict[str, Any]] = None
+    broker_status: Optional[str] = None
+    reason: Optional[str] = None
+
+
+@router.post(
+    "/ledger/trigger-rules/{rule_id}/cancel",
+    response_model=OrderEngineCancelTriggerRuleResponse,
+)
+async def cancel_ledger_trigger_rule(
+    rule_id: str,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineCancelTriggerRuleResponse:
+    """Closes the gap `docs/ORDER_ENGINE_RELIABILITY_AUDIT.md` names as "no real way to cancel a
+    specific server-armed bracket leg from the client" -- since Part B3, bracket legs are armed and
+    fired entirely server-side, so the client's own local `TriggerRuleCanceller` (which only ever
+    read a local Room `TriggerRule` row) can never find anything to act on. This route is that
+    class's logic, ported server-side, working against the real, authoritative `trigger_rules` row:
+
+    - `ARMED` -> a pure internal CAS (`cas_update_trigger_rule_state`, race-safe against the
+      evaluator's own tick-driven CAS to `FIRING` -- a rule that wins that race between this route
+      reading it and applying the transition is rejected with 409, never silently dropped).
+    - `PLACED` -> a real broker cancel via `OrderEngineOrderService.cancel_order`, keyed by
+      [rule_id] itself (the same idempotency key `order_engine_trigger_evaluator._fire_rule` placed
+      the exit order with), confirmed against broker state per that method's own discipline, then
+      the local row is CAS'd `PLACED -> CANCELLED` to match (re-reading the row's current version
+      first, since the evaluator could have moved it in the time the broker call took).
+    - Every other state (`EVALUATING`, `FIRING`, `FAILED`, `CANCELLED`) has nothing legitimate to
+      cancel -- rejected with a reason, same "never silently dropped or falsely reported as
+      successful" discipline `TriggerRuleCanceller`'s own doc comment states.
+
+    404 if [rule_id] doesn't exist in the ledger at all.
+    """
+    rule = ledger.get_trigger_rule(rule_id)
+    if rule is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "No matching trigger rule found")
+
+    state = rule.get("state")
+
+    if state == "ARMED":
+        cancelled = ledger.cas_update_trigger_rule_state(rule_id, rule["version"], "CANCELLED")
+        if cancelled is None:
+            raise _http_error(
+                status.HTTP_409_CONFLICT,
+                "Trigger rule changed state before this cancel could apply -- refresh and retry.",
+            )
+        ledger.record_event(
+            event_type="TRIGGER_RULE_CANCELLED", lot_id=cancelled.get("lot_id"), rule_id=rule_id,
+            payload={"via": "internal_cas"},
+        )
+        return OrderEngineCancelTriggerRuleResponse(
+            outcome="cancelled_internally", trigger_rule=cancelled,
+        )
+
+    if state == "PLACED":
+        access_token = _load_access_token(token_store)
+        order_service = OrderEngineOrderService(service)
+        try:
+            confirmed = await order_service.cancel_order(access_token, rule_id)
+        except (UpstoxApiError, httpx.TimeoutException, httpx.TransportError) as exc:
+            raise _upstox_call_error(exc) from exc
+
+        if confirmed is None:
+            return OrderEngineCancelTriggerRuleResponse(outcome="not_found_on_broker")
+
+        # Re-read the row's own *current* state/version rather than trusting the stale [rule] this
+        # handler already holds -- the evaluator's own reconciliation could have moved it while the
+        # broker call above was in flight. Only CAS if it's still genuinely PLACED.
+        current = ledger.get_trigger_rule(rule_id) or rule
+        cancelled = None
+        if current.get("state") == "PLACED":
+            cancelled = ledger.cas_update_trigger_rule_state(rule_id, current["version"], "CANCELLED")
+            if cancelled is not None:
+                ledger.record_event(
+                    event_type="TRIGGER_RULE_CANCELLED", lot_id=cancelled.get("lot_id"),
+                    rule_id=rule_id, payload={"via": "broker_cancel"},
+                )
+        return OrderEngineCancelTriggerRuleResponse(
+            outcome="cancelled_on_broker",
+            trigger_rule=cancelled if cancelled is not None else current,
+            broker_status=confirmed.get("status"),
+        )
+
+    return OrderEngineCancelTriggerRuleResponse(
+        outcome="rejected", reason=f"cannot cancel a rule in state {state}",
+    )
+
+
 class OrderEngineMaxLossEpochUpsertRequest(BaseModel):
     """§7.10's 2026-08-12 amendment: the user chooses, client-side, whether `threshold_x` is a
     fixed absolute amount or a percentage of the breach formula's own reference point -- this

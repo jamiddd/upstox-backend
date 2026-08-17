@@ -15,6 +15,8 @@ from app.core.config import Settings, get_settings
 from app.main import app
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
 from app.services.order_engine_lot_tracker import OrderEngineLotTracker
+from app.services.order_engine_order_service import derive_order_tag
+from tests.test_order_engine_order_service import FakeUpstox
 
 _HEADERS = {"X-API-Key": "mobile-secret"}
 
@@ -596,5 +598,163 @@ def test_get_ledger_armed_brackets_joins_the_lots_own_exit_shape(tmp_path) -> No
         assert bracket["lot_transaction_type"] == "BUY"
         assert bracket["lot_remaining_quantity"] == 50
         assert bracket["lot_product"] == "I"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _seeded_cancel_ledger(tmp_path: Path) -> OrderEngineLedgerStore:
+    settings = _settings()
+    ledger = OrderEngineLedgerStore(
+        replace(settings, order_engine_ledger_database_path=tmp_path / "ledger.sqlite3"),
+    )
+    ledger.upsert_lot(
+        lot_id="lot-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=100.0, entry_quantity=50, remaining_quantity=50,
+        realized_pnl=0.0, state="OPEN", product="I",
+    )
+    return ledger
+
+
+def _cancel_route_client_overrides(settings, ledger, fake_upstox) -> None:
+    """Every branch of `cancel_ledger_trigger_rule` still declares `get_upstox_service`/
+    `get_token_store` as FastAPI `Depends` params (same posture every other route in this file
+    uses) -- they're resolved before the handler body's own state-based branching runs, so even
+    the pure-internal-CAS `ARMED` path needs a working override, not a missing one. Whether the
+    fake broker was actually *called* is asserted separately per test via `fake_upstox`'s own
+    call-recording lists."""
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    app.dependency_overrides[get_upstox_service] = lambda: fake_upstox
+    app.dependency_overrides[get_token_store] = lambda: _FakePlacementTokenStore()
+
+
+def test_cancel_trigger_rule_404_for_unknown_rule(tmp_path) -> None:
+    # `get_upstox_service`/`get_token_store` are still resolved before the 404 check runs (see
+    # `_cancel_route_client_overrides`'s own doc comment) -- a plain `_client(tmp_path)` (no such
+    # override) would fail on dependency resolution, not reach the assertion below.
+    settings = _settings()
+    ledger = _seeded_cancel_ledger(tmp_path)
+    _cancel_route_client_overrides(settings, ledger, FakeUpstox())
+    try:
+        response = TestClient(app).post(
+            "/api/order-engine/ledger/trigger-rules/unknown/cancel", headers=_HEADERS,
+        )
+        assert response.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_cancel_armed_trigger_rule_is_a_pure_internal_cas(tmp_path) -> None:
+    """The ARMED branch must never actually call the broker, even though a working
+    `get_upstox_service` override exists (FastAPI resolves it regardless of which branch the
+    handler body takes) -- asserted directly via `fake_upstox`'s own empty call list, not by
+    omitting the override."""
+    settings = _settings()
+    ledger = _seeded_cancel_ledger(tmp_path)
+    ledger.upsert_trigger_rule(
+        rule_id="rule-sl", lot_id="lot-1", instrument_key="NSE_FO|1",
+        role="STOP_LOSS", state="ARMED", condition_op="BELOW", condition_value=90.0,
+        sibling_rule_id=None,
+    )
+    fake_upstox = FakeUpstox()
+    _cancel_route_client_overrides(settings, ledger, fake_upstox)
+    try:
+        response = TestClient(app).post(
+            "/api/order-engine/ledger/trigger-rules/rule-sl/cancel", headers=_HEADERS,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["outcome"] == "cancelled_internally"
+        assert body["trigger_rule"]["state"] == "CANCELLED"
+        assert ledger.get_trigger_rule("rule-sl")["state"] == "CANCELLED"
+        assert fake_upstox.cancel_order_calls == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_cancel_placed_trigger_rule_calls_the_real_broker_cancel(tmp_path) -> None:
+    settings = _settings()
+    ledger = _seeded_cancel_ledger(tmp_path)
+    ledger.upsert_trigger_rule(
+        rule_id="rule-sl", lot_id="lot-1", instrument_key="NSE_FO|1",
+        role="STOP_LOSS", state="PLACED", condition_op="BELOW", condition_value=90.0,
+        sibling_rule_id=None,
+    )
+    fake_upstox = FakeUpstox(order_book_data=[
+        {"order_id": "broker-order-1", "tag": derive_order_tag("rule-sl"), "status": "open"},
+    ])
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    app.dependency_overrides[get_upstox_service] = lambda: fake_upstox
+    app.dependency_overrides[get_token_store] = lambda: _FakePlacementTokenStore()
+    try:
+        response = TestClient(app).post(
+            "/api/order-engine/ledger/trigger-rules/rule-sl/cancel", headers=_HEADERS,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["outcome"] == "cancelled_on_broker"
+        assert body["broker_status"] == "cancelled"
+        assert body["trigger_rule"]["state"] == "CANCELLED"
+        assert fake_upstox.cancel_order_calls == ["broker-order-1"]
+        assert ledger.get_trigger_rule("rule-sl")["state"] == "CANCELLED"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_cancel_placed_trigger_rule_not_found_on_broker(tmp_path) -> None:
+    """No matching order on today's broker book at all (already filled, or never really placed) --
+    404-shaped "not found," never conflated with a genuine cancel failure. The local row is left
+    exactly as it was; there's nothing confirmed to CAS off."""
+    settings = _settings()
+    ledger = _seeded_cancel_ledger(tmp_path)
+    ledger.upsert_trigger_rule(
+        rule_id="rule-sl", lot_id="lot-1", instrument_key="NSE_FO|1",
+        role="STOP_LOSS", state="PLACED", condition_op="BELOW", condition_value=90.0,
+        sibling_rule_id=None,
+    )
+    fake_upstox = FakeUpstox(order_book_data=[])
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    app.dependency_overrides[get_order_engine_lot_tracker] = lambda: OrderEngineLotTracker(ledger)
+    app.dependency_overrides[get_upstox_service] = lambda: fake_upstox
+    app.dependency_overrides[get_token_store] = lambda: _FakePlacementTokenStore()
+    try:
+        response = TestClient(app).post(
+            "/api/order-engine/ledger/trigger-rules/rule-sl/cancel", headers=_HEADERS,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["outcome"] == "not_found_on_broker"
+        assert body["trigger_rule"] is None
+        assert ledger.get_trigger_rule("rule-sl")["state"] == "PLACED"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_cancel_trigger_rule_rejected_for_terminal_or_mid_transition_states(tmp_path) -> None:
+    settings = _settings()
+    ledger = _seeded_cancel_ledger(tmp_path)
+    for state in ("EVALUATING", "FIRING", "FAILED", "CANCELLED"):
+        ledger.upsert_trigger_rule(
+            rule_id=f"rule-{state}", lot_id="lot-1", instrument_key="NSE_FO|1",
+            role="STOP_LOSS", state=state, condition_op="BELOW", condition_value=90.0,
+            sibling_rule_id=None,
+        )
+    fake_upstox = FakeUpstox()
+    _cancel_route_client_overrides(settings, ledger, fake_upstox)
+    try:
+        for state in ("EVALUATING", "FIRING", "FAILED", "CANCELLED"):
+            response = TestClient(app).post(
+                f"/api/order-engine/ledger/trigger-rules/rule-{state}/cancel", headers=_HEADERS,
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["outcome"] == "rejected"
+            assert state in body["reason"]
+            # Untouched -- a rejected cancel must never silently mutate state.
+            assert ledger.get_trigger_rule(f"rule-{state}")["state"] == state
     finally:
         app.dependency_overrides.clear()
