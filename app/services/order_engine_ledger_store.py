@@ -164,6 +164,15 @@ class OrderEngineLedgerStore:
                     ON order_history (instrument_key, status);
                 CREATE INDEX IF NOT EXISTS ix_order_history_created_at
                     ON order_history (created_at);
+
+                CREATE TABLE IF NOT EXISTS pending_ambiguous_fills (
+                    id TEXT PRIMARY KEY,
+                    order_id TEXT NOT NULL UNIQUE,
+                    instrument_key TEXT NOT NULL,
+                    candidate_lot_ids_json TEXT NOT NULL,
+                    broker_order_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """,
             )
             # `CREATE TABLE IF NOT EXISTS` above is a no-op against an already-existing `lots`
@@ -726,6 +735,71 @@ class OrderEngineLedgerStore:
                 (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # -- pending ambiguous external fills (2026-08-18: external-order-detection follow-up) ----
+    #
+    # A fill placed outside the app that matched 2+ open lots on the opposite side (see
+    # `_record_order_history_from_push` in `app/main.py`) is never auto-closed -- this table is
+    # the durable, resolvable form of that "needs review" state, surfaced in the app's Positions
+    # screen (unavoidable UI, per the user's own call) alongside the existing push notification,
+    # which is purely informational and takes no action of its own. Resolving here (or the row
+    # simply never existing, e.g. a duplicate portfolio push for an already-resolved order) is the
+    # only way this ever gets acted on -- there's no second, competing action path to race against.
+
+    def record_pending_ambiguous_fill(
+        self, *, order_id: str, instrument_key: str, candidate_lot_ids: list[str],
+        broker_order: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Idempotent by `order_id` -- a duplicate portfolio-feed push for the same order (already
+        pending, or already resolved and thus absent) must not create a second row or resurrect a
+        resolved one. `INSERT OR IGNORE` covers the first case; the second is simply that a
+        resolved row no longer exists, so this naturally does nothing for it either."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO pending_ambiguous_fills (
+                    id, order_id, instrument_key, candidate_lot_ids_json, broker_order_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id, order_id, instrument_key,
+                    json.dumps(candidate_lot_ids), json.dumps(broker_order, default=str),
+                    self._now(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM pending_ambiguous_fills WHERE order_id = ?", (order_id,),
+            ).fetchone()
+        return self._pending_ambiguous_fill_row_to_dict(row)
+
+    def get_pending_ambiguous_fills(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM pending_ambiguous_fills ORDER BY created_at",
+            ).fetchall()
+        return [self._pending_ambiguous_fill_row_to_dict(row) for row in rows]
+
+    def get_pending_ambiguous_fill(self, pending_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pending_ambiguous_fills WHERE id = ?", (pending_id,),
+            ).fetchone()
+        return self._pending_ambiguous_fill_row_to_dict(row) if row is not None else None
+
+    def delete_pending_ambiguous_fill(self, pending_id: str) -> None:
+        """Called once a candidate lot is chosen and the fill has been applied -- this row's only
+        job was to hold the ambiguity open until a human picked one."""
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM pending_ambiguous_fills WHERE id = ?", (pending_id,),
+            )
+
+    @staticmethod
+    def _pending_ambiguous_fill_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data["candidate_lot_ids"] = json.loads(data.pop("candidate_lot_ids_json"))
+        data["broker_order"] = json.loads(data.pop("broker_order_json"))
+        return data
 
     # -- journal v2 (design session 2026-08-16) --------------------------------------------
     #

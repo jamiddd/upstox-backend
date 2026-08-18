@@ -984,5 +984,94 @@ async def get_ledger_armed_brackets(
     )
 
 
+class OrderEnginePendingAmbiguousFillResponse(BaseModel):
+    """One unresolved external-order-detection ambiguity -- see
+    `OrderEngineLedgerStore`'s `pending_ambiguous_fills` table doc comment. Surfaced in the
+    Positions screen; the user picks which of [candidate_lot_ids] the fill actually closed, or
+    leaves it (no dismiss/ignore action exists -- it simply stays pending until resolved)."""
+
+    id: str
+    order_id: str
+    instrument_key: str
+    candidate_lot_ids: list[str]
+    transaction_type: Optional[str] = None
+    average_price: Optional[float] = None
+    filled_quantity: Optional[int] = None
+    created_at: str
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "OrderEnginePendingAmbiguousFillResponse":
+        broker_order = row["broker_order"]
+        return cls(
+            id=row["id"],
+            order_id=row["order_id"],
+            instrument_key=row["instrument_key"],
+            candidate_lot_ids=row["candidate_lot_ids"],
+            transaction_type=broker_order.get("transaction_type"),
+            average_price=broker_order.get("average_price"),
+            filled_quantity=broker_order.get("filled_quantity"),
+            created_at=row["created_at"],
+        )
+
+
+class OrderEnginePendingAmbiguousFillsResponse(BaseModel):
+    fills: list[OrderEnginePendingAmbiguousFillResponse]
+
+
+@router.get("/ledger/pending-ambiguous-fills", response_model=OrderEnginePendingAmbiguousFillsResponse)
+async def get_pending_ambiguous_fills(
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEnginePendingAmbiguousFillsResponse:
+    return OrderEnginePendingAmbiguousFillsResponse(
+        fills=[
+            OrderEnginePendingAmbiguousFillResponse.from_row(row)
+            for row in ledger.get_pending_ambiguous_fills()
+        ],
+    )
+
+
+class OrderEngineResolvePendingAmbiguousFillRequest(BaseModel):
+    lot_id: str
+
+
+class OrderEngineResolvePendingAmbiguousFillResponse(BaseModel):
+    resolved: bool
+    lot_id: Optional[str] = None
+
+
+@router.post(
+    "/ledger/pending-ambiguous-fills/{pending_id}/resolve",
+    response_model=OrderEngineResolvePendingAmbiguousFillResponse,
+)
+async def resolve_pending_ambiguous_fill(
+    pending_id: str,
+    body: OrderEngineResolvePendingAmbiguousFillRequest,
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> OrderEngineResolvePendingAmbiguousFillResponse:
+    """The only action path for an ambiguous external exit (§ the `pending_ambiguous_fills` table
+    doc comment) -- the push notification fired alongside the original detection is purely
+    informational, so there is nothing else that could race with this."""
+    pending = ledger.get_pending_ambiguous_fill(pending_id)
+    if pending is None:
+        raise _http_error(status.HTTP_404_NOT_FOUND, "No such pending ambiguous fill")
+    if body.lot_id not in pending["candidate_lot_ids"]:
+        raise _http_error(status.HTTP_400_BAD_REQUEST, "lot_id is not one of this fill's candidates")
+
+    lot = ledger.get_lot(body.lot_id)
+    entry_transaction_type = lot.get("transaction_type") if lot else None
+    recorder = OrderHistoryRecorder(ledger)
+    mutated_lot = recorder.apply_fill_to_ledger(
+        pending["broker_order"], lot_id=body.lot_id, role="EXIT",
+        entry_transaction_type=entry_transaction_type,
+    )
+    recorder.record_order_snapshot(
+        pending["broker_order"], lot_id=body.lot_id, role="EXIT",
+    )
+    ledger.delete_pending_ambiguous_fill(pending_id)
+    return OrderEngineResolvePendingAmbiguousFillResponse(
+        resolved=mutated_lot is not None, lot_id=body.lot_id,
+    )
+
+
 def _pnl_number(value: Any) -> float:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0

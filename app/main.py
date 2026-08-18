@@ -37,6 +37,7 @@ from app.services.order_engine_order_service import OrderEngineOrderService, der
 from app.services.order_engine_trigger_evaluator import check_now as check_order_engine_triggers_now
 from app.services.order_engine_trigger_evaluator import run_fallback_loop as run_order_engine_trigger_evaluator_fallback
 from app.services.broker_order_lookup import find_order_by_id
+from app.services.default_bracket import default_bracket_prices
 from app.services.order_history_recorder import OrderHistoryRecorder
 from app.services.journal_reconciler import JournalReconciler, run_journal_reconciler
 from app.services.live_candle_builder import LiveCandleBuilder, feed_candle_to_cache_row
@@ -887,7 +888,7 @@ def _on_portfolio_update(
     asyncio.create_task(
         _record_order_history_from_push(
             order_engine_ledger_store, order_history_recorder, order_engine_upstox,
-            order_engine_token_store, payload,
+            order_engine_token_store, payload, notification_service,
         ),
     )
 
@@ -919,6 +920,7 @@ async def _record_order_history_from_push(
     upstox: UpstoxService,
     token_store: EncryptedTokenStore,
     payload: dict[str, Any],
+    notification_service: NotificationService,
 ) -> None:
     """Part 5's own reactive writer: never trusts [payload] (the raw portfolio-feed WS push)
     directly for a durable write -- re-fetches the order from Upstox's order book first, same
@@ -936,7 +938,8 @@ async def _record_order_history_from_push(
     `OrderHistoryRecorder.record_placement` whenever its caller supplies a `role` -- this falls
     back to reading that row by `broker_order_id` when the trigger-rule scan finds nothing. An
     entry order placed without that `role` hint still gets recorded in `order_history` (role
-    `None`) but never auto-creates a lot, same as before this fallback existed."""
+    `None`) but falls through to the external-order-detection block below instead of leaving the
+    lot untouched."""
     order_id = payload.get("order_id") or payload.get("exchange_order_id")
     if not isinstance(order_id, str) or not order_id:
         return
@@ -982,6 +985,9 @@ async def _record_order_history_from_push(
                         break
 
             placed_row: Optional[dict[str, Any]] = None
+            target_price: Optional[float] = None
+            stoploss_price: Optional[float] = None
+            trailing_gap: Optional[float] = None
             if role is None:
                 # No PLACED bracket leg matched -- fall back to whatever place_order_engine_order
                 # recorded at placement time (entries, and any other caller that supplied a role).
@@ -994,6 +1000,95 @@ async def _record_order_history_from_push(
                         # record_placement reuses idempotency_key as the eventual lot id -- stable,
                         # unique per placement, no separate id-generation scheme needed.
                         lot_id = placed_row.get("lot_id") or idempotency_key
+                        target_price = placed_row.get("target_price")
+                        stoploss_price = placed_row.get("stoploss_price")
+                        trailing_gap = placed_row.get("trailing_gap")
+
+            if role is None and broker_order.get("status") == "complete":
+                # External-order detection: an order placed in Upstox's own app (not through this
+                # engine) carries no tag and no record_placement correlation row, so role is still
+                # unresolved here -- exactly the gap the "why did the app not know about a trade
+                # I placed outside it" audit item named.
+                candidate_instrument_key = str(
+                    broker_order.get("instrument_token") or broker_order.get("instrument_key")
+                )
+                fill_transaction_type = str(broker_order.get("transaction_type", "")).upper()
+                open_lots = ledger_store.get_open_lots_for_instrument(candidate_instrument_key)
+
+                if not open_lots:
+                    # No lot this engine is tracking for this instrument at all -- a fresh
+                    # external entry, unambiguous. Auto-create the lot and arm a default bracket
+                    # (`default_bracket_prices`) so the position is never left genuinely
+                    # unprotected. A second external entry building on an already-detected
+                    # external lot for the same instrument (same direction) is deliberately left
+                    # alone below (the "opposite-direction" branch won't match it) -- only the
+                    # very first untagged fill for an instrument auto-detects as an entry.
+                    raw_average_price = broker_order.get("average_price")
+                    average_price = (
+                        float(raw_average_price)
+                        if isinstance(raw_average_price, (int, float)) and not isinstance(raw_average_price, bool)
+                        else None
+                    )
+                    if average_price is not None:
+                        role = "ENTRY"
+                        target_price, stoploss_price = default_bracket_prices(average_price, fill_transaction_type)
+                        logger.info(
+                            "External order detected for %s (order %s) -- auto-arming default "
+                            "+-%.0f%% bracket around %.2f",
+                            candidate_instrument_key, order_id, 5.0, average_price,
+                        )
+                else:
+                    # Open lot(s) already exist for this instrument. A fill on the *opposite* side
+                    # of a given lot's own transaction_type is a closing/reducing trade against it
+                    # -- a same-side fill is instead another entry building on the position (e.g.
+                    # a same-strike add on a fast-moving expiry day), left alone here exactly like
+                    # the no-open-lots branch's own "only the first fill auto-detects" posture.
+                    #
+                    # Matching an untagged closing fill back to the right lot is unambiguous only
+                    # when exactly one open lot sits on the opposite side -- there's only one
+                    # possible answer, so it's safe to auto-close. Two or more candidates is a
+                    # real ambiguity (which lot's entry price does this fill's P&L belong to?) that
+                    # a FIFO guess could silently misattribute -- the user's own explicit call
+                    # (2026-08-18): never guess here, flag it via a push notification instead and
+                    # leave every candidate lot untouched for manual reconciliation.
+                    closing_candidates = [
+                        lot for lot in open_lots
+                        if str(lot.get("transaction_type", "")).upper() != fill_transaction_type
+                    ]
+                    if len(closing_candidates) == 1:
+                        role = "EXIT"
+                        lot_id = closing_candidates[0]["id"]
+                        logger.info(
+                            "External exit detected for %s (order %s) -- closing lot %s",
+                            candidate_instrument_key, order_id, lot_id,
+                        )
+                    elif len(closing_candidates) > 1:
+                        logger.warning(
+                            "Ambiguous external exit for %s (order %s) -- %d open lots on the "
+                            "opposite side, not auto-closing any",
+                            candidate_instrument_key, order_id, len(closing_candidates),
+                        )
+                        ledger_store.record_pending_ambiguous_fill(
+                            order_id=order_id,
+                            instrument_key=candidate_instrument_key,
+                            candidate_lot_ids=[lot["id"] for lot in closing_candidates],
+                            broker_order=broker_order,
+                        )
+                        await notification_service.record(
+                            category="orders",
+                            severity="warning",
+                            title="Trade needs review",
+                            message=(
+                                f"A fill outside the app for {candidate_instrument_key} could "
+                                f"match {len(closing_candidates)} open positions -- please "
+                                "reconcile manually."
+                            ),
+                            details={
+                                "order_id": order_id,
+                                "instrument_key": candidate_instrument_key,
+                                "candidate_lot_ids": [lot["id"] for lot in closing_candidates],
+                            },
+                        )
 
             # Fill-application runs *before* the order_history write below: for an ENTRY, the lot
             # doesn't exist yet until apply_fill_to_ledger creates it, and order_history.lot_id is a
@@ -1004,24 +1099,35 @@ async def _record_order_history_from_push(
             if (
                 broker_order.get("status") == "complete"
                 and role in ("ENTRY", "EXIT")
-                and lot_id
+                # A fresh external ENTRY (see above) has no lot_id yet -- that's exactly the
+                # "create a brand-new lot" case _apply_entry_fill already handles when lot_id is
+                # None. An EXIT always needs an existing lot_id to act on, so that side keeps the
+                # truthy check.
+                and (lot_id or role == "ENTRY")
                 and not already_applied
             ):
-                lot = ledger_store.get_lot(lot_id)
+                lot = ledger_store.get_lot(lot_id) if lot_id else None
                 entry_transaction_type = lot.get("transaction_type") if lot else None
                 # §6.3 Part B2: the bracket this ENTRY placement itself intended, carried on
-                # placed_row since record_placement's own call time -- see that method's own doc
-                # comment. None for an EXIT (placed_row is never fetched on that path -- role came
-                # from the PLACED-rule scan above instead) or an ENTRY placed with no bracket at all.
+                # placed_row since record_placement's own call time (or, for an external-order
+                # detection, the default bracket computed above) -- see that branch's own comment.
+                # None for an EXIT (role came from the PLACED-rule scan above instead).
                 lot_confirmed_to_exist = recorder.apply_fill_to_ledger(
                     broker_order, lot_id=lot_id, role=role,
                     entry_transaction_type=entry_transaction_type,
-                    target_price=placed_row.get("target_price") if placed_row else None,
-                    stoploss_price=placed_row.get("stoploss_price") if placed_row else None,
-                    trailing_gap=placed_row.get("trailing_gap") if placed_row else None,
+                    target_price=target_price,
+                    stoploss_price=stoploss_price,
+                    trailing_gap=trailing_gap,
                 )
 
-            snapshot_lot_id = lot_id if (role == "EXIT" or lot_confirmed_to_exist is not None) else None
+            if lot_confirmed_to_exist is not None:
+                # The real lot id -- for a freshly-detected external entry this is the id
+                # _apply_entry_fill just minted, not the (still-None) local [lot_id].
+                snapshot_lot_id = lot_confirmed_to_exist.get("id")
+            elif role == "EXIT":
+                snapshot_lot_id = lot_id
+            else:
+                snapshot_lot_id = None
             recorder.record_order_snapshot(
                 broker_order, idempotency_key=idempotency_key, lot_id=snapshot_lot_id, role=role,
             )

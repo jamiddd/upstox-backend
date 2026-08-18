@@ -300,7 +300,9 @@ async def test_a_real_ws_push_for_a_correlated_entry_order_auto_creates_a_lot(tm
     token_store = _FakeTokenStore()
     push_payload = {"order_id": "broker-entry-real", "status": "complete", "tag": "tagentryreal"}
 
-    await _record_order_history_from_push(ledger, recorder, upstox, token_store, push_payload)
+    await _record_order_history_from_push(
+        ledger, recorder, upstox, token_store, push_payload, _FakeNotificationService(),
+    )
 
     lot = ledger.get_lot("idem-entry-real")
     assert lot is not None
@@ -312,3 +314,200 @@ async def test_a_real_ws_push_for_a_correlated_entry_order_auto_creates_a_lot(tm
     assert history_row["status"] == "complete"
     assert history_row["lot_id"] == "idem-entry-real"
     assert history_row["role"] == "ENTRY"
+
+
+# -- Scenario 6: external-order detection, entry side (no existing lot) ------------------------
+
+
+@pytest.mark.anyio
+async def test_an_untagged_fill_with_no_open_lot_auto_creates_an_entry_with_default_bracket(
+    tmp_path,
+) -> None:
+    """A fill placed directly in Upstox's own app -- no tag, no record_placement row -- with no
+    lot this engine already tracks for the instrument. Unambiguous: must be a fresh entry."""
+    ledger = OrderEngineLedgerStore(_settings(tmp_path))
+    recorder = OrderHistoryRecorder(ledger)
+    upstox = _FakeUpstox(order_book_data=[
+        {
+            "order_id": "broker-external-entry", "tag": None, "instrument_token": "NSE_FO|1",
+            "trading_symbol": "NIFTY", "transaction_type": "BUY", "product": "I",
+            "order_type": "MARKET", "quantity": 50, "status": "complete",
+            "average_price": 200.0, "filled_quantity": 50,
+        },
+    ])
+    token_store = _FakeTokenStore()
+    notifications = _FakeNotificationService()
+    push_payload = {"order_id": "broker-external-entry", "status": "complete"}
+
+    await _record_order_history_from_push(ledger, recorder, upstox, token_store, push_payload, notifications)
+
+    open_lots = ledger.get_open_lots_for_instrument("NSE_FO|1")
+    assert len(open_lots) == 1
+    lot = open_lots[0]
+    assert lot["transaction_type"] == "BUY"
+    assert lot["entry_price"] == 200.0
+    assert lot["target_price"] == pytest.approx(210.0)
+    assert lot["stoploss_price"] == pytest.approx(190.0)
+    assert notifications.records == []
+
+
+# -- Scenario 7: external-order detection, exit side (Option A) --------------------------------
+
+
+@pytest.mark.anyio
+async def test_an_untagged_closing_fill_against_the_single_open_lot_auto_closes_it(tmp_path) -> None:
+    """Exactly one open lot on the opposite side of the fill's own transaction_type --
+    unambiguous, safe to auto-match and close, per the user's own explicit 2026-08-18 decision
+    (Option A: auto-match only when there is exactly one candidate)."""
+    ledger = OrderEngineLedgerStore(_settings(tmp_path))
+    recorder = OrderHistoryRecorder(ledger)
+    ledger.upsert_lot(
+        lot_id="lot-open-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=200.0, entry_quantity=50, remaining_quantity=50, realized_pnl=0.0, state="OPEN",
+    )
+    upstox = _FakeUpstox(order_book_data=[
+        {
+            "order_id": "broker-external-exit", "tag": None, "instrument_token": "NSE_FO|1",
+            "trading_symbol": "NIFTY", "transaction_type": "SELL", "product": "I",
+            "order_type": "MARKET", "quantity": 50, "status": "complete",
+            "average_price": 220.0, "filled_quantity": 50,
+        },
+    ])
+    token_store = _FakeTokenStore()
+    notifications = _FakeNotificationService()
+    push_payload = {"order_id": "broker-external-exit", "status": "complete"}
+
+    await _record_order_history_from_push(ledger, recorder, upstox, token_store, push_payload, notifications)
+
+    lot = ledger.get_lot("lot-open-1")
+    assert lot["state"] == "CLOSED"
+    assert lot["remaining_quantity"] == 0
+    assert lot["realized_pnl"] == pytest.approx(1000.0)  # (220 - 200) * 50, long lot
+    assert notifications.records == []
+
+
+@pytest.mark.anyio
+async def test_an_untagged_closing_fill_against_multiple_open_lots_is_flagged_not_guessed(
+    tmp_path,
+) -> None:
+    """Two open lots on the opposite side of the fill -- genuinely ambiguous which one this fill
+    closes. Per the user's own explicit call: never FIFO-guess here, flag it and leave both lots
+    untouched."""
+    ledger = OrderEngineLedgerStore(_settings(tmp_path))
+    recorder = OrderHistoryRecorder(ledger)
+    ledger.upsert_lot(
+        lot_id="lot-open-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=200.0, entry_quantity=50, remaining_quantity=50, realized_pnl=0.0, state="OPEN",
+    )
+    ledger.upsert_lot(
+        lot_id="lot-open-2", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=210.0, entry_quantity=50, remaining_quantity=50, realized_pnl=0.0, state="OPEN",
+    )
+    upstox = _FakeUpstox(order_book_data=[
+        {
+            "order_id": "broker-ambiguous-exit", "tag": None, "instrument_token": "NSE_FO|1",
+            "trading_symbol": "NIFTY", "transaction_type": "SELL", "product": "I",
+            "order_type": "MARKET", "quantity": 50, "status": "complete",
+            "average_price": 220.0, "filled_quantity": 50,
+        },
+    ])
+    token_store = _FakeTokenStore()
+    notifications = _FakeNotificationService()
+    push_payload = {"order_id": "broker-ambiguous-exit", "status": "complete"}
+
+    await _record_order_history_from_push(ledger, recorder, upstox, token_store, push_payload, notifications)
+
+    assert ledger.get_lot("lot-open-1")["state"] == "OPEN"
+    assert ledger.get_lot("lot-open-2")["state"] == "OPEN"
+    assert len(notifications.records) == 1
+    assert notifications.records[0]["title"] == "Trade needs review"
+
+    pending = ledger.get_pending_ambiguous_fills()
+    assert len(pending) == 1
+    assert pending[0]["order_id"] == "broker-ambiguous-exit"
+    assert sorted(pending[0]["candidate_lot_ids"]) == ["lot-open-1", "lot-open-2"]
+
+
+def test_resolving_a_pending_ambiguous_fill_closes_the_chosen_lot_and_clears_the_pending_row(
+    tmp_path,
+) -> None:
+    """The Positions-screen UI is the only path that can act on an ambiguous external exit -- this
+    exercises that resolve route end to end: picking one candidate closes exactly that lot, leaves
+    the other untouched, and the pending row is gone afterwards (so a second resolve attempt 404s,
+    never double-acts)."""
+    settings = _settings(tmp_path)
+    ledger = OrderEngineLedgerStore(settings)
+    ledger.upsert_lot(
+        lot_id="lot-open-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=200.0, entry_quantity=50, remaining_quantity=50, realized_pnl=0.0, state="OPEN",
+    )
+    ledger.upsert_lot(
+        lot_id="lot-open-2", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=210.0, entry_quantity=50, remaining_quantity=50, realized_pnl=0.0, state="OPEN",
+    )
+    ledger.record_pending_ambiguous_fill(
+        order_id="broker-ambiguous-exit",
+        instrument_key="NSE_FO|1",
+        candidate_lot_ids=["lot-open-1", "lot-open-2"],
+        broker_order={
+            "order_id": "broker-ambiguous-exit", "instrument_token": "NSE_FO|1",
+            "transaction_type": "SELL", "average_price": 220.0, "filled_quantity": 50,
+            "status": "complete",
+        },
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_order_engine_ledger_store] = lambda: ledger
+    client = TestClient(app)
+    try:
+        pending_id = ledger.get_pending_ambiguous_fills()[0]["id"]
+        response = client.post(
+            f"/api/order-engine/ledger/pending-ambiguous-fills/{pending_id}/resolve",
+            json={"lot_id": "lot-open-1"},
+            headers={"X-API-Key": "mobile-secret"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"resolved": True, "lot_id": "lot-open-1"}
+
+        assert ledger.get_lot("lot-open-1")["state"] == "CLOSED"
+        assert ledger.get_lot("lot-open-2")["state"] == "OPEN"
+        assert ledger.get_pending_ambiguous_fills() == []
+
+        second_attempt = client.post(
+            f"/api/order-engine/ledger/pending-ambiguous-fills/{pending_id}/resolve",
+            json={"lot_id": "lot-open-1"},
+            headers={"X-API-Key": "mobile-secret"},
+        )
+        assert second_attempt.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.anyio
+async def test_an_untagged_same_side_fill_against_an_open_lot_is_left_alone(tmp_path) -> None:
+    """A same-direction fill (adding to an existing position, e.g. a same-strike add on a
+    fast-moving expiry day) is not a closing trade -- deliberately left undetected, same posture
+    as the entry side's own "only the first fill auto-detects" scoping."""
+    ledger = OrderEngineLedgerStore(_settings(tmp_path))
+    recorder = OrderHistoryRecorder(ledger)
+    ledger.upsert_lot(
+        lot_id="lot-open-1", instrument_key="NSE_FO|1", transaction_type="BUY",
+        entry_price=200.0, entry_quantity=50, remaining_quantity=50, realized_pnl=0.0, state="OPEN",
+    )
+    upstox = _FakeUpstox(order_book_data=[
+        {
+            "order_id": "broker-same-side-add", "tag": None, "instrument_token": "NSE_FO|1",
+            "trading_symbol": "NIFTY", "transaction_type": "BUY", "product": "I",
+            "order_type": "MARKET", "quantity": 25, "status": "complete",
+            "average_price": 205.0, "filled_quantity": 25,
+        },
+    ])
+    token_store = _FakeTokenStore()
+    notifications = _FakeNotificationService()
+    push_payload = {"order_id": "broker-same-side-add", "status": "complete"}
+
+    await _record_order_history_from_push(ledger, recorder, upstox, token_store, push_payload, notifications)
+
+    lot = ledger.get_lot("lot-open-1")
+    assert lot["state"] == "OPEN"
+    assert lot["remaining_quantity"] == 50  # untouched, not re-averaged
+    assert notifications.records == []
