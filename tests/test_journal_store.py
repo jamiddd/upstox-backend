@@ -202,3 +202,20 @@ def test_backfill_flat_brokerage_correction_fixes_fills_and_rebuilds_journal_tra
     fills_after = {f["fill_id"]: f["computed_charges"] for f in store.fills_for_session("2026-07-27")}
     assert fills_after == {"buy-1": 22.5, "sell-1": 22.5}
 
+
+def test_reset_all_clears_every_table_despite_foreign_keys(tmp_path) -> None:
+    """2026-08-18 fix -- the first cut of `reset_all` deleted parent tables (`trade_fills`,
+    `journal_trades`) before their `journal_trade_fills`/`journal_notes` children, which raised
+    `sqlite3.IntegrityError` in production the moment real linked rows existed (this store's own
+    [JournalStore._connect] always runs with `PRAGMA foreign_keys = ON`, unlike the ad-hoc raw
+    `sqlite3` connection the original manual VPS wipe used, which never enabled it)."""
+    store = JournalStore(_settings(tmp_path))
+    _closed_round_trip(store, "2026-07-27", "buy-1", "sell-1")
+    trade_id = store.list_trades()[0][0]["id"]
+    store.save_notes(trade_id, {"setup": "breakout", "tags": ["A"], "reviewed": True})
+
+    store.reset_all()
+
+    assert store.list_trades()[1]["total_records"] == 0
+    assert store.fills_for_session("2026-07-27") == []
+

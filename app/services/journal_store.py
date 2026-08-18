@@ -303,12 +303,16 @@ class JournalStore:
         """Settings-page "clear server DB" button (2026-08-18) -- same tables the manual
         `DELETE FROM` wipe on 2026-08-18 cleared by hand on the VPS. Leaves `journal_metadata`
         alone (a config marker -- `ledger_started_at` -- not trade data, same reasoning the
-        manual wipe used)."""
+        manual wipe used). Children before parents (2026-08-18 fix: the first cut of this method
+        deleted in the manual wipe's own order, which only worked there because that one-off raw
+        `sqlite3` connection never turned foreign_keys on; this store's own [_connect] always does,
+        so `journal_trade_fills`/`journal_notes` must go before the `trade_fills`/`journal_trades`
+        rows they reference or the delete raises `IntegrityError`)."""
         connection = self._connect()
         try:
             for table in (
-                "trade_context", "journal_sessions", "trade_fills",
-                "journal_trades", "journal_trade_fills", "journal_notes",
+                "journal_notes", "journal_trade_fills", "journal_trades",
+                "trade_fills", "journal_sessions", "trade_context",
             ):
                 connection.execute(f"DELETE FROM {table}")
             connection.commit()
