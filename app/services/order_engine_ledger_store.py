@@ -531,16 +531,24 @@ class OrderEngineLedgerStore:
         return [dict(row) for row in rows]
 
     def reset_all(self) -> None:
-        """Settings-page "clear server DB" button (2026-08-18) -- same three tables the manual
-        `DELETE FROM` wipe on 2026-08-18 cleared by hand on the VPS, now reachable from the app
-        itself since the same "server thinks a trade is still running that was actually exited
-        outside the app" state has recurred more than once. Deliberately does not touch
-        `max_loss_epochs` (a config marker, not trade data, same reasoning the manual wipe used)."""
+        """Settings-page "clear server DB" button (2026-08-18) -- the manual `DELETE FROM` wipe on
+        2026-08-18 cleared by hand on the VPS, now reachable from the app itself since the same
+        "server thinks a trade is still running that was actually exited outside the app" state has
+        recurred more than once. Deliberately does not touch `max_loss_epochs` (a config marker,
+        not trade data, same reasoning the manual wipe used).
+
+        `order_history` added 2026-08-18 (second pass) -- the original three-table wipe left this
+        table untouched, so Terminal's Orders panel (`GET /order-engine/orders`, which reads only
+        this table, never the broker) kept showing old test-order-placement rows through resets --
+        exactly the same class of stale residue this button exists to clear, just missed the first
+        time since `order_history` is a client-read log, not something the trigger evaluator itself
+        consults."""
         connection = self._connect()
         try:
             connection.execute("DELETE FROM order_engine_events")
             connection.execute("DELETE FROM trigger_rules")
             connection.execute("DELETE FROM lots")
+            connection.execute("DELETE FROM order_history")
             connection.commit()
             connection.execute("VACUUM")
         finally:
