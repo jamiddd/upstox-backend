@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from app.services.journal_store import JournalStore
 from app.services.notification_service import NotificationService
+from app.services.order_engine_ledger_store import OrderEngineLedgerStore
 from app.services.token_store import EncryptedTokenStore
 from app.services.upstox_service import UpstoxService
 
@@ -16,7 +17,19 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 class JournalReconciler:
-    """Token-aware, idempotent current-day fill reconciliation."""
+    """Token-aware, idempotent current-day fill reconciliation.
+
+    2026-08-18: scoped to the order engine's own ledger, at the user's own explicit request
+    ("i want exactly what our backend ledger would have calculated not any other data") after a
+    trade placed directly in the broker's own app showed up in the Watchlist home screen's Today's
+    P&L / P&L calendar widgets -- both of which read journal data, and this reconciler used to
+    insert *every* fill Upstox's `get_trades_for_day` returned, account-wide, regardless of
+    whether the order engine placed it. Now a fill is only journaled if its `order_id` has a
+    resolved [OrderHistoryRecorder]-written `order_history` row (`role` is `ENTRY`/`EXIT`/`MANUAL`,
+    not `None`) -- i.e. an order this app's own order engine actually placed or managed, the same
+    correlation `_on_order_update` already uses to decide whether to derive a `lots` row. An order
+    placed in the broker's own app was never recorded there, so it's now silently skipped here
+    too, everywhere journal data is read from (trades list, analytics, both watchlist widgets)."""
 
     def __init__(
         self,
@@ -24,11 +37,13 @@ class JournalReconciler:
         store: JournalStore,
         upstox: UpstoxService,
         token_store: EncryptedTokenStore,
+        ledger_store: OrderEngineLedgerStore,
         notifications: Optional[NotificationService] = None,
     ) -> None:
         self.store = store
         self.upstox = upstox
         self.token_store = token_store
+        self.ledger_store = ledger_store
         self.notifications = notifications
         self._lock = asyncio.Lock()
 
@@ -57,6 +72,12 @@ class JournalReconciler:
                     fill = _normalize_fill(raw, fallback_date=trading_date)
                     if fill is None:
                         logger.warning("Skipping malformed broker trade: %r", raw)
+                        continue
+                    # Ledger-scoping (2026-08-18, see this class's own doc comment) -- an order
+                    # this app's engine never placed/managed has no `order_history` row (or one
+                    # with an unresolved `role`), so it's never journaled at all.
+                    order_history_row = self.ledger_store.get_order_by_broker_order_id(fill["order_id"])
+                    if order_history_row is None or not order_history_row.get("role"):
                         continue
                     charges = await self._charges(access_token, fill)
                     fill["computed_charges"] = (

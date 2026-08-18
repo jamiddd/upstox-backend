@@ -393,6 +393,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         upstox=trade_context_upstox,
         token_store=trade_context_token_store,
         notifications=notification_service,
+        ledger_store=order_engine_ledger_store,
     )
     market_feed_notifier = _FeedStateNotifier(
         name="Market data feed", notification_service=notification_service,
