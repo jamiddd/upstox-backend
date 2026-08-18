@@ -8,13 +8,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import (
+    get_journal_store,
     get_order_engine_ledger_store,
     get_order_engine_lot_tracker,
     get_token_store,
     get_upstox_service,
 )
+from app.core.config import Settings, get_settings
 from app.core.exceptions import TokenStoreError, UpstoxApiError, UpstoxAuthRequiredError
 from app.core.security import require_mobile_api_key
+from app.services.instrument_rules_service import InstrumentRulesService
+from app.services.journal_store import JournalStore
 from app.services.order_engine_ledger_store import OrderEngineLedgerStore
 from app.services.order_engine_lot_tracker import OrderEngineLotTracker
 from app.services.order_engine_order_service import (
@@ -24,6 +28,7 @@ from app.services.order_engine_order_service import (
 )
 from app.services.order_history_recorder import OrderHistoryRecorder
 from app.services import order_engine_trigger_evaluator
+from app.services.position_flattener import flatten_positions
 from app.services.token_store import EncryptedTokenStore
 from app.services.trade_context_service import extract_order_ids
 from app.services.upstox_service import UpstoxService
@@ -311,6 +316,61 @@ async def modify_order_engine_order_quantity(
     return OrderEngineModifyQuantityResponse(status=confirmed.get("status"), raw=confirmed)
 
 
+class OrderEngineExitPositionsRequest(BaseModel):
+    """`None`/omitted [instrument_keys] closes every open position (mirrors the old
+    `POST /orders/exit-all`); a non-empty list closes only those instruments -- e.g. "close only
+    profitable positions", where the app itself decides which instrument_keys qualify (it already
+    has live P&L from the WebSocket feed)."""
+
+    instrument_keys: Optional[list[str]] = None
+
+
+class OrderEngineExitPositionsResponse(BaseModel):
+    status: Literal["success"] = "success"
+    positions_found: int
+    results: list[dict[str, Any]]
+
+
+@router.post("/exit-positions", response_model=OrderEngineExitPositionsResponse)
+async def exit_order_engine_positions(
+    body: OrderEngineExitPositionsRequest,
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
+) -> OrderEngineExitPositionsResponse:
+    """Phase 0 of the GTT-to-order-engine cutover's own missing piece: the old model's
+    `POST /orders/exit-all`/`POST /orders/exit-positions` (`smart_order_service.py`) had no
+    order-engine equivalent -- this is it. Deliberately built on Upstox's own `GET /positions`
+    (via [flatten_positions]) rather than `order_engine_ledger_store`'s `lots` table: a real held
+    position is real held position regardless of which system opened it, and this is the one path
+    that also gets the freeze-quantity slicing and retry-on-failure the ledger-driven
+    `order_engine_max_loss_watcher.flatten_open_lots` doesn't have. Best-effort per position, same
+    as the old route -- one instrument failing to flatten is reported in [results], not raised as
+    an HTTP error.
+    """
+    access_token = _load_access_token(token_store)
+    result = await flatten_positions(
+        service, access_token,
+        instrument_rules_service=InstrumentRulesService(settings),
+        instrument_keys=body.instrument_keys,
+    )
+    return OrderEngineExitPositionsResponse(**result)
+
+
+@router.post("/exit-all", response_model=OrderEngineExitPositionsResponse)
+async def exit_all_order_engine_positions(
+    service: UpstoxService = Depends(get_upstox_service),
+    token_store: EncryptedTokenStore = Depends(get_token_store),
+    settings: Settings = Depends(get_settings),
+) -> OrderEngineExitPositionsResponse:
+    """Thin no-filter wrapper over [exit_order_engine_positions], same relationship the old
+    `exit_all_positions`/`exit_positions` pair in `smart_order_service.py` had."""
+    return await exit_order_engine_positions(
+        OrderEngineExitPositionsRequest(instrument_keys=None),
+        service=service, token_store=token_store, settings=settings,
+    )
+
+
 class OrderHistoryEntryResponse(BaseModel):
     """One `order_history` row -- see `docs/ORDER_HISTORY_V2_DESIGN.md` for the full column list
     and why each exists. Journaling columns are always `None` from this route today -- populated
@@ -483,12 +543,16 @@ def _modify_bracket_leg(
 ) -> str:
     """One leg's own modify decision, same "a rule's own state decides what's legal" shape
     `cancel_ledger_trigger_rule`/the now-dead `TriggerRuleCanceller` both already use -- only a
-    still-`ARMED` leg can move (a pure internal value change, no broker call, mirrors
-    `TriggerRepository.modifyConditionValue`/`tighten_ledger_trigger_rule_stop_loss`'s existing
-    value-only-upsert pattern rather than a version-CAS'd update -- same posture that route
-    already established for this exact kind of change). `no_such_leg` covers both "this lot never
-    had this side armed" (`rule_id` is `None`) and "the id it recorded doesn't resolve to a real
-    row" (shouldn't happen -- a real FK -- but never assumed)."""
+    still-`ARMED` leg can move. Writes via [cas_update_trigger_rule_condition_value] rather than
+    the old read-then-plain-upsert: a plain upsert echoed back whatever `state` this function
+    read moments earlier, so a concurrent evaluator firing the same rule (ARMED -> FIRING ->
+    PLACED, a real broker exit order now resting) between the read and the write got silently
+    reverted back to ARMED here. The CAS only ever succeeds while the row is still ARMED at the
+    exact version just read, so a lost race now correctly falls through to `not_armed` (re-read
+    for a fresher, more honest error) instead of clobbering the evaluator's own transition.
+    `no_such_leg` covers both "this lot never had this side armed" (`rule_id` is `None`) and "the
+    id it recorded doesn't resolve to a real row" (shouldn't happen -- a real FK -- but never
+    assumed)."""
     if not rule_id:
         return "no_such_leg"
     rule = ledger.get_trigger_rule(rule_id)
@@ -496,11 +560,11 @@ def _modify_bracket_leg(
         return "no_such_leg"
     if rule.get("state") != "ARMED":
         return "not_armed"
-    ledger.upsert_trigger_rule(
-        rule_id=rule_id, lot_id=rule["lot_id"], instrument_key=rule["instrument_key"],
-        role=rule["role"], state=rule["state"], condition_op=rule["condition_op"],
-        condition_value=new_value, sibling_rule_id=rule["sibling_rule_id"],
+    updated = ledger.cas_update_trigger_rule_condition_value(
+        rule_id, expected_version=rule["version"], new_condition_value=new_value,
     )
+    if updated is None:
+        return "not_armed"
     return "modified"
 
 
@@ -604,21 +668,22 @@ async def tighten_ledger_trigger_rule_stop_loss(
 ) -> OrderEngineTriggerRuleResponse:
     """Mirrors `TriggerRepository.tightenStopLoss`'s value-only CAS -- the rule stays `ARMED`
     throughout, only `condition_value` moves. 404 if the client references a rule the server has
-    never seen (e.g. this call raced ahead of the rule's own initial upsert)."""
+    never seen (e.g. this call raced ahead of the rule's own initial upsert), 409 if the rule is
+    no longer `ARMED` (already fired/cancelled, whether from this same stale read or a genuinely
+    concurrent one) -- via [cas_update_trigger_rule_condition_value], not the old plain
+    read-then-upsert, which echoed back a possibly-stale `state` and could revert a rule the
+    evaluator had just fired back to `ARMED` underneath it."""
     existing = ledger.get_trigger_rule(rule_id)
     if existing is None:
         raise _http_error(status.HTTP_404_NOT_FOUND, "No matching trigger rule found")
+    if existing.get("state") != "ARMED":
+        raise _http_error(status.HTTP_409_CONFLICT, "Trigger rule is no longer armed")
 
-    rule = ledger.upsert_trigger_rule(
-        rule_id=rule_id,
-        lot_id=existing["lot_id"],
-        instrument_key=existing["instrument_key"],
-        role=existing["role"],
-        state=existing["state"],
-        condition_op=existing["condition_op"],
-        condition_value=body.condition_value,
-        sibling_rule_id=existing["sibling_rule_id"],
+    rule = ledger.cas_update_trigger_rule_condition_value(
+        rule_id, expected_version=existing["version"], new_condition_value=body.condition_value,
     )
+    if rule is None:
+        raise _http_error(status.HTTP_409_CONFLICT, "Trigger rule is no longer armed")
     ledger.record_event(
         event_type="TRIGGER_RULE_TIGHTENED", lot_id=existing["lot_id"], rule_id=rule_id,
         payload={"condition_value": body.condition_value},
@@ -842,6 +907,24 @@ async def get_ledger_pnl_summary(
             for status in lot_tracker.per_lot_live_pnl()
         ],
     )
+
+
+@router.post("/ledger/admin/reset", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+async def reset_ledger_and_journal(
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+    journal: JournalStore = Depends(get_journal_store),
+) -> None:
+    """Settings-page "clear server DB" button (2026-08-18) -- the app-reachable version of the
+    manual `DELETE FROM` + `VACUUM` wipe run by hand on the VPS on 2026-08-18 and again on
+    2026-08-18 (a stuck server-side "trade still running" lot after an outside-the-app exit,
+    expected to recur "multiple times until we fix the live market issues", per the user's own
+    framing). Clears both [OrderEngineLedgerStore.reset_all] (lots/trigger_rules/
+    order_engine_events) and [JournalStore.reset_all] (trade history) -- same full-reset scope the
+    manual wipe used, not a partial one. No auth beyond the router's own `require_mobile_api_key`;
+    this is a destructive, irreversible action and the client is expected to confirm with the user
+    before ever calling it."""
+    ledger.reset_all()
+    journal.reset_all()
 
 
 class OrderEngineHealthResponse(BaseModel):

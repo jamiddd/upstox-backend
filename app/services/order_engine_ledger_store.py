@@ -398,6 +398,28 @@ class OrderEngineLedgerStore:
                 return None
         return self.get_trigger_rule(rule_id)
 
+    def cas_update_trigger_rule_condition_value(
+        self, rule_id: str, expected_version: int, new_condition_value: float,
+    ) -> Optional[dict[str, Any]]:
+        """Same CAS discipline as [cas_update_trigger_rule_state], for the "modify an armed
+        leg's price" writes (`_modify_bracket_leg`/`tighten_ledger_trigger_rule_stop_loss`).
+        Those routes used to read-then-write via the plain [upsert_trigger_rule] (no version
+        check), which could silently revert a rule the evaluator had *concurrently* fired
+        (ARMED -> FIRING -> PLACED) back to ARMED, since the stale write carried the state it
+        read before the race. This only ever moves `condition_value`/`updated_at` and bumps
+        `version` -- it never touches `state`, so a caller must additionally require the row it
+        read back was still `ARMED` before calling this. Returns `None` (no write) if the row
+        doesn't exist or the CAS lost the race, exactly like [cas_update_trigger_rule_state]."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE trigger_rules SET condition_value = ?, version = version + 1, updated_at = ? "
+                "WHERE id = ? AND version = ? AND state = 'ARMED'",
+                (new_condition_value, self._now(), rule_id, expected_version),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return self.get_trigger_rule(rule_id)
+
     def get_armed_brackets_with_lot_info(self) -> list[dict[str, Any]]:
         """§6.4 Part B4: every currently-`ARMED` `trigger_rules` row, joined with the fields its
         own lot's `ClientFallbackRule` construction needs (transaction_type/remaining_quantity/
@@ -498,6 +520,22 @@ class OrderEngineLedgerStore:
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM lots ORDER BY created_at").fetchall()
         return [dict(row) for row in rows]
+
+    def reset_all(self) -> None:
+        """Settings-page "clear server DB" button (2026-08-18) -- same three tables the manual
+        `DELETE FROM` wipe on 2026-08-18 cleared by hand on the VPS, now reachable from the app
+        itself since the same "server thinks a trade is still running that was actually exited
+        outside the app" state has recurred more than once. Deliberately does not touch
+        `max_loss_epochs` (a config marker, not trade data, same reasoning the manual wipe used)."""
+        connection = self._connect()
+        try:
+            connection.execute("DELETE FROM order_engine_events")
+            connection.execute("DELETE FROM trigger_rules")
+            connection.execute("DELETE FROM lots")
+            connection.commit()
+            connection.execute("VACUUM")
+        finally:
+            connection.close()
 
     # -- max-loss epoch (§7.10-equivalent, server-side; §8.3 "the server cannot default") --------
 

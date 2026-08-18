@@ -17,7 +17,6 @@ from app.api.dependencies import (
     get_atm_iv_snapshot_store,
     get_candle_cache_store,
     get_device_token_store,
-    get_exit_all_lock,
     get_journal_store,
     get_max_loss_settings_store,
     get_notification_service,
@@ -52,19 +51,12 @@ from app.services.tracked_instruments_store import TrackedInstrumentsStore
 from app.services.upstox_service import UpstoxService
 from app.services.watchlist_store import WatchlistStore
 from app.core.security import require_mobile_api_key, require_mobile_or_web, require_web_session
-from app.services.instrument_rules_service import (
-    InstrumentRulesService,
-    slice_quantity_for_freeze,
-    validate_price,
-    validate_quantity,
-)
 from app.services.device_token_store import DeviceTokenStore
 from app.services.max_loss_settings_store import MaxLossSettingsStore
 from app.services.main_screen_service import DEFAULT_UNDERLYING_KEY, MainScreenService
 from app.services.notification_service import NotificationService
 from app.services.notification_store import NotificationStore
 from app.services.journal_store import DuplicateJournalTradeError, JournalStore
-from app.services.gtt_history_store import GttHistoryStore
 from app.services.order_history_service import OrderHistoryService
 from app.services.order_cancellation_service import OrderCancellationService
 from app.services.order_modification_service import OrderModificationService
@@ -74,10 +66,8 @@ from app.services.atm_iv_snapshot_store import AtmIvSnapshotStore
 from app.services.oi_snapshot_store import OISnapshotStore, SnapshotNotFoundError
 from app.services.search_screen_service import SearchScreenService
 from app.services.signal_snapshot_store import SignalSnapshotStore
-from app.services.smart_order_service import SmartOrderService
 from app.services import quantity_sizing
 from app.services.underlying_signals_service import UnderlyingSignalsService
-from app.services.trade_context_service import TradeContextService, extract_order_ids
 from app.services.usd_inr_service import UsdInrService
 from app.services.upstox_totp_login import UpstoxTotpLoginService
 
@@ -102,24 +92,6 @@ logger = logging.getLogger(__name__)
 _POSITIONS_CACHE_TTL_SECONDS = 1.0
 _positions_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _positions_cache_lock = asyncio.Lock()
-
-
-class SmartBracketOrderRequest(BaseModel):
-    """Client-provided bracket-like GTT order parameters."""
-
-    instrument_key: str = Field(min_length=1)
-    underlying_key: Optional[str] = Field(default=None, min_length=1)
-    signal_expiry_date: Optional[str] = None
-    transaction_type: Literal["BUY", "SELL"]
-    quantity: int = Field(gt=0)
-    product: Literal["I", "D", "MTF"] = "I"
-    entry_trigger_type: Literal["ABOVE", "BELOW", "IMMEDIATE"] = "IMMEDIATE"
-    entry_trigger_price: float = Field(gt=0)
-    target_trigger_price: float = Field(gt=0)
-    stoploss_trigger_price: float = Field(gt=0)
-    trailing_gap: Optional[float] = Field(default=None, gt=0)
-    market_protection: Optional[int] = Field(default=None, ge=-1, le=25)
-    slice_quantity: Optional[int] = Field(default=None, gt=0)
 
 
 class SuggestedQuantityRequest(BaseModel):
@@ -151,29 +123,6 @@ class SuggestedQuantityRequest(BaseModel):
     kelly_capital: Optional[float] = None
 
 
-class ModifyGttOrderRequest(BaseModel):
-    """Re-points an existing GTT bracket's target/stoploss trigger prices. The entry fields are
-    resent unchanged by the client (it already has them from GET /orders/gtt) -- Upstox's GTT
-    modify contract expects the full rule set, not a partial patch.
-    """
-
-    gtt_order_id: str = Field(min_length=1)
-    instrument_key: str = Field(min_length=1)
-    quantity: int = Field(gt=0)
-    product: Literal["I", "D", "MTF"] = "I"
-    entry_trigger_type: Literal["ABOVE", "BELOW", "IMMEDIATE"] = "IMMEDIATE"
-    entry_trigger_price: float = Field(gt=0)
-    target_trigger_price: float = Field(gt=0)
-    stoploss_trigger_price: float = Field(gt=0)
-    trailing_gap: Optional[float] = Field(default=None, gt=0)
-
-
-class CancelGttOrderRequest(BaseModel):
-    """Identifies the complete GTT order whose remaining rules should be cancelled."""
-
-    gtt_order_id: str = Field(min_length=1)
-
-
 class TrackedInstrumentsRequest(BaseModel):
     """Replaces the whole persisted set of underlying_keys the background poller keeps
     5-minute-change history warm for -- see TrackedInstrumentsStore. Always the client's full
@@ -200,14 +149,6 @@ class WatchlistRequest(BaseModel):
     """
 
     items: list[WatchlistInstrumentModel] = Field(default_factory=list)
-
-
-class ExitPositionsRequest(BaseModel):
-    """Optionally scopes /orders/exit-positions to a subset of open positions. None
-    (instrument_keys omitted or null) means every open position -- identical to /orders/exit-all.
-    """
-
-    instrument_keys: Optional[list[str]] = None
 
 
 class MaxLossSettingsRequest(BaseModel):
@@ -315,13 +256,24 @@ def web_login(
         raise _http_error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
 
     token = create_session_token(settings)
+    # SameSite=None requires Secure -- browsers reject the pairing outright otherwise. In local dev
+    # (WEB_SESSION_COOKIE_SECURE=false, no TLS on this backend) fall back to "lax", which browsers
+    # still accept: localhost:5173 and localhost:8000 are the same "site" (no registrable domain,
+    # so only the hostname is compared, not the port), so a Lax cookie is sent between them anyway.
+    cookie_secure = settings.web_session_cookie_secure
     response.set_cookie(
         key=WEB_SESSION_COOKIE_NAME,
         value=token,
         max_age=DEFAULT_SESSION_TTL_SECONDS,
         httponly=True,
-        secure=True,
-        samesite="strict",
+        secure=cookie_secure,
+        # "none" (not "strict") so the cookie is sent on cross-site requests too -- e.g. a hosted
+        # dev frontend on a different site talking to this backend. Secure=True (HTTPS-only
+        # transport) plus the explicit CORS origin allowlist above (allow_credentials=True with a
+        # fixed allow_origins list, never "*") are what actually gate who can use this cookie;
+        # SameSite=None just stops the browser from also refusing to send it for legitimate
+        # cross-site callers we've already allowed.
+        samesite="none" if cookie_secure else "lax",
     )
     return {"status": "ok"}
 
@@ -1328,73 +1280,6 @@ async def register_device(
     return {"status": "success"}
 
 
-@dual_router.post("/orders/smart-bracket")
-async def place_smart_bracket_order(
-    order: SmartBracketOrderRequest,
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-    snapshot_store: SignalSnapshotStore = Depends(get_signal_snapshot_store),
-    oi_snapshot_store: OISnapshotStore = Depends(get_oi_snapshot_store),
-) -> dict[str, Any]:
-    """Place a bracket-like order using Upstox multi-leg GTT.
-
-    On dual_router (require_mobile_or_web) -- M3's first write endpoint exposed to the web client.
-    Unlike every prior dual_router move (all read-only), this one places a real order; the web
-    client's own confirmation dialog (always shown, no Android-style skip-confirmation mode) is
-    the client-side safety gate, same posture Android's OrderConfirmationDialog already provides.
-    """
-    access_token = _load_access_token(token_store)
-    try:
-        rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
-        validate_quantity(order.quantity, rules)
-        validate_price(order.entry_trigger_price, rules, field_name="entry_trigger_price")
-        validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
-        validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
-        slice_quantity = order.slice_quantity or slice_quantity_for_freeze(order.quantity, rules)
-        result = await SmartOrderService(service, history_store=GttHistoryStore(settings)).place_bracket_order(
-            access_token,
-            instrument_key=order.instrument_key,
-            transaction_type=order.transaction_type,
-            quantity=order.quantity,
-            product=order.product,
-            entry_trigger_type=order.entry_trigger_type,
-            entry_trigger_price=order.entry_trigger_price,
-            target_trigger_price=order.target_trigger_price,
-            stoploss_trigger_price=order.stoploss_trigger_price,
-            trailing_gap=order.trailing_gap,
-            market_protection=order.market_protection,
-            slice_quantity=slice_quantity,
-        )
-        if order.underlying_key:
-            order_ids = extract_order_ids(result)
-            if order_ids:
-                context_service = TradeContextService(
-                    store=JournalStore(settings),
-                    upstox=service,
-                    signals=UnderlyingSignalsService(
-                        service,
-                        snapshot_store=snapshot_store,
-                        oi_snapshot_store=oi_snapshot_store,
-                    ),
-                )
-                asyncio.create_task(
-                    context_service.capture(
-                        access_token=access_token,
-                        order_ids=order_ids,
-                        trigger="placement",
-                        instrument_key=order.instrument_key,
-                        underlying_key=order.underlying_key,
-                        expiry_date=order.signal_expiry_date,
-                    )
-                )
-        return result
-    except AppConfigError as exc:
-        raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
-
-
 @dual_router.post("/orders/suggested-quantity")
 def suggested_quantity(request: SuggestedQuantityRequest) -> dict[str, object]:
     """Server-side port of QuantitySizing.kt's defaultQuantity -- read-only computation, no side
@@ -1427,127 +1312,6 @@ def suggested_quantity(request: SuggestedQuantityRequest) -> dict[str, object]:
     return {"quantity": quantity}
 
 
-@dual_router.get("/orders/gtt")
-async def get_gtt_orders(
-    instrument_key: Optional[str] = Query(None, min_length=1),
-    include_history: bool = Query(False),
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-) -> list[dict[str, Any]]:
-    """Active GTT orders, optionally filtered to one instrument. The unfiltered form powers the
-    Main screen's GTT Open Orders section; the filtered form lets the app find the bracket behind
-    a position, or (with include_history=true) its historical bracket.
-    See SmartOrderService.get_gtt_orders_for_instrument.
-
-    Reads straight from GttHistoryStore -- no live Upstox call at all. Upstox's own GTT list
-    endpoint isn't reliable enough to be this response's data source (see GttHistoryStore's own
-    doc comment); place/modify/cancel already write directly to the store the moment Upstox
-    confirms each one, and a background poller (gtt_status_poller.py) separately keeps statuses
-    (fired/expired) fresh without this read path ever depending on that call succeeding.
-
-    On dual_router (require_mobile_or_web) -- the web client's GTT screen (M3d) needs this.
-    """
-    access_token = _load_access_token(token_store)
-    try:
-        smart_order_service = SmartOrderService(service, history_store=GttHistoryStore(settings))
-        orders = await smart_order_service.get_gtt_orders_for_instrument(
-            access_token, instrument_key=instrument_key, include_history=include_history
-        )
-        return await _attach_trading_symbols(orders, settings)
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
-
-
-async def _attach_trading_symbols(orders: list[dict[str, Any]], settings: Settings) -> list[dict[str, Any]]:
-    """Upstox's GTT list response carries no trading_symbol at all -- only instrument_token,
-    which isn't human-readable (see docs/ORDER_PLACEMENT_API.md's own example response).
-    InstrumentRulesService already caches the BOD instrument master (trading_symbol included) for
-    tick/lot-size validation elsewhere, so this reuses that same cache rather than adding a second
-    lookup path. Best-effort: a lookup failure for one instrument (e.g. a delisted/expired
-    contract no longer in the master) leaves that one order's trading_symbol simply absent, not
-    the whole response failing.
-    """
-    rules_service = InstrumentRulesService(settings)
-    unique_keys = {
-        order["instrument_token"] for order in orders if isinstance(order.get("instrument_token"), str)
-    }
-
-    async def _lookup(key: str) -> tuple[str, Optional[str]]:
-        try:
-            rules = await rules_service.get_rules(key)
-            return key, rules.trading_symbol or None
-        except AppConfigError:
-            return key, None
-
-    resolved = dict(await asyncio.gather(*(_lookup(key) for key in unique_keys)))
-    return [
-        {**order, "trading_symbol": resolved.get(order["instrument_token"])}
-        if isinstance(order.get("instrument_token"), str)
-        else order
-        for order in orders
-    ]
-
-
-@dual_router.put("/orders/gtt/modify")
-async def modify_gtt_order(
-    order: ModifyGttOrderRequest,
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-) -> dict[str, Any]:
-    """Re-points an existing GTT bracket's target/stoploss. See SmartOrderService.modify_gtt_bracket.
-
-    On dual_router (require_mobile_or_web) -- M3's fourth write endpoint exposed to the web client.
-    """
-    access_token = _load_access_token(token_store)
-    try:
-        rules = await InstrumentRulesService(settings).get_rules(order.instrument_key)
-        validate_quantity(order.quantity, rules)
-        validate_price(order.entry_trigger_price, rules, field_name="entry_trigger_price")
-        validate_price(order.target_trigger_price, rules, field_name="target_trigger_price")
-        validate_price(order.stoploss_trigger_price, rules, field_name="stoploss_trigger_price")
-        return await SmartOrderService(service, history_store=GttHistoryStore(settings)).modify_gtt_bracket(
-            access_token,
-            gtt_order_id=order.gtt_order_id,
-            quantity=order.quantity,
-            product=order.product,
-            entry_trigger_type=order.entry_trigger_type,
-            entry_trigger_price=order.entry_trigger_price,
-            target_trigger_price=order.target_trigger_price,
-            stoploss_trigger_price=order.stoploss_trigger_price,
-            trailing_gap=order.trailing_gap,
-            instrument_key=order.instrument_key,
-        )
-    except AppConfigError as exc:
-        raise _http_error(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
-
-
-@dual_router.delete("/orders/gtt/cancel")
-async def cancel_gtt_order(
-    order: CancelGttOrderRequest,
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-) -> dict[str, Any]:
-    """Cancels an untriggered GTT order and all associated rules.
-
-    On dual_router (require_mobile_or_web) -- M3's fifth write endpoint exposed to the web client.
-    """
-    access_token = _load_access_token(token_store)
-    try:
-        result = await service.cancel_gtt_order(access_token, order.gtt_order_id)
-        # Persist directly, right here, the moment Upstox confirms the cancel -- same "no
-        # dependency on a later list call" reasoning as place/modify (see GttHistoryStore's own
-        # doc comment).
-        GttHistoryStore(settings).record_cancelled(order.gtt_order_id)
-        return result
-    except UpstoxApiError as exc:
-        raise _upstox_http_error(exc) from exc
-
-
 @dual_router.get("/settings/max-loss")
 def get_max_loss_settings(
     store: MaxLossSettingsStore = Depends(get_max_loss_settings_store),
@@ -1574,90 +1338,6 @@ def set_max_loss_settings(
     """
     store.save(request.amount)
     return {"amount": request.amount}
-
-
-@protected_router.post("/orders/exit-all")
-async def exit_all_positions(
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-    notification_service: NotificationService = Depends(get_notification_service),
-    exit_all_lock: asyncio.Lock = Depends(get_exit_all_lock),
-) -> dict[str, Any]:
-    """Flattens every currently open position with an immediate market order -- backs the app's
-    own max-loss auto square-off (MainViewModel.checkMaxLoss). See
-    SmartOrderService.exit_all_positions.
-
-    Held under [exit_all_lock] -- shared with the backend's own max_loss_watcher, which can
-    trigger the exact same flatten independently (e.g. the app is closed). Without this, a
-    client-triggered flatten and the watcher's own could race: Upstox's position book doesn't
-    always reflect a just-placed market order's fill instantly, so both could see the same
-    position as still open and each submit their own exit, flattening it twice -- e.g. closing a
-    long with two separate sell orders leaves a net *short* position instead of flat.
-    """
-    access_token = _load_access_token(token_store)
-    async with exit_all_lock:
-        try:
-            result = await SmartOrderService(service).exit_all_positions(
-                access_token,
-                instrument_rules_service=InstrumentRulesService(settings),
-            )
-        except UpstoxApiError as exc:
-            raise _upstox_http_error(exc) from exc
-    await _notify_if_exit_had_failures(notification_service, result)
-    return result
-
-
-@dual_router.post("/orders/exit-positions")
-async def exit_positions(
-    request: ExitPositionsRequest,
-    service: UpstoxService = Depends(get_upstox_service),
-    token_store: EncryptedTokenStore = Depends(get_token_store),
-    settings: Settings = Depends(get_settings),
-    notification_service: NotificationService = Depends(get_notification_service),
-    exit_all_lock: asyncio.Lock = Depends(get_exit_all_lock),
-) -> dict[str, Any]:
-    """Flattens open positions with an immediate market order, optionally scoped to
-    [ExitPositionsRequest.instrument_keys] (e.g. "close only profitable positions", computed
-    client-side). See SmartOrderService.exit_positions and [exit_all_positions]'s own doc
-    comment for why this shares the same lock.
-
-    On dual_router (require_mobile_or_web) -- M3's second write endpoint exposed to the web
-    client, after /orders/smart-bracket (M3a). /orders/exit-all stays on protected_router,
-    untouched -- the web client always calls this route with no instrument_keys for "close
-    everything," identical behavior, so there's no need to expose that one too.
-    """
-    access_token = _load_access_token(token_store)
-    async with exit_all_lock:
-        try:
-            result = await SmartOrderService(service).exit_positions(
-                access_token,
-                instrument_keys=request.instrument_keys,
-                instrument_rules_service=InstrumentRulesService(settings),
-            )
-        except UpstoxApiError as exc:
-            raise _upstox_http_error(exc) from exc
-    await _notify_if_exit_had_failures(notification_service, result)
-    return result
-
-
-async def _notify_if_exit_had_failures(
-    notification_service: NotificationService, result: dict[str, Any],
-) -> None:
-    """Records a `risk`-category notification when any position failed to flatten after
-    SmartOrderService.exit_positions's own retry loop gave up -- covers both the "max-loss result
-    had failures" and "exit retries exhausted" scenarios in one message, since a result reaching
-    here with status="error" for a position *is* exactly a retry-exhausted outcome."""
-    failed = [item for item in result.get("results", []) if item.get("status") == "error"]
-    if not failed:
-        return
-    await notification_service.record(
-        category="risk",
-        severity="critical",
-        title="Position exit failed",
-        message=f"{len(failed)} of {result.get('positions_found', len(failed))} position(s) could not be flattened.",
-        details={"positions_found": result.get("positions_found"), "results": result.get("results")},
-    )
 
 
 @protected_router.put("/orders/modify")

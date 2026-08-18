@@ -299,6 +299,23 @@ class JournalStore:
                 (trading_date, now, now, now if complete else None, "complete" if complete else "partial"),
             )
 
+    def reset_all(self) -> None:
+        """Settings-page "clear server DB" button (2026-08-18) -- same tables the manual
+        `DELETE FROM` wipe on 2026-08-18 cleared by hand on the VPS. Leaves `journal_metadata`
+        alone (a config marker -- `ledger_started_at` -- not trade data, same reasoning the
+        manual wipe used)."""
+        connection = self._connect()
+        try:
+            for table in (
+                "trade_context", "journal_sessions", "trade_fills",
+                "journal_trades", "journal_trade_fills", "journal_notes",
+            ):
+                connection.execute(f"DELETE FROM {table}")
+            connection.commit()
+            connection.execute("VACUUM")
+        finally:
+            connection.close()
+
     def charges_for_fill_ids(self, fill_ids: list[str]) -> dict[str, float]:
         """Last known-good `computed_charges` for the given fill_ids, keyed by fill_id --
         used by the reconciler to fall back to a prior value when a fresh brokerage-charge

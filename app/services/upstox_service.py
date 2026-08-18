@@ -197,84 +197,6 @@ class UpstoxService:
             },
         )
 
-    async def place_gtt_order(
-        self,
-        access_token: str,
-        order: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Place a V3 GTT order."""
-        response = await self._request(
-            "POST",
-            f"{self.settings.upstox_api_v3_base_url}/order/gtt/place",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {access_token}",
-            },
-            json=order,
-        )
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise UpstoxApiError("Unexpected Upstox GTT order response")
-        return payload
-
-    async def get_gtt_orders(self, access_token: str) -> dict[str, Any]:
-        """List all of the user's GTT orders (every instrument, every status)."""
-        response = await self._request(
-            "GET",
-            f"{self.settings.upstox_api_v3_base_url}/order/gtt",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {access_token}",
-            },
-        )
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise UpstoxApiError("Unexpected Upstox GTT order list response")
-        return payload
-
-    async def modify_gtt_order(
-        self,
-        access_token: str,
-        order: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Modify an existing V3 GTT order's rules (e.g. new target/stoploss trigger prices)."""
-        response = await self._request(
-            "PUT",
-            f"{self.settings.upstox_api_v3_base_url}/order/gtt/modify",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {access_token}",
-            },
-            json=order,
-        )
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise UpstoxApiError("Unexpected Upstox GTT modify response")
-        return payload
-
-    async def cancel_gtt_order(
-        self,
-        access_token: str,
-        gtt_order_id: str,
-    ) -> dict[str, Any]:
-        """Cancel an untriggered V3 GTT order and all of its remaining rules."""
-        response = await self._request(
-            "DELETE",
-            f"{self.settings.upstox_api_v3_base_url}/order/gtt/cancel",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {access_token}",
-            },
-            json={"gtt_order_id": gtt_order_id},
-        )
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise UpstoxApiError("Unexpected Upstox GTT cancel response")
-        return payload
-
     async def place_order(
         self,
         access_token: str,
@@ -288,13 +210,11 @@ class UpstoxService:
         trigger_price: float = 0,
         tag: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Places a regular (non-GTT) order via Place Order V3 -- unlike place_gtt_order (a
-        conditional GTT rule watched by Upstox's own GTT engine), this becomes a real live order
-        on the exchange's order book immediately. Used for MARKET fills (see place_market_order)
-        and, since GTT structurally can't attach only a target/stoploss to an already-open
-        position without also re-firing a live entry, for the plain LIMIT (target) and SL-M
-        (stoploss) exit legs SmartOrderService.attach_exit_orders places instead -- see that
-        method's own doc comment.
+        """Places a regular order via Place Order V3 -- becomes a real live order on the
+        exchange's order book immediately (unlike a broker-native GTT conditional rule, which the
+        old, now-retired GTT model used to place instead). Used for MARKET fills (see
+        place_market_order) and for the order engine's own LIMIT/SL-M bracket legs
+        (OrderEngineOrderService.place_order).
 
         [tag] is Upstox's own client-supplied order-tagging field (short, alphanumeric), echoed
         back on every order-book/order-details read -- OrderEngineOrderService uses it as the one
@@ -346,8 +266,9 @@ class UpstoxService:
         product: str,
     ) -> dict[str, Any]:
         """Places an immediate market order -- fills right away at whatever the market gives.
-        Used to actually flatten a position (see SmartOrderService.exit_all_positions), where a
-        GTT rule would be too slow/indirect for something meant to happen right now.
+        Used to actually flatten a position (see position_flattener.flatten_positions and
+        order_engine_max_loss_watcher.flatten_open_lots), where a conditional/resting order
+        would be too slow/indirect for something meant to happen right now.
         """
         return await self.place_order(
             access_token,
