@@ -101,11 +101,18 @@ class OrderHistoryRecorder:
         lot_id: Optional[str] = None,
         rule_id: Optional[str] = None,
         role: Optional[str] = None,
+        exit_reason: Optional[str] = None,
     ) -> dict[str, Any]:
         """Upserts one `order_history` row for [broker_order], keyed by its own `order_id`.
         Called for *every* reconciled order sighting -- placement-accept, open, rejected,
         cancelled, complete -- so `order_history` genuinely records every order ever placed, not
-        just the ones that filled."""
+        just the ones that filled.
+
+        [exit_reason] (2026-08-19): why this exit actually happened -- `"TARGET"`/`"STOP_LOSS"`
+        when the caller resolved this order back to a fired bracket `TriggerRule` (its own `role`
+        copied straight across), `None` for anything else that closes a lot (a manual "Exit"/
+        "Close all", the max-loss watcher's flatten, an untagged external fill) -- the Android
+        client already reads a missing value as a manual exit."""
         broker_order_id = broker_order.get("order_id")
         if not broker_order_id:
             raise ValueError("broker_order missing order_id -- nothing to key the row on")
@@ -131,6 +138,7 @@ class OrderHistoryRecorder:
             lot_id=lot_id,
             rule_id=rule_id,
             role=role,
+            exit_reason=exit_reason,
             placed_at=broker_order.get("order_timestamp"),
             last_broker_update_at=broker_order.get("exchange_timestamp") or broker_order.get("order_timestamp"),
             raw_broker_payload_json=_to_json(broker_order),

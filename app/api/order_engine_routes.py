@@ -396,6 +396,11 @@ class OrderHistoryEntryResponse(BaseModel):
     lot_id: Optional[str] = None
     rule_id: Optional[str] = None
     role: Optional[str] = None
+    # Why a closed lot's exit fired -- "TARGET"/"STOP_LOSS" when this order is a bracket leg the
+    # trigger evaluator itself fired (see `_record_order_history_from_push`'s own doc comment),
+    # `None` for a manual exit/flatten/untagged external fill. Added 2026-08-19 so Terminal's
+    # Positions/Orders panel can show the real reason instead of guessing from fill price.
+    exit_reason: Optional[str] = None
     placed_at: Optional[str] = None
     last_broker_update_at: Optional[str] = None
     created_at: str

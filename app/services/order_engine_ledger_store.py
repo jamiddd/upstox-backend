@@ -142,6 +142,7 @@ class OrderEngineLedgerStore:
                     lot_id TEXT REFERENCES lots(id),
                     rule_id TEXT,
                     role TEXT,
+                    exit_reason TEXT,
                     placed_at TEXT,
                     last_broker_update_at TEXT,
                     created_at TEXT NOT NULL,
@@ -214,6 +215,16 @@ class OrderEngineLedgerStore:
                 "ALTER TABLE order_history ADD COLUMN target_price REAL",
                 "ALTER TABLE order_history ADD COLUMN stoploss_price REAL",
                 "ALTER TABLE order_history ADD COLUMN trailing_gap REAL",
+                # Why a closed lot exited (2026-08-19) -- an exit order itself carries no TP/SL
+                # tag (a fired TARGET/STOP_LOSS TriggerRule places a plain market/limit order), so
+                # this is the only durable record of which one actually fired. Set in
+                # `_record_order_history_from_push` (app/main.py) only when the exit's own order
+                # tag matches a PLACED TriggerRule's id -- that rule's own `role` ("TARGET"/
+                # "STOP_LOSS") is copied straight across. Anything else that closes a lot (a
+                # manual "Exit"/"Close all", the max-loss watcher's flatten, an untagged external
+                # fill) leaves this `NULL` -- the Android client already reads a missing value as
+                # a manual exit, so `NULL` needs no separate "MANUAL" literal here.
+                "ALTER TABLE order_history ADD COLUMN exit_reason TEXT",
             ):
                 try:
                     connection.execute(column_sql)
@@ -628,6 +639,7 @@ class OrderEngineLedgerStore:
         lot_id: Optional[str] = None,
         rule_id: Optional[str] = None,
         role: Optional[str] = None,
+        exit_reason: Optional[str] = None,
         placed_at: Optional[str] = None,
         last_broker_update_at: Optional[str] = None,
         raw_broker_payload_json: Optional[str] = None,
@@ -655,10 +667,10 @@ class OrderEngineLedgerStore:
                     id, broker_order_id, exchange_order_id, idempotency_key, order_tag,
                     instrument_key, trading_symbol, transaction_type, product, order_type,
                     requested_quantity, requested_price, trigger_price, status, status_message,
-                    average_price, filled_quantity, lot_id, rule_id, role, placed_at,
+                    average_price, filled_quantity, lot_id, rule_id, role, exit_reason, placed_at,
                     last_broker_update_at, created_at, updated_at, raw_broker_payload_json,
                     target_price, stoploss_price, trailing_gap
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(broker_order_id) DO UPDATE SET
                     exchange_order_id = excluded.exchange_order_id,
                     idempotency_key = COALESCE(excluded.idempotency_key, order_history.idempotency_key),
@@ -671,6 +683,7 @@ class OrderEngineLedgerStore:
                     lot_id = COALESCE(excluded.lot_id, order_history.lot_id),
                     rule_id = COALESCE(excluded.rule_id, order_history.rule_id),
                     role = COALESCE(excluded.role, order_history.role),
+                    exit_reason = COALESCE(excluded.exit_reason, order_history.exit_reason),
                     last_broker_update_at = excluded.last_broker_update_at,
                     updated_at = excluded.updated_at,
                     raw_broker_payload_json = excluded.raw_broker_payload_json,
@@ -682,7 +695,7 @@ class OrderEngineLedgerStore:
                     row_id, broker_order_id, exchange_order_id, idempotency_key, order_tag,
                     instrument_key, trading_symbol, transaction_type, product, order_type,
                     requested_quantity, requested_price, trigger_price, status, status_message,
-                    average_price, filled_quantity, lot_id, rule_id, role, placed_at,
+                    average_price, filled_quantity, lot_id, rule_id, role, exit_reason, placed_at,
                     last_broker_update_at, created_at, now, raw_broker_payload_json,
                     target_price, stoploss_price, trailing_gap,
                 ),

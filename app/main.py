@@ -974,6 +974,13 @@ async def _record_order_history_from_push(
             idempotency_key: Optional[str] = None
             lot_id: Optional[str] = None
             role: Optional[str] = None
+            # Why this lot actually closed (2026-08-19) -- only ever resolved here, from the
+            # firing rule's own `role` ("TARGET"/"STOP_LOSS"): a bracket leg's placed order
+            # carries no TP/SL tag of its own (see `order_engine_trigger_evaluator._fire_rule`),
+            # so this tag-to-rule match is the only place that fact is still known. Stays `None`
+            # for a manual "Exit"/"Close all", the max-loss watcher's flatten, or an untagged
+            # external fill -- all resolve `role` some other way below, never through this match.
+            exit_reason: Optional[str] = None
             tag = broker_order.get("tag")
             if isinstance(tag, str) and tag:
                 for rule in ledger_store.get_trigger_rules_by_state("PLACED"):
@@ -982,6 +989,7 @@ async def _record_order_history_from_push(
                         idempotency_key = rule_id
                         lot_id = rule.get("lot_id")
                         role = "EXIT"
+                        exit_reason = rule.get("role")
                         break
 
             placed_row: Optional[dict[str, Any]] = None
@@ -1130,6 +1138,7 @@ async def _record_order_history_from_push(
                 snapshot_lot_id = None
             recorder.record_order_snapshot(
                 broker_order, idempotency_key=idempotency_key, lot_id=snapshot_lot_id, role=role,
+                exit_reason=exit_reason,
             )
     except Exception:
         logger.warning("Order-history recording failed for order %s", order_id, exc_info=True)
