@@ -852,6 +852,20 @@ async def get_ledger_max_loss_epoch(
     return OrderEngineMaxLossEpochResponse(epoch=epoch)
 
 
+@router.delete("/ledger/max-loss-epoch", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+async def delete_ledger_max_loss_epoch(
+    ledger: OrderEngineLedgerStore = Depends(get_order_engine_ledger_store),
+) -> None:
+    """Disarm (2026-08-20). Mirrors the client's own `MaxLossEpochRepository.disarm()`. Pure
+    delete -- `order_engine_max_loss_watcher.check_now()` already no-ops on `get_max_loss_epoch()
+    is None`, so this is a complete disarm with no watcher change needed. No carry-forward of
+    `peak_equity`; re-arming after this always starts a fresh epoch (2026-08-20 decision: a
+    carried-forward peak from before disarm could sit above current equity and misrepresent
+    "protect what's left from here")."""
+    ledger.delete_max_loss_epoch()
+    ledger.record_event(event_type="MAX_LOSS_EPOCH_DISARMED", payload={})
+
+
 class OrderEngineLotPnlResponse(BaseModel):
     """One open lot's own live P&L, added 2026-08-13 as the per-lot breakdown
     [OrderEnginePnlSummaryResponse] never had -- see that model's own doc comment for why the gap

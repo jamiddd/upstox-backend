@@ -606,6 +606,17 @@ class OrderEngineLedgerStore:
             row = connection.execute("SELECT * FROM max_loss_epochs WHERE id = 1").fetchone()
         return dict(row) if row is not None else None
 
+    def delete_max_loss_epoch(self) -> None:
+        """Disarm (2026-08-20): pure delete, no soft-disarmed flag. `order_engine_max_loss_watcher
+        .check_now()` already no-ops on `get_max_loss_epoch() is None`, so deleting the row is a
+        complete disarm with no watcher-side change needed. Deliberately does NOT carry forward
+        `peak_equity` for the next `upsert_max_loss_epoch` -- re-arming after a disarm always
+        starts fresh at whatever the client passes as the new opening balance/peak, per the
+        2026-08-20 decision that a carried-forward stale peak would misrepresent "protect what's
+        left from here" if equity had already fallen since disarm."""
+        with self._connect() as connection:
+            connection.execute("DELETE FROM max_loss_epochs WHERE id = 1")
+
     def get_events_for_lot(self, lot_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -840,7 +851,13 @@ class OrderEngineLedgerStore:
     ) -> list[dict[str, Any]]:
         """Cursor-paginated (`updated_at DESC, id DESC`) closed lots -- a lot's `updated_at` is
         only bumped again once, at close, since `OrderHistoryRecorder` never re-upserts a
-        `CLOSED` lot, so it doubles as "closed_at" without a dedicated column."""
+        `CLOSED` lot, so it doubles as "closed_at" without a dedicated column.
+
+        `trading_symbol` (2026-08-20, journal contract-name fix): `lots` has no column of its
+        own for this -- only `instrument_key` -- so it's pulled via a correlated subquery from
+        the row's own `order_history` (which does carry a real `trading_symbol` per fill), taking
+        whichever fires first. Scoped to this journal-only read path rather than a `lots` schema
+        migration, since nothing else needs it off a lot directly."""
         clauses = ["state = 'CLOSED'"]
         params: list[Any] = []
         if before is not None:
@@ -857,7 +874,11 @@ class OrderEngineLedgerStore:
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT * FROM lots WHERE {' AND '.join(clauses)}
+                SELECT lots.*,
+                    (SELECT trading_symbol FROM order_history
+                     WHERE order_history.lot_id = lots.id AND trading_symbol IS NOT NULL
+                     ORDER BY created_at LIMIT 1) AS trading_symbol
+                FROM lots WHERE {' AND '.join(clauses)}
                 ORDER BY updated_at DESC, id DESC
                 LIMIT ?
                 """,

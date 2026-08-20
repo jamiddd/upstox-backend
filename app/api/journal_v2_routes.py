@@ -32,6 +32,7 @@ class JournalV2TradeResponse(BaseModel):
 
     id: str
     instrument_key: str
+    trading_symbol: Optional[str] = None
     transaction_type: str
     entry_price: Optional[float] = None
     entry_quantity: int
@@ -170,8 +171,14 @@ async def get_journal_v2_trade(
     if lot is None:
         raise HTTPException(status_code=404, detail="Trade not found")
     orders = ledger.get_orders_for_lot(trade_id)
+    # `lots` has no trading_symbol column of its own (see `list_closed_lots`'s own docstring) --
+    # for the detail view, pull it off the constituent orders already being fetched here anyway,
+    # rather than a second query.
+    trading_symbol = next(
+        (order["trading_symbol"] for order in orders if order.get("trading_symbol")), None,
+    )
     return JournalV2TradeDetailResponse(
-        trade=_trade_response(lot),
+        trade=_trade_response({**lot, "trading_symbol": trading_symbol}),
         orders=[JournalV2OrderResponse(**order) for order in orders],
     )
 
